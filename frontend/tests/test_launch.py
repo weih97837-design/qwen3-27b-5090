@@ -61,6 +61,17 @@ def test_reserve_default_is_the_compose_and_engine_one():
     assert launch.env_settings()["vram_reserve_gib"] is None or os.environ.get("VRAM_RESERVE_GIB")
 
 
+def test_reserve_env_is_read_like_the_engine():
+    assert launch.parse_reserve("") is None and launch.parse_reserve(None) is None
+    assert launch.parse_reserve("2.5") == 2.5
+    assert launch.parse_reserve("-1") == 0.0 and launch.parse_reserve("abc") == 0.0 and launch.parse_reserve("nan") == 0.0
+
+
+def test_the_launcher_clears_a_legacy_budget():
+    import inspect
+    assert '"VRAM_BUDGET_GIB": None' in inspect.getsource(launch.Launch.config)
+
+
 def test_env_changes_name_what_changed_since_the_start():
     lc = object.__new__(launch.Launch)
     lc.settings = lc.at_start = dict(DEFAULTS, vram_reserve_gib=3.0)

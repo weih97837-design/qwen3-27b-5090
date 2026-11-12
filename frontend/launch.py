@@ -68,7 +68,18 @@ def env_settings():
     reserve = env("VRAM_RESERVE_GIB")
     return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
-            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": float(reserve) if reserve else None}
+            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": parse_reserve(reserve)}
+
+
+def parse_reserve(value):
+    """VRAM_RESERVE_GIB as the engine reads it (memory.cc): empty is the default (None), unparsable or negative is 0."""
+    if not value:
+        return None
+    try:
+        v = float(value)
+    except ValueError:
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
 
 
 def auto_budget(free, total=None, reserve=None):
@@ -162,6 +173,8 @@ class Launch:
         eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
                "VRAM_RESERVE_GIB": None if s["vram_reserve_gib"] is None else f"{s['vram_reserve_gib']:g}",
+               # (a legacy VRAM_BUDGET_GIB inherited from settings.ini would cap the budget unseen: the reserve rules)
+               "VRAM_BUDGET_GIB": None,
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
         return dict(self.base, model=str(path), weights=s["weights"], draft=str(draft) if draft else None,
                     max_tokens=s["max_tokens"], kv_dtype=s["kv_dtype"], max_seqs=s["max_seqs"],

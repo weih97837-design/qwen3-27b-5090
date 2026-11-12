@@ -76,7 +76,7 @@ void check_and_log(const Budget& b, const std::vector<Pool*>& pools) {
   size_t dev = 0, host = 0;
   log("memory budget: free at start %.2f GiB of %.2f GiB, reserve %.2f GiB, budget %.2f GiB", b.free_at_start / kGiB,
       b.total / kGiB, b.reserve / kGiB, b.budget / kGiB);
-  if (b.asked) log("VRAM_BUDGET_GIB %.2f GiB is above what is free: using %.2f GiB", b.asked / kGiB, b.budget / kGiB);
+  if (b.asked) log("VRAM_BUDGET_GIB %.2f GiB (legacy) is above free minus the reserve: using %.2f GiB", b.asked / kGiB, b.budget / kGiB);
   for (auto* p : pools) {
     (p->host() ? host : dev) += p->size();
     log("  %-12s %-6s %8.3f GiB", p->name().c_str(), p->host() ? "host" : "device", p->size() / kGiB);
