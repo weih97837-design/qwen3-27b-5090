@@ -49,7 +49,7 @@ def env_settings():
     env = os.environ.get
     budget = env("VRAM_BUDGET_GIB")
     return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
-            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
+            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 
 

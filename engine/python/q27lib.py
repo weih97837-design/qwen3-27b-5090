@@ -38,6 +38,11 @@ SIGNATURES = {
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
     "q27_cache_grow": ([P, I, P], I),
+    "q27_spill_list": ([P, ctypes.c_char_p, I], I),
+    "q27_spill_export": ([P, ctypes.c_uint64, ctypes.c_char_p], I),
+    "q27_spill_drop": ([P, ctypes.c_uint64], I),
+    "q27_spill_import": ([P, ctypes.c_char_p, P], I),
+    "q27_spill_stats": ([P, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
@@ -394,6 +399,49 @@ class Engine:
         self._check(lib().q27_cache_stats(self.h, out), "q27_cache_stats")
         keys = ("lookups", "hits", "prompt_tokens", "cached_tokens", "saved", "evicted", "checkpoints", "free_pages",
                 "checkpoint_only_pages", "pool_pages", "park_pages", "slots_allocated")
+        return dict(zip(keys, out))
+
+    # ---- tiered cache (SPILL_RAM_GIB > 0; frontend/tiercache.py)
+
+    def spill_list(self):
+        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "path"}] of the checkpoints the KV pool gave up."""
+        n = 1 << 16
+        while True:
+            buf = ctypes.create_string_buffer(n)
+            size = lib().q27_spill_list(self.h, buf, n)
+            if size < 0:
+                self._check(1, "q27_spill_list")
+            if size < n:
+                break
+            n = size + 1
+        out = []
+        for line in buf.value.decode("utf-8", "replace").split("\n"):  # (not splitlines: a path may hold \r etc.)
+            if not line:
+                continue
+            f = line.split("\t", 5)
+            out.append({"id": int(f[0]), "pos": int(f[1]), "ram_bytes": int(f[2]), "on_disk": f[3] == "1",
+                        "last_use": int(f[4]), "path": f[5] if len(f) > 5 else ""})
+        return out
+
+    def spill_export(self, entry_id, path):
+        """Writes an entry that is in memory to `path` and frees the memory (the lookup still finds it)."""
+        self._check(lib().q27_spill_export(self.h, entry_id, os.fsencode(path)), "q27_spill_export")
+
+    def spill_drop(self, entry_id):
+        """Forgets an entry and deletes its file."""
+        self._check(lib().q27_spill_drop(self.h, entry_id), "q27_spill_drop")
+
+    def spill_import(self, path):
+        """Indexes a file an earlier run wrote; 0 when it is not one of this model and KV type."""
+        out = ctypes.c_uint64()
+        self._check(lib().q27_spill_import(self.h, os.fsencode(path), ctypes.byref(out)), "q27_spill_import")
+        return out.value
+
+    def spill_stats(self):
+        out = (ctypes.c_int64 * 10)()
+        self._check(lib().q27_spill_stats(self.h, out), "q27_spill_stats")
+        keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
+                "failed")
         return dict(zip(keys, out))
 
     def memory_report(self):

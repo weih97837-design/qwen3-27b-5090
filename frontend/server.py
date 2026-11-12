@@ -1608,7 +1608,7 @@ def main():
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
-    ap.add_argument("--max-seqs", type=int, default=int(env("MAX_SEQS", 8)),
+    ap.add_argument("--max-seqs", type=int, default=int(env("MAX_SEQS", 4)),
                     help="requests the engine can run at once (1..8); fewer run while the KV pool is short")
     ap.add_argument("--min-seq-tps", type=float, default=float(env("MIN_SEQ_TPS", 0)),
                     help="start another request only if each one keeps this many tok/s (0: off)")

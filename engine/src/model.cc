@@ -197,9 +197,27 @@ Model::Model(const Options& opt) : opt_(opt) {
     opt_.max_tokens = fit;
     max_pages_ = int(ceil_div(fit + kSpecBlock, kPageTokens));
   }
+  // A fixed pool (KV_POOL_TOKENS) is kept as given, but with MAX_TOKENS_FIT a pool the budget cannot hold is lowered:
+  // the parking areas and the block rounding of kv_pages come on top of the pool (kv_total = kv_pages + park_all).
+  int pool_tokens = opt.kv_pool_tokens;
+  if (opt.fit_max_tokens && pool_tokens > 0) {
+    const int room = left_pages - park_all - kv_block_;
+    if (ceil_div(pool_tokens, kPageTokens) > room) {
+      const int fit = std::max(0, room) * kPageTokens / 1024 * 1024;
+      if (fit < opt.prefill_chunk) fail("not enough VRAM: the VRAM budget leaves no room for KV_POOL_TOKENS (MAX_TOKENS_FIT)");
+      log("KV_POOL_TOKENS %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.kv_pool_tokens, fit);
+      pool_tokens = fit;
+      if (max_pages_ > ceil_div(fit, kPageTokens)) {
+        const int new_max = (fit - kSpecBlock) / 1024 * 1024;
+        log("max_tokens %d does not fit the lowered KV pool: lowered to %d (MAX_TOKENS_FIT)", opt.max_tokens, new_max);
+        opt_.max_tokens = new_max;
+        max_pages_ = int(ceil_div(new_max + kSpecBlock, kPageTokens));
+      }
+    }
+  }
   int pool_pages = max_pages_;
   if (opt.kv_pool_tokens > 0)
-    pool_pages = std::max(max_pages_, int(ceil_div(opt.kv_pool_tokens, kPageTokens)));
+    pool_pages = std::max(max_pages_, int(ceil_div(pool_tokens, kPageTokens)));
   else if (cache_on_)
     pool_pages = std::max(max_pages_, left_pages);
   // Whole blocks: with the prefix cache the pool takes what the budget leaves rounded down to blocks.
@@ -562,6 +580,7 @@ bool Model::evict_checkpoint() {
   if (ckpts_.empty()) return false;
   auto it = std::min_element(ckpts_.begin(), ckpts_.end(),
                              [](const Checkpoint& a, const Checkpoint& b) { return a.last_use < b.last_use; });
+  if (spill_on()) spill_checkpoint(*it);  // tiered cache: to host memory instead of gone (before its pages go back)
   for (int32_t p : it->pages) pool_.unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
@@ -630,6 +649,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
   cstats_.lookups++;
   cstats_.prompt_tokens += n;
   if (!cache_on_) return 0;
+  if (spill_on()) spill_lookup(ids, n, spec);  // a deeper match in host memory or on disk comes back into the pool first
   const Checkpoint* best = nullptr;
   for (auto& c : ckpts_)
     if (c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&

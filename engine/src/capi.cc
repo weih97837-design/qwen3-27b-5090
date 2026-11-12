@@ -125,6 +125,10 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
   if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
   if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
+  // Tiered cache (docs/tiered-cache.md): SPILL_RAM_GIB (host memory for checkpoints the KV pool gives up; 0 / unset:
+  // off) and SPILL_DIR (where they are written when that is full; frontend/tiercache.py writes them out sooner).
+  if (const char* e = getenv("SPILL_RAM_GIB")) o.spill_ram_gib = atof(e);
+  if (const char* e = getenv("SPILL_DIR")) o.spill_dir = e;
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
@@ -354,6 +358,36 @@ int q27_memory_report(void* m, char* buf, int cap) {
     buf[n] = 0;
   }
   return int(r.size());
+}
+
+// Tiered cache (Model::spill_list ...): the list is copied as q27_memory_report copies its report.
+int q27_spill_list(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->spill_list(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+int q27_spill_export(void* m, uint64_t id, const char* path) {
+  return guard([&] { static_cast<Model*>(m)->spill_export(id, path); });
+}
+
+int q27_spill_drop(void* m, uint64_t id) {
+  return guard([&] { static_cast<Model*>(m)->spill_drop(id); });
+}
+
+// *id: the entry, 0 when the file is not one of this model and KV type (the caller deletes it).
+int q27_spill_import(void* m, const char* path, uint64_t* id) {
+  return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
+}
+
+// out[10]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed.
+int q27_spill_stats(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->spill_stats(out); });
 }
 
 // out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.

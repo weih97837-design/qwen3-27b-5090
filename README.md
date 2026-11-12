@@ -251,13 +251,13 @@ to change it. The most useful ones:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TOKENS` | 262144 | Context limit of one request |
-| `MAX_SEQS` | 8 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
+| `MAX_SEQS` | 4 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
 | `SPEC` | `dflash2` | `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
-[docs/configuration.md](docs/configuration.md) lists every setting. By default the server accepts connections from this PC
+[docs/configuration.md](docs/configuration.md) lists every setting. The RAM and SSD tiers for evicted KV checkpoints are in [docs/tiered-cache.md](docs/tiered-cache.md). By default the server accepts connections from this PC
 only; [Using it from other machines](docs/configuration.md#using-it-from-other-machines) says how to open it to your network.
 
 ### Other checkpoints

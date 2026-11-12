@@ -10,7 +10,9 @@
 
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace q27 {
@@ -83,6 +85,28 @@ struct Checkpoint {
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   uint64_t last_use = 0;
   int pos() const { return int(ids.size()); }
+};
+
+// Tiered cache (SPILL_RAM_GIB > 0): a checkpoint the KV pool had to give up is copied to host memory instead of
+// being dropped, and later written to a file (the frontend's policy, frontend/tiercache.py, or the RAM cap). Its
+// tokens stay in memory for the lookup; prefix_begin brings a spilled checkpoint back into the pool when it is
+// the deepest match. kv holds the pages slice-major ([kKvSlices][pages][kv_page_bytes]), state the host slot's
+// bytes (ssm | conv | draft ring).
+struct Spilled {
+  std::vector<int32_t> ids;
+  std::unique_ptr<char[]> kv, state;  // null once the entry is only on disk
+  size_t kv_bytes = 0, state_bytes = 0;
+  bool ring = false;
+  std::string path;     // the file (empty: in memory only)
+  uint64_t last_use = 0;
+  bool busy = false;    // being restored: neither dropped nor written out meanwhile
+  int pos() const { return int(ids.size()); }
+  bool in_ram() const { return kv != nullptr; }
+  size_t ram_bytes() const { return in_ram() ? kv_bytes + state_bytes : 0; }
+};
+
+struct SpillStats {
+  int64_t spilled = 0, restored = 0, written = 0, dropped = 0, subsumed = 0, failed = 0;
 };
 
 struct CacheStats {

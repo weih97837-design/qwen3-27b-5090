@@ -2,6 +2,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,10 @@ struct Options {
   double state_cache_gib = 0;
   int kv_pool_tokens = 0;
   int checkpoint_interval = 8192;
+  // Tiered cache (needs the prefix cache): GiB of host memory for checkpoints the KV pool gives up (0: off, they are
+  // dropped as before), and the folder they are written to when that is full (empty: the oldest is dropped then).
+  double spill_ram_gib = 0;
+  std::string spill_dir;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
@@ -137,6 +142,17 @@ class Model {
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
+  // Tiered cache (Options::spill_ram_gib > 0). Only the frontend's policy calls these, between engine steps.
+  // spill_list: one line per entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tpath". spill_export writes an entry
+  // that is in memory to `path` and frees the memory (it stays found by the lookup). spill_drop forgets an entry and
+  // deletes its file. spill_import indexes a file another run wrote (0 when it is not a file of this model and KV
+  // type, or unreadable: the caller deletes it). spill_stats out[10]: entries, in memory, on disk, memory bytes,
+  // spilled, restored, written, dropped, subsumed (a deeper checkpoint of the same tokens was kept), failed.
+  std::string spill_list() const;
+  void spill_export(uint64_t id, const std::string& path);
+  void spill_drop(uint64_t id);
+  uint64_t spill_import(const std::string& path);
+  void spill_stats(int64_t* out) const;
   // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
   // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
   // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
@@ -209,6 +225,18 @@ class Model {
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   bool evict_checkpoint();           // the least recently used one; false when there is none
+  // Tiered cache (spill.cc).
+  bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
+  void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
+  void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's
+  bool spill_promote(uint64_t id);               // a spilled entry -> a checkpoint in the pool
+  void spill_enforce_ram();                      // over spill_ram_gib: write out (or drop) the least recently used
+  void spill_write(Spilled& s, const std::string& path);
+  bool spill_load(Spilled& s);                   // the file's pages and state into memory
+  void spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file);
+  // pages' K / V slices <-> host [kKvSlices][pages][kv_page_bytes_] (runs of adjacent pages in one copy)
+  void copy_pages(const std::vector<int32_t>& pages, char* host, bool to_host);
+  uint64_t spill_fingerprint() const;
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
   cudaGraphExec_t capture(const std::function<void()>& body);
@@ -312,6 +340,10 @@ class Model {
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
+  std::map<uint64_t, Spilled> spill_;  // (a map: entries stay put while others come and go)
+  uint64_t spill_next_ = 1;
+  size_t spill_ram_ = 0;               // host bytes the entries in memory hold
+  SpillStats sstats_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
   float* conv_ = nullptr;            // [48][10240][3]
   float* ssm_ = nullptr;             // [48][48][128][128]: the current buffer (ssm_buf_[sbuf_host_])
