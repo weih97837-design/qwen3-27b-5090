@@ -409,21 +409,36 @@ void Model::spill_h2d(Spilled& s, const std::vector<int32_t>& pages, cudaStream_
 }
 
 void Model::spill_reap() {
+  // Exception-safe: an item is removed from retired_ only once its memory and event are given back (r.done is cleared
+  // at once, so an item kept after a throw never returns its event twice), and keep never grows past its reserve.
   std::vector<Retired> keep;
-  for (Retired& r : retired_) {
-    if (r.async) {  // (D) s_ did not wait for this copy: only a completed one is freed here
-      const cudaError_t e = cudaEventQuery(r.done);
-      if (e == cudaErrorNotReady) {
-        cudaGetLastError();
-        keep.push_back(std::move(r));
-        continue;
+  keep.reserve(retired_.size());
+  size_t i = 0;
+  try {
+    for (; i < retired_.size(); ++i) {
+      Retired& r = retired_[i];
+      if (r.async) {  // (D) s_ did not wait for this copy: only a completed one is freed here
+        const cudaError_t e = cudaEventQuery(r.done);
+        if (e == cudaErrorNotReady) {
+          cudaGetLastError();
+          keep.push_back(std::move(r));
+          continue;
+        }
+        Q27_CUDA(e);
+      } else {
+        Q27_CUDA(cudaEventSynchronize(r.done));  // (done already, in practice: see the header comment)
       }
-      Q27_CUDA(e);
-    } else {
-      Q27_CUDA(cudaEventSynchronize(r.done));  // (done already, in practice: see the header comment)
+      r.kv.reset();  // (back into the pinned pool, or delete[])
+      cudaEvent_t ev = r.done;
+      r.done = nullptr;
+      spill_event_put(ev);
     }
-    r.kv.reset();  // (back into the pinned pool, or delete[])
-    spill_event_put(r.done);
+  } catch (...) {
+    // keep what was kept and what was not looked at yet (from i on: item i still holds its event if it threw before put)
+    for (; i < retired_.size(); ++i)
+      if (retired_[i].done) keep.push_back(std::move(retired_[i]));
+    retired_ = std::move(keep);
+    throw;
   }
   retired_ = std::move(keep);
 }
@@ -1351,7 +1366,7 @@ void Model::spill_stats(int64_t* out, int n) const {
   int64_t* const dst = out;
   out = v;
   for (const auto& kv : spill_) {
-    ram += kv.second.in_ram();
+    ram += kv.second.in_ram() || (kv.second.busy && !kv.second.chunks.empty());  // (an issued restore holds its chunks)
     disk += !kv.second.path.empty();
     logical += int64_t(kv.second.ram_bytes());
   }
