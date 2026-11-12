@@ -114,7 +114,7 @@ KV_HEADS = 4  # kKvHeads
 SPEC_BLOCK = 8  # kSpecBlock: a verify block writes up to 8 positions past the committed length
 KV_ROW_BYTES = {"nvfp4": 144, "fp8": 256, "bf16": 512}  # kv_row_bytes(kv_type)
 EVICT_MARGIN = 4  # pages: the two conversations must exceed the usable pool by this much, so B's prefill evicts A
-AHEAD_PAGES = 8  # pages added to the two conversations' pages (the pages ahead of the spec block, not tokens)
+AHEAD_PAGES = 0  # (ensure_pages_of evicts only for pages a sequence NEEDS; the 8 pages it maps ahead are taken only if free)
 
 
 def ceil_div(a, b):
