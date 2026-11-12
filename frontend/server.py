@@ -367,6 +367,9 @@ class EngineClient:
             if time.monotonic() > deadline:
                 raise ApiError(503, "the engine is loading", "overloaded_error")
             self.ready.wait(0.2)
+        meta = getattr(HUB.local, "meta", None)  # (the HTTP thread's request_meta: the client's X-Agent-Id / "user")
+        if meta and meta.get("agent_id"):
+            req = dict(req, agent_id=meta["agent_id"])
         try:
             with self.send_lock:
                 self.conn.send(("submit", rid, req))

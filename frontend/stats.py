@@ -14,6 +14,8 @@ import shutil
 import threading
 import time
 
+import agent
+
 SAMPLE_S = float(os.environ.get("STATS_SAMPLE_S", 1.0))  # s between GPU samples (0: no sampling)
 HISTORY_S = 600   # s of samples kept
 LOG_SIZE = 500    # log entries kept
@@ -109,8 +111,30 @@ def request_meta(path, headers, body):
     return {"endpoint": path, "client": (headers.get("User-Agent") or "")[:80], "model": body.get("model"),
             "stream": bool(body.get("stream")), "messages": len(msgs) if isinstance(msgs, list) else 1,
             "tools": len(body.get("tools") or []),
+            "agent_id": agent.from_request(headers, body),  # (None: the worker derives auto:<hash>)
             "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens") or body.get("max_output_tokens"),
             "preview": last[:PREVIEW] + ("…" if len(last) > PREVIEW else "")}
+
+
+def agents_block(seqs, totals):
+    """Per-agent aggregate for the UI (worker.Scheduler.stats). seqs: the snapshot's request rows (with "agent",
+    "state"); totals: agent -> {"requests", "prompt_tokens", "cached_tokens", "hit_requests"} counted since the
+    worker started. ram_bytes / ssd_bytes are placeholders (None) for the tiered-cache eviction change to fill from
+    its per-agent accounting (Scheduler.agent_of_ids). Sorted by running + waiting, then by requests."""
+    out = {}
+    for a, t in totals.items():
+        out[a] = {"agent": a, "running": 0, "waiting": 0, "requests": t["requests"], "hit_requests": t["hit_requests"],
+                  "prompt_tokens": t["prompt_tokens"], "cached_tokens": t["cached_tokens"],
+                  "hit": t["cached_tokens"] / t["prompt_tokens"] if t["prompt_tokens"] else None,
+                  "ram_bytes": None, "ssd_bytes": None}
+    for r in seqs:
+        a = r.get("agent")
+        if a is None:
+            continue
+        row = out.setdefault(a, {"agent": a, "running": 0, "waiting": 0, "requests": 0, "hit_requests": 0, "prompt_tokens": 0,
+                                 "cached_tokens": 0, "hit": None, "ram_bytes": None, "ssd_bytes": None})
+        row["waiting" if r["state"] in ("waiting", "restoring") else "running"] += 1
+    return sorted(out.values(), key=lambda x: (-(x["running"] + x["waiting"]), -x["requests"], x["agent"]))
 
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
@@ -552,6 +576,7 @@ class Hub:
                     "sample": self.samples[-1] if self.samples else None,
                     "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None,
                     "slots": snap.get("slots", []) if snap else [],
+                    "agents": snap.get("agents", []) if snap else [],
                     "tiers": snap.get("tiers") if snap else None,
                     "prefix": prefix_block(snap, self.memory),
                     "host": host_info(self.started),

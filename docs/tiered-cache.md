@@ -177,6 +177,18 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     "SPILL_PINNED_GIB=8 SPILL_PINNED_SLAB_MIB=256 SPILL_ASYNC_IO=1"
 ```
 
+## 代理識別（X-Agent-Id）
+
+為了之後能依代理（agent）公平地逐出分層快取，伺服器會標記每個請求屬於哪個代理：
+
+- 標頭 `X-Agent-Id: <id>`（優先），或 OpenAI 請求本文的 `"user": "<id>"`；兩者都有時以標頭為準。
+- id 最長 128 字元，允許 `A-Za-z0-9._/-`；其他字元換成 `_` 並截斷；空字串視為未提供。
+- 公平性的代理 = 第一個 `/` 之前的部分（`manager/task-123` 與 `manager/probe` 都是 `manager`）；完整 id 也會保留。
+- 未提供時，由 worker 以提示詞開頭（系統提示詞加第一則使用者訊息）的雜湊產生 `auto:<8 位十六進位>`。限制：開頭相同的代理會共用同一個身分。
+
+worker 記錄每個請求存下的 checkpoint 位置，並以 `Scheduler.agent_of_ids(ids, pos)` 查詢（有上限的字典，最近 4096 筆，鍵為
+`agent.prefix_fingerprint(ids, pos)`）。統計頁有「Agents」表（RAM／SSD 位元組目前為空，待逐出機制填入）。
+
 ## WSL2 注意事項
 
 - **RAM 層計入 WSL VM 的記憶體。** 預設的 WSL2 記憶體上限不足以容納 32 GiB 的 RAM 層。請在 `%UserProfile%\.wslconfig`

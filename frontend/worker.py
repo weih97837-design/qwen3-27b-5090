@@ -46,7 +46,11 @@ import sys
 import time
 import traceback
 
+import agent as agents  # (the frontend dir is on sys.path)
+
 PREFILL, DECODE = "prefill", "decode"
+AGENT_NOTES = 4096    # checkpoint fingerprints kept for Scheduler.agent_of_ids
+AGENT_STATS = 256     # agents the per-agent counters keep (the oldest go first)
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
@@ -159,6 +163,10 @@ class Seq:
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
         self.steps = 0           # decode steps (speculative: verify steps)
         self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
+        # The client's X-Agent-Id / "user" (full id: "agent/session"), or the auto:<hash> of the prompt's opening
+        # (Scheduler.submit); agent is the fairness key, the part before the first "/".
+        self.agent_id = req.get("agent_id") or None
+        self.agent = agents.agent_of(self.agent_id)
         self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
 
     @property
@@ -381,12 +389,48 @@ class Scheduler:
         # (stats: where the first message ends, the last message and the generation prompt start)
         starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
         s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
+        if s.agent_id is None:  # (no id from the client: the hash of the system prompt and first user message)
+            s.agent_id = agents.auto_id(s.prompt, self.im_start)
+            s.agent = s.agent_id
+        self.note_checkpoints(s, s.prompt, s.at)
         s.est_cached = s.reusable
         if s.images:
             self.prefetch(s)
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def note_checkpoints(self, s, ids, positions):
+        """Remembers that request s's agent saved (or is about to save) checkpoints of ids at these positions: a bounded
+        dict (the last AGENT_NOTES) from agents.prefix_fingerprint(ids, pos) to the agent. A later change that evicts
+        per agent asks agent_of_ids(ids, pos) for a checkpoint or spilled entry it holds. The latest writer wins when
+        two agents save the same prefix; a fingerprint is cheap (first 4096 tokens + last 64 + pos), not exact."""
+        notes = self.__dict__.setdefault("agent_notes", collections.OrderedDict())
+        for pos in positions:
+            k = agents.prefix_fingerprint(ids, pos)
+            notes[k] = s.agent
+            notes.move_to_end(k)
+        while len(notes) > AGENT_NOTES:
+            notes.popitem(last=False)
+
+    def agent_of_ids(self, ids, pos=None):
+        """The agent that saved a checkpoint covering ids[:pos] (pos: all of ids), or None when unknown (never noted,
+        or dropped from the bounded dict)."""
+        return self.__dict__.get("agent_notes", {}).get(agents.prefix_fingerprint(ids, len(ids) if pos is None else pos))
+
+    def agent_count(self, s, prompt, cached):
+        """Per-agent totals for the stats block (once per request, when its prefill begins)."""
+        tot = self.__dict__.setdefault("agent_totals", collections.OrderedDict())
+        t = tot.get(s.agent)
+        if t is None:
+            t = tot[s.agent] = {"requests": 0, "hit_requests": 0, "prompt_tokens": 0, "cached_tokens": 0}
+            while len(tot) > AGENT_STATS:
+                tot.popitem(last=False)
+        tot.move_to_end(s.agent)
+        t["requests"] += 1
+        t["hit_requests"] += 1 if cached else 0
+        t["prompt_tokens"] += prompt
+        t["cached_tokens"] += cached
 
     def plan_sibling_checkpoint(self, o, n):
         """Asks the engine for a checkpoint at n in the already running (or parked) request o, which has not run
@@ -973,6 +1017,8 @@ class Scheduler:
             s.cached, s.begun = cached, time.time()
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
+            self.agent_count(s, len(s.prompt), cached)
+            self.note_checkpoints(s, s.prompt, s.at)  # (s.at grew if a sibling shared a prefix with it since submit)
             self.m["q27:reusable_tokens_total"] += s.reusable
             if s.reusable > 0:  # (a continuing conversation: what the cache itself can be judged by)
                 self.m["q27:turn2_requests_total"] += 1
@@ -1257,6 +1303,8 @@ class Scheduler:
             s.area = None
         elif s is self.cur and end:
             self.engine.checkpoint()
+        if end and s.out:  # (the end of the generation is saved: it belongs to this agent too)
+            self.note_checkpoints(s, s.prompt + s.out, [len(s.prompt) + len(s.out)])
         if s.started or s.out:
             self.history.append(array.array("i", s.prompt + s.out).tobytes())
         now = time.time()
@@ -1265,7 +1313,7 @@ class Scheduler:
                 "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
                 "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
-                "diverged_at": s.diverged_at}
+                "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -1302,7 +1350,7 @@ class Scheduler:
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
-        from stats import slot_rows, tiers_block  # (the frontend dir is on sys.path)
+        from stats import agents_block, slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
         if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
             self.slot_lanes = {}
@@ -1323,7 +1371,7 @@ class Scheduler:
                          "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
-                         "marks": s.marks})
+                         "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id})
             if s.restoring is not None:
                 rec = s.restoring
                 seqs[-1]["restore"] = {"tokens": rec["pos"], "bytes": rec["bytes"], "on_disk": rec["on_disk"],
@@ -1337,6 +1385,7 @@ class Scheduler:
                 "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
                 "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
                 "tiers": tiers_block(self.engine, getattr(self, "tiers", None)),
+                "agents": agents_block(seqs, self.__dict__.get("agent_totals", {})),
                 "hits": {"requests": self.m["q27:requests_total"], "prompt_tokens": self.m["q27:prompt_tokens_total"],
                          "cached_tokens": self.m["q27:cached_tokens_total"],
                          "turn2_requests": self.m["q27:turn2_requests_total"],

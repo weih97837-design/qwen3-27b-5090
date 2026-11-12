@@ -222,6 +222,14 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
     <div id="tiers-body"></div>
   </section>
 
+  <section class="card" id="agents-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">Agents</h2>
+      <span class="muted" id="agents-sum"></span>
+    </div>
+    <div class="scroll"><table id="agents"></table></div>
+  </section>
+
   <section class="card" id="deploy-sec" hidden>
     <div class="row" style="justify-content:space-between;margin-bottom:8px">
       <h2 style="margin:0">部署與硬體</h2>
@@ -595,6 +603,7 @@ function logRow(e) {
   const r = e.rec, m = e.meta || r?.meta || {};
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
   const cells = r ? [
+    el("td", { class: "mono", title: r.agent_id || "" }, r.agent || ""),
     el("td", { class: "r" }, fmtTok(r.prompt_tokens)),
     el("td", { class: "r", title: r.diverged_at != null ? `diverges from an earlier sequence at token ${r.diverged_at}` : "" },
       `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})` + (r.diverged_at != null ? " ≠" : "")),
@@ -607,14 +616,14 @@ function logRow(e) {
     el("td", { class: "prev" }, m.preview || ""),
   ] : [el("td", { colspan: 9, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
-    el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...cells);
+    el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
   tr.title = "click for details";
   tr.addEventListener("click", () => { state.open.has(e.n) ? state.open.delete(e.n) : state.open.add(e.n); drawLog(); });
   const out = [tr];
   if (state.open.has(e.n)) {
     tr.className += " sel";
     const detail = { ...e }; delete detail.n;
-    out.push(el("tr", { class: "sel" }, el("td", { colspan: 13 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
+    out.push(el("tr", { class: "sel" }, el("td", { colspan: 14 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
   }
   return out;
 }
@@ -622,10 +631,10 @@ function drawLog() {
   const req = $("f-req").checked, sub = $("f-sub").checked, ev = $("f-ev").checked;
   const rows = state.log.filter((e) => e.kind === "done" ? req : e.kind === "submit" ? sub : ev).slice(-300).reverse();
   const tb = $("log"); tb.replaceChildren();
-  tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"),
+  tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"), el("th", {}, "Agent"),
     el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r" }, "TTFT"),
     el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", {}, "Last user message")));
-  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 13, class: "empty" }, "Nothing yet.")));
+  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 14, class: "empty" }, "Nothing yet.")));
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
   const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);
@@ -810,7 +819,22 @@ function drawHeader() {
   }
   b.append(" ", $("launch").hidden ? "▾" : "▴");
 }
-function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawDeploy(); drawSessions(); }
+// Agents: X-Agent-Id / "user" (agent = the part before the first "/"; auto:<hash> without one), from tick.agents.
+function drawAgents() {
+  const rows = state.tick?.agents, sec = $("agents-sec");
+  if (!Array.isArray(rows) || !rows.length) { sec.hidden = true; return; }
+  sec.hidden = false;
+  $("agents-sum").textContent = `${rows.length} agent${rows.length === 1 ? "" : "s"}`;
+  const tb = $("agents"); tb.replaceChildren();
+  tb.append(el("tr", {}, el("th", {}, "Agent"), el("th", { class: "r" }, "Running"), el("th", { class: "r" }, "Waiting"),
+    el("th", { class: "r" }, "Requests"), el("th", { class: "r" }, "Prompt tokens"), el("th", { class: "r" }, "Cached (hit)"),
+    el("th", { class: "r" }, "RAM"), el("th", { class: "r" }, "SSD")));
+  for (const a of rows) tb.append(el("tr", {}, el("td", { style: "font-family:ui-monospace,monospace" }, a.agent),
+    el("td", { class: "r" }, String(a.running)), el("td", { class: "r" }, String(a.waiting)), el("td", { class: "r" }, String(a.requests)),
+    el("td", { class: "r" }, fmtTok(a.prompt_tokens)), el("td", { class: "r" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
+    el("td", { class: "r" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes)), el("td", { class: "r" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes))));
+}
+function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawDeploy(); drawSessions(); }
 
 async function engineAction(a) {
   const n = state.tick?.seqs?.length || 0, changes = launchChanges();

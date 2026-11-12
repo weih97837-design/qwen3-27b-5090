@@ -375,3 +375,26 @@ def test_text_around_decodes_a_window_escapes_newlines_and_never_raises():
     assert "\\n" in sched.text_around(list(range(100)), 12)[0] and "\n" not in sched.text_around(list(range(100)), 12)[0]
     sched.dec_tok = None  # (no cfg: the tokenizer cannot be made)
     assert sched.text_around([1, 2, 3], 1)[0].startswith("?(")
+
+
+def test_scheduler_stats_agents_block_and_row_agent():
+    now = time.time()
+    a, b, w = seq("a", now), seq("b", now), seq("w", now, started=False)
+    a.agent_id, a.agent = "alpha/x", "alpha"
+    b.agent_id, b.agent = "alpha/y", "alpha"
+    w.agent_id, w.agent = "beta", "beta"
+    sched = make_sched(StubEngine(), FakeTiers(None), [a, b], [w], cur=a)
+    sched.agent_count(a, 200, 150)
+    sched.agent_count(w, 100, 0)
+    snap = sched.stats()
+    assert {r["rid"]: r["agent"] for r in snap["seqs"]} == {"a": "alpha", "b": "alpha", "w": "beta"}
+    assert snap["seqs"][0]["agent_id"] == "alpha/x"
+    ag = {x["agent"]: x for x in snap["agents"]}
+    assert ag["alpha"]["running"] == 2 and ag["alpha"]["waiting"] == 0 and ag["alpha"]["hit"] == 0.75
+    assert ag["beta"]["waiting"] == 1 and ag["beta"]["running"] == 0 and ag["beta"]["hit_requests"] == 0
+    assert ag["alpha"]["ram_bytes"] is None and ag["alpha"]["ssd_bytes"] is None
+    hub = stats.Hub()
+    hub.set_snapshot(snap)
+    tick = hub.tick()
+    assert tick["agents"] == snap["agents"] and tick["seqs"][0]["agent"] == "alpha"
+    json.dumps(tick)
