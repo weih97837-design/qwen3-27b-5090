@@ -84,7 +84,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
 scripts/download-weights.sh
 ```
 
-- 下載預設的 `nvidia` 權重（約 20.4 GB）與 DFlash2 草稿模型（約 3.5 GB）到 `./hf`。Hugging Face 快取資料夾（位於 `./hf/hub/`）：`models--nvidia--Qwen3.8-27B-NVFP4`（nvidia 權重）與 `models--incoai--Qwen3.8-27B-DFlash2`（草稿模型）；每個資料夾內以提交雜湊值分出 `snapshots/<commit>/`。`WEIGHTS=gdnfp4` 需另外執行 `python scripts/download_weights.py --weights gdnfp4`，加入 `models--juzbox--Qwen3.8-27B-NVFP4-GDN`（約 19.5 GB，較快）。`--quasar` 另外加入 `models--QUASAR-QAT--Qwen3.8-27B-QUASAR-NVFP4`。
+- 下載預設的 `gdnfp4` 權重（約 19.5 GB）與 DFlash2 草稿模型（約 3.5 GB）到 `./hf`。Hugging Face 快取資料夾（位於 `./hf/hub/`）：`models--juzbox--Qwen3.8-27B-NVFP4-GDN`（gdnfp4 權重）與 `models--incoai--Qwen3.8-27B-DFlash2`（草稿模型）；每個資料夾內以提交雜湊值分出 `snapshots/<commit>/`。`--quasar` 另外加入 `models--QUASAR-QAT--Qwen3.8-27B-QUASAR-NVFP4` 與 `models--nvidia--Qwen3.8-27B-NVFP4`。
 - 其他選項（需要時才加）：`--quasar`；`--repo ORG/NAME[@REVISION]`（另一個 checkpoint，之後設定 `WEIGHTS=ORG/NAME`）。`--dev` 與 `--bf16` 只為測試與參考模型，部署不需要。
 - 要把權重放在別的磁碟：先建立符號連結再下載：`ln -s /其他磁碟/路徑 hf`。
 

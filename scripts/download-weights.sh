@@ -2,9 +2,8 @@
 # Download the pinned checkpoints (revisions from reference/qwen27b/paths.py) into ./hf, the Hugging Face cache the
 # compose services mount at /hf. To keep them elsewhere, make ./hf a symlink first. If a download fails or is
 # interrupted, run the same command again: it resumes where it stopped (scripts/download_weights.py does the work).
-#   scripts/download-weights.sh             # serving: nvidia (20.4 GB) and the DFlash2 draft (3.5 GB)
-#   scripts/download-weights.sh --dev       # same as the default now (NVIDIA's checkpoint is already included); kept for scripts
-#   python3 scripts/download_weights.py --weights gdnfp4  # the faster gdnfp4 checkpoint (19.5 GB), for WEIGHTS=gdnfp4
+#   scripts/download-weights.sh             # serving: gdnfp4 (19.5 GB) and the DFlash2 draft (3.5 GB)
+#   scripts/download-weights.sh --dev       # also the NVIDIA checkpoint (20.4 GB): tests, reference model, golden
 #   scripts/download-weights.sh --bf16      # also the BF16 original (55.6 GB): KL against it, building gdnfp4
 #   scripts/download-weights.sh --quasar    # also QUASAR (19.9 GB, WEIGHTS=quasar)
 #   scripts/download-weights.sh --repo ORG/NAME[@REVISION]  # also another checkpoint of the model (WEIGHTS=ORG/NAME)
@@ -31,4 +30,4 @@ else
   py=(uv run --no-project --python 3.12 python)
 fi
 mkdir -p hf
-HF_HOME="$(cd hf && pwd -P)" "${py[@]}" scripts/download_weights.py --weights nvidia "${also[@]}"
+HF_HOME="$(cd hf && pwd -P)" "${py[@]}" scripts/download_weights.py --weights gdnfp4 "${also[@]}"

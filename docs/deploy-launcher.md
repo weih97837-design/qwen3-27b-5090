@@ -177,7 +177,7 @@ SPILL_TTL_DAYS=7
 
 | 欄位 | 對應變數 | 可選值 |
 | --- | --- | --- |
-| weights | `WEIGHTS` | `nvidia`（預設）、`gdnfp4`、`quasar`（已下載的）或服務啟動時的模型資料夾 |
+| weights | `WEIGHTS` | `gdnfp4`、`nvidia`、`quasar`（已下載的）或服務啟動時的模型資料夾 |
 | kv_dtype | `KV_DTYPE` | `nvfp4`、`fp8`、`bf16` |
 | spec | `SPEC` | `dflash2`、`none` |
 | vision | `VISION` | `host`、`fp8`、`bf16`、`off` |
