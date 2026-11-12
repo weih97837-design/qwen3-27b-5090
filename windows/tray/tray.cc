@@ -922,7 +922,7 @@ std::string json_quote(const std::wstring& w) {
     return out + "\"";
 }
 
-// A setting's value as its variable has it ("": null, the automatic budget).
+// A setting's value as its variable has it ("": null, the default reserve).
 std::wstring env_text(const Json& v) {
     wchar_t number[32];
     switch (v.type) {
@@ -1044,7 +1044,7 @@ std::vector<Row> make_rows() {
         {L"Images (vision tower)", L"VISION", "vision", K::choice, T::engine, nullptr},
         {L"Requests at once", L"MAX_SEQS", "max_seqs", K::choice, T::engine, nullptr},
         {L"Context limit (tokens)", L"MAX_TOKENS", "max_tokens", K::choice, T::engine, nullptr},
-        {L"VRAM budget (GiB)", L"VRAM_BUDGET_GIB", "vram_budget_gib", K::choice, T::engine, nullptr},
+        {L"VRAM reserve (GiB)", L"VRAM_RESERVE_GIB", "vram_reserve_gib", K::choice, T::engine, nullptr},
         {L"Load the engine", L"ENGINE_AUTOSTART", nullptr, K::choice, T::server, nullptr},
         {L"Unload when idle (seconds)", L"ENGINE_IDLE_UNLOAD_S", nullptr, K::edit, T::live, L"0: never"},
         {L"Smallest KV pool (tokens)", L"MIN_KV_TOKENS", nullptr, K::edit, T::server, L"Below this it does not load. 0: any size"},
@@ -1093,7 +1093,7 @@ std::wstring plan_text(const Json& plan) {
 }
 
 std::wstring value_name(const Row& row, const std::wstring& value) {
-    if (value.empty() && !wcscmp(row.var, L"VRAM_BUDGET_GIB")) return L"automatic";
+    if (value.empty() && !wcscmp(row.var, L"VRAM_RESERVE_GIB")) return L"1.5 (default)";
     return value;
 }
 
@@ -1306,7 +1306,7 @@ void load_rows() {
         if (var == L"HF_HOME") row.initial = file.count(var) ? file[var] : L"huggingface";
         if (var == L"ENGINE_AUTOSTART") row.initial = row.initial == L"0" ? L"0" : L"1";
         if (var == L"MIN_KV_TOKENS" && !row.known) row.known = true, row.initial = L"0";
-        if (row.known && row.key && row.tier == Tier::engine && (var == L"MAX_SEQS" || var == L"MAX_TOKENS" || var == L"VRAM_BUDGET_GIB") && !row.initial.empty()) {
+        if (row.known && row.key && row.tier == Tier::engine && (var == L"MAX_SEQS" || var == L"MAX_TOKENS" || var == L"VRAM_RESERVE_GIB") && !row.initial.empty()) {
             wchar_t number[32];
             swprintf(number, 32, L"%g", wcstod(row.initial.c_str(), nullptr));  // (24.0 and 24 are the same choice)
             row.initial = number;
@@ -1516,7 +1516,7 @@ std::string settings_json() {
         std::string text;
         if (var == L"WEIGHTS" && !weights_from_scan() && weights_need_server(value)) continue;  // (the server does not take them)
         if (var == L"MAX_SEQS" || var == L"MAX_TOKENS") text = narrow(value);
-        else if (var == L"VRAM_BUDGET_GIB") text = value.empty() ? "null" : narrow(value);
+        else if (var == L"VRAM_RESERVE_GIB") text = value.empty() ? "null" : narrow(value);
         else text = json_quote(value);
         out += (out.empty() ? "\"" : ",\"") + std::string(row.key) + "\":" + text;
     }

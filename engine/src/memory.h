@@ -47,11 +47,12 @@ class Pool {
 struct Budget {
   size_t free_at_start = 0;   // cudaMemGetInfo free before any allocation
   size_t total = 0;
+  size_t reserve = 0;         // VRAM_RESERVE_GIB: bytes of the free VRAM left unused
   size_t budget = 0;          // device bytes this process may allocate in pools
-  size_t asked = 0;           // VRAM_BUDGET_GIB, if it was above what is free (and so not used)
+  size_t asked = 0;           // legacy VRAM_BUDGET_GIB, if it was above the budget (and so not used)
 };
 
-// min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context), or VRAM_BUDGET_GIB if that is lower.
+// max(0, free - VRAM_RESERVE_GIB (default 1.5)), or the legacy VRAM_BUDGET_GIB if that is lower.
 Budget make_budget();
 // The same for a device with `free` of `total` bytes free (after the CUDA context), without CUDA (Options::plan_only).
 Budget budget_for(size_t free, size_t total);

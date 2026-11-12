@@ -38,11 +38,9 @@ from typing import Any
 GiB = 2**30
 MiB = 2**20
 
-# VRAM (section 5: the engine budget is the free VRAM minus the WDDM margin, at most 30.3 GiB).
-VRAM_BUDGET_CAP_GIB = 30.3
-VRAM_CAP_APPLIES_BELOW_GIB = 34  # the cap is for ~32 GB cards only; cards at or above this use the real budget
-WDDM_MARGIN_GIB = 0.6
-# Weights + draft + state + activations, derived from the documented 605,504-token pool at a 30.3 GiB budget with
+# VRAM (section 5: the engine budget is the free VRAM minus VRAM_RESERVE_GIB, the default of memory.cc).
+VRAM_RESERVE_GIB = 1.5
+# Weights + draft + state + activations, derived from the documented 605,504-token pool at the 30.3 GiB budget of a 5090 with
 # 18 KiB/token NVFP4 KV.
 NON_KV_GIB = 19.9
 PARKING_GIB = 0.57  # 3 parking areas for MAX_SEQS = 4
@@ -291,9 +289,7 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
         reasons["KV_POOL_TOKENS"] = "GPU 未偵測，使用 compose.yaml 預設值。"
         reasons["MAX_TOKENS"] = "GPU 未偵測，使用 compose.yaml 預設值。"
     else:
-        # The cap is for ~32 GB cards; larger cards use their real budget (the pool is still capped at POOL_CAP_TOKENS).
-        cap = VRAM_BUDGET_CAP_GIB if total < VRAM_CAP_APPLIES_BELOW_GIB else math.inf
-        budget = min(cap, total - used - WDDM_MARGIN_GIB)
+        budget = max(0.0, total - used - VRAM_RESERVE_GIB)  # (the pool is still capped at POOL_CAP_TOKENS)
         kv_gib = budget - NON_KV_GIB - PARKING_GIB
         pool = kv_pool_tokens(kv_gib)
         if used > VRAM_USED_WARN_GIB:
@@ -318,8 +314,7 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
         env["MAX_TOKENS"] = str(max_tokens)
         reasons["KV_POOL_TOKENS"] = (
             f"{detected.get('gpu_name') or 'GPU'}：預算 {budget:.2f} GiB"
-            + (f"（上限 {VRAM_BUDGET_CAP_GIB}）" if cap != math.inf else "")
-            + f"，扣除非 KV {NON_KV_GIB} 與 3 個停放區 {PARKING_GIB} 後可容納 {pool:,} tokens。"
+            + f"（可用 VRAM 扣除保留 {VRAM_RESERVE_GIB} GiB），扣除非 KV {NON_KV_GIB} 與 3 個停放區 {PARKING_GIB} 後可容納 {pool:,} tokens。"
         )
         reasons["MAX_TOKENS"] = (
             f"池大於等於 {FULL_CONTEXT_TOKENS:,} tokens 時維持 {FULL_CONTEXT_TOKENS:,}，否則為池大小（向下取整到 1024）。"

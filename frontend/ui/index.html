@@ -787,7 +787,7 @@ function drawHeader() {
   if (st) {
     const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
     b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "dflash2" ? "DFlash2" : "no spec", `vision ${st.vision}`,
-      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM ${fmtVal("vram_budget_gib", st.vram_budget_gib)}`].join(" · "));
+      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM reserve ${fmtVal("vram_reserve_gib", st.vram_reserve_gib)}`].join(" · "));
     if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
   }
   b.append(" ", $("launch").hidden ? "▾" : "▴");
@@ -818,9 +818,9 @@ const OPTS = [
   { key: "vision", label: "Vision tower", note: "image input", names: { host: ["host", "pinned RAM, streamed"], fp8: ["GPU FP8"], bf16: ["GPU BF16"], off: ["off", "no images"] } },
   { key: "max_seqs", label: "Requests at once", note: "MAX_SEQS" },
   { key: "max_tokens", label: "Context limit", note: "per request, MAX_TOKENS" },
-  { key: "vram_budget_gib", label: "VRAM budget", note: "allocated by the engine", custom: true },
+  { key: "vram_reserve_gib", label: "VRAM reserve", note: "left free for other programs", custom: true },
 ];
-const fmtVal = (k, v) => k === "vram_budget_gib" ? (v == null ? "auto" : `${v} GiB`) :
+const fmtVal = (k, v) => k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -861,7 +861,7 @@ function repoName(v) {
 }
 function optButton(o, v, p) {
   let [name, sub] = o.names?.[v] || (o.key === "weights" && /^[^/]+\/[^/@]+(@.+)?$/.test(v) ? repoName(v) : [fmtVal(o.key, v)]);
-  if (o.key === "vram_budget_gib" && v == null && p?.budget) sub = fmtGiB(p.budget);
+  if (o.key === "vram_reserve_gib" && v == null && p?.budget) sub = fmtGiB(p.budget);
   const unavailable = o.key === "weights" && L.weights[v];
   const b = el("button", { class: "opt", "aria-pressed": String(L.form[o.key] === v), type: "button" },
     el("b", {}, name), sub ? el("span", { class: "muted", style: "font-size:11px" }, " " + sub) : null,
@@ -912,9 +912,9 @@ function drawLaunch() {
     if (o.key === "weights") for (const w of Object.keys(L.weights)) if (!vs.some((x) => x.value === w)) vs.push({ value: w, plan: null });
     for (const { value, plan } of vs) row.append(optButton(o, value, plan));
     if (o.custom) {
-      const inp = el("input", { type: "number", min: "4", step: "0.25", placeholder: "GiB", "aria-label": "VRAM budget in GiB" });
-      if (L.form.vram_budget_gib != null) inp.value = L.form.vram_budget_gib;
-      inp.addEventListener("change", () => { const v = parseFloat(inp.value); setForm("vram_budget_gib", isFinite(v) ? v : null); });
+      const inp = el("input", { type: "number", min: "0", step: "0.25", placeholder: "GiB", "aria-label": "VRAM reserve in GiB" });
+      if (L.form.vram_reserve_gib != null) inp.value = L.form.vram_reserve_gib;
+      inp.addEventListener("change", () => { const v = parseFloat(inp.value); setForm("vram_reserve_gib", isFinite(v) && v >= 0 ? v : null); });
       row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "custom "), inp, el("span", { class: "n" }, "GiB")));
     }
     box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
@@ -938,7 +938,7 @@ function drawLaunch() {
     stackBar(bar, leg, pools.map(([name, bytes, c]) => ({ name, bytes, c })), p.budget, (q) => q.c, "planned");
     sum.append(bar, leg);
     sum.append(el("div", { class: "muted" }, `Device pools ${fmtGiB(p.device)} of a ${fmtGiB(p.budget)} budget` +
-      (L.form.vram_budget_gib == null ? " (automatic: free memory minus 0.6 GiB, at most 30.3 GiB for the process)" : "") +
+      " (VRAM left free for other programs; budget = free VRAM minus the reserve" + (L.form.vram_reserve_gib == null ? ", 1.5 GiB by default)" : ")") +
       ` · pinned host memory ${fmtGiB(p.host)} · free device memory ${fmtGiB(dev.free)} ` +
       (dev.source === "engine" ? "(the running engine's, before its pools)" : "(now, less an engine's CUDA context: estimated)")));
   }

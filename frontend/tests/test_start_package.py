@@ -28,8 +28,8 @@ def test_the_weights_stay_in_the_folder_unless_settings_say_otherwise(tmp_path):
 def test_read_settings_as_notepad_saves_them(tmp_path):
     path = tmp_path / "settings.ini"
     assert sp.read_settings(path) == {}
-    text = '; comment\n[other]\nPORT=1\n[env]\n; PORT=2\nport = 8003\nHF_HOME="D:\\\u91cd\u307f"\nWDDM_MARGIN_GIB=0.5\n'
-    want = {"PORT": "8003", "HF_HOME": "D:\\\u91cd\u307f", "WDDM_MARGIN_GIB": "0.5"}
+    text = '; comment\n[other]\nPORT=1\n[env]\n; PORT=2\nport = 8003\nHF_HOME="D:\\\u91cd\u307f"\nVRAM_RESERVE_GIB=0.5\n'
+    want = {"PORT": "8003", "HF_HOME": "D:\\\u91cd\u307f", "VRAM_RESERVE_GIB": "0.5"}
     for encoded in (text.encode("utf-8"), b"\xef\xbb\xbf" + text.encode("utf-8"), text.encode("utf-16")):
         path.write_bytes(encoded)
         assert sp.read_settings(path) == want

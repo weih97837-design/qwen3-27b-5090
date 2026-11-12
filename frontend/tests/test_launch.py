@@ -17,7 +17,7 @@ from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
 DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dflash2", "vision": "host", "max_seqs": 8,
-            "max_tokens": 262144, "vram_budget_gib": None}
+            "max_tokens": 262144, "vram_reserve_gib": None}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
 
 
@@ -26,29 +26,58 @@ def settings():
 
 
 def test_auto_budget_is_the_engines():
-    # memory.cc budget_for: min(free - 0.6, 30.3 - used); the engine logged 28.69 GiB for this device.
-    assert abs(launch.auto_budget(*DEVICE) / GiB - 28.68) < 0.01
+    # memory.cc budget_for: max(0, free - reserve), the reserve 1.5 GiB unless given.
+    assert abs(launch.auto_budget(*DEVICE) / GiB - 28.70) < 0.01
+    assert abs(launch.auto_budget(*DEVICE, reserve=0.5) / GiB - 29.70) < 0.01
+    assert abs(launch.auto_budget(*DEVICE, reserve=0) / GiB - 30.20) < 0.01
+    assert launch.auto_budget(int(1 * GiB), DEVICE[1]) == 0 and launch.auto_budget(int(2 * GiB), reserve=3) == 0
 
 
 def test_validate():
     lc = settings()
-    assert lc.validate({"kv_dtype": "fp8", "vram_budget_gib": 20}) == dict(DEFAULTS, kv_dtype="fp8", vram_budget_gib=20.0)
+    assert lc.validate({"kv_dtype": "fp8", "vram_reserve_gib": 2}) == dict(DEFAULTS, kv_dtype="fp8", vram_reserve_gib=2.0)
     assert lc.settings == DEFAULTS  # (validate does not change them)
     for bad in ({"kv_dtype": "int4"}, {"max_seqs": 9}, {"max_seqs": 2.0}, {"max_tokens": 1 << 20}, {"vision": True},
-                {"vram_budget_gib": 2}, {"vram_budget_gib": "auto"}, {"what": 1}, {"weights": "/elsewhere"}):
+                {"vram_reserve_gib": -0.5}, {"vram_reserve_gib": "auto"}, {"vram_reserve_gib": True},
+                {"vram_reserve_gib": float("nan")}, {"vram_reserve_gib": float("inf")}, {"vram_budget_gib": 20},
+                {"what": 1}, {"weights": "/elsewhere"}):
         with pytest.raises(ValueError):
             lc.validate(bad)
-    with pytest.raises(ValueError, match="at most the automatic budget"):
-        lc.validate({"vram_budget_gib": 30}, device=DEVICE)
-    assert lc.validate({"vram_budget_gib": 28.5}, device=DEVICE)["vram_budget_gib"] == 28.5
+    assert lc.validate({"vram_reserve_gib": 0})["vram_reserve_gib"] == 0.0
+    assert lc.validate({"vram_reserve_gib": 1.234})["vram_reserve_gib"] == 1.23
+    assert lc.validate({"vram_reserve_gib": None})["vram_reserve_gib"] is None
+    with pytest.raises(ValueError, match="at most the device's memory"):
+        lc.validate({"vram_reserve_gib": 40}, device=DEVICE)
+    assert lc.validate({"vram_reserve_gib": 40}, device=DEVICE, check_budget=False)["vram_reserve_gib"] == 40.0
+    assert lc.validate({"vram_reserve_gib": 4}, device=DEVICE)["vram_reserve_gib"] == 4.0
+
+
+def test_reserve_default_is_the_compose_and_engine_one():
+    import re
+    compose = (ROOT / "compose.yaml").read_text()
+    assert float(re.search(r"^\s+VRAM_RESERVE_GIB: \$\{VRAM_RESERVE_GIB:-([^}]*)\}", compose, re.M).group(1)) == launch.DEFAULT_RESERVE_GIB
+    assert re.search(r"double reserve = %s;" % launch.DEFAULT_RESERVE_GIB, (ROOT / "engine/src/memory.cc").read_text())
+    assert launch.ENV_NAMES["vram_reserve_gib"] == "VRAM_RESERVE_GIB"
+    assert launch.env_settings()["vram_reserve_gib"] is None or os.environ.get("VRAM_RESERVE_GIB")
+
+
+def test_reserve_env_is_read_like_the_engine():
+    assert launch.parse_reserve("") is None and launch.parse_reserve(None) is None
+    assert launch.parse_reserve("2.5") == 2.5
+    assert launch.parse_reserve("-1") == 0.0 and launch.parse_reserve("abc") == 0.0 and launch.parse_reserve("nan") == 0.0
+
+
+def test_the_launcher_clears_a_legacy_budget():
+    import inspect
+    assert '"VRAM_BUDGET_GIB": None' in inspect.getsource(launch.Launch.config)
 
 
 def test_env_changes_name_what_changed_since_the_start():
     lc = object.__new__(launch.Launch)
-    lc.settings = lc.at_start = dict(DEFAULTS, vram_budget_gib=28.0)
+    lc.settings = lc.at_start = dict(DEFAULTS, vram_reserve_gib=3.0)
     assert lc.env_changes() == {}
-    lc.settings = dict(lc.at_start, kv_dtype="fp8", max_seqs=4, vram_budget_gib=None)
-    assert lc.env_changes() == {"KV_DTYPE": "fp8", "MAX_SEQS": "4", "VRAM_BUDGET_GIB": ""}
+    lc.settings = dict(lc.at_start, kv_dtype="fp8", max_seqs=4, vram_reserve_gib=None)
+    assert lc.env_changes() == {"KV_DTYPE": "fp8", "MAX_SEQS": "4", "VRAM_RESERVE_GIB": ""}
 
 
 def test_plan_device():
@@ -100,18 +129,18 @@ def test_plans_match_the_engine():
     # (28.378 until the own GEMMs replaced CUTLASS and its 7.8 MiB workspace, then 28.370 until the penalty
     # counts of the 8 sequences, 7.6 MiB).
     assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 605504, True)
-    assert abs(p["device"] / GiB - 28.3775) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
+    assert abs(p["device"] / GiB - 28.3775) < 0.001 and abs(p["budget"] / GiB - 28.70) < 0.01
     kv = {v["value"]: v["plan"] for v in out["variants"]["kv_dtype"]}
     assert kv["nvfp4"] == p and kv["fp8"]["kv_tokens"] < kv["nvfp4"]["kv_tokens"]
-    small = {v["value"]: v["plan"] for v in out["variants"]["vram_budget_gib"]}[20.0]
-    assert small["max_tokens"] < 262144 and small["max_tokens"] % 1024 == 0 and small["fits"]
+    big = {v["value"]: v["plan"] for v in out["variants"]["vram_reserve_gib"]}
+    assert big[4.0]["kv_tokens"] < p["kv_tokens"] <= big[0.5]["kv_tokens"] and big[None] == p
     seqs = [v["plan"]["kv_tokens"] for v in out["variants"]["max_seqs"]]
     assert seqs == sorted(seqs, reverse=True)  # (each sequence's buffers take some of the pool)
 
 
 def test_plan_errors():
     lc = planner_or_skip()
-    p = lc.plan_many([dict(DEFAULTS, vram_budget_gib=4.0)], DEVICE)[0]
+    p = lc.plan_many([dict(DEFAULTS, vram_reserve_gib=20.0)], DEVICE)[0]
     assert "error" in p and "VRAM budget" in p["error"]
 
 
@@ -137,13 +166,14 @@ def test_tokenizer_fingerprint(tmp_path):
     assert fingerprint(write("other", [["a", "b"]], r"\p{L}\p{M}+", {"a": 0, "b": 1, "ab": 5})) != base
 
 
-def test_too_little_free_vram_lowers_the_pool_and_an_asked_budget():
+def test_too_little_free_vram_lowers_the_pool_and_a_big_reserve_does_too():
     lc = planner_or_skip()
     full = lc.plan_many([dict(DEFAULTS)], DEVICE)[0]
-    busy, asked = lc.plan_many([dict(DEFAULTS), dict(DEFAULTS, vram_budget_gib=30.0)], (int(25 * GiB), DEVICE[1]))
+    busy, reserved = lc.plan_many([dict(DEFAULTS), dict(DEFAULTS, vram_reserve_gib=6.2)], (int(25 * GiB), DEVICE[1]))
     assert busy["kv_tokens"] < full["kv_tokens"] and busy["fits"]
-    assert asked["budget"] == busy["budget"] == launch.auto_budget(int(25 * GiB), DEVICE[1])  # (not 30 GiB)
-    assert asked["device"] <= launch.auto_budget(int(25 * GiB), DEVICE[1])
+    assert busy["budget"] == launch.auto_budget(int(25 * GiB), DEVICE[1])
+    assert reserved["budget"] == launch.auto_budget(int(25 * GiB), DEVICE[1], reserve=6.2) < busy["budget"]
+    assert reserved["device"] <= reserved["budget"]
 
 
 def test_every_shortage_is_named_as_such():
