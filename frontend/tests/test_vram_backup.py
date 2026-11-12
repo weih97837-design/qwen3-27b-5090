@@ -38,6 +38,7 @@ class Base:
         self.entries, self.next_id = {}, 1
         self.exports, self.conn = [], None
         self.backup_calls, self.marks, self.backed_up = [], [], 0
+        self.victims = []  # the `victims` argument of each spill_backup_one call (0: any checkpoint)
 
     def _advance(self, seconds):
         if self.clock is not None:
@@ -46,7 +47,7 @@ class Base:
     def add_ram(self, size=100, backup=False):
         i = self.next_id
         self.next_id += 1
-        self.entries[i] = {"id": i, "pos": 0, "ram_bytes": size, "on_disk": False, "path": "", "last_use": 0,
+        self.entries[i] = {"id": i, "pos": 10_000, "ram_bytes": size, "on_disk": False, "path": "", "last_use": 0,
                            "backup": backup}
         return i
 
@@ -88,9 +89,10 @@ class Engine(Base):
     on_backup = None  # hook(index of the call), run inside spill_backup_one
     fail_backup = None
 
-    def spill_backup_one(self):
+    def spill_backup_one(self, victims=0):
         n = len(self.backup_calls)
         self.backup_calls.append(n)
+        self.victims.append(victims)
         self.marks.append(len(self.conn.polls) if self.conn else 0)
         if self.on_backup:
             self.on_backup(n)
@@ -390,6 +392,21 @@ def test_status_counts_backup_entries():
     assert st["backup_entries"] == 1 and st["ram_entries"] == 2
 
 
+def test_status_splits_each_tier_into_backups_and_evicted(tmp_path):
+    f = tmp_path / "e3"
+    f.write_bytes(b"x" * 40)
+    eng = Base()
+    t = tiers_for(eng)
+    t.listed = [{"id": 1, "ram_bytes": 100, "on_disk": False, "path": "", "backup": True},
+                {"id": 2, "ram_bytes": 300, "on_disk": False, "path": ""},
+                {"id": 3, "ram_bytes": 0, "on_disk": True, "path": str(f)}]
+    st = t.status()
+    assert (st["ram_backup_entries"], st["ram_backup_bytes"]) == (1, 100)
+    assert (st["ram_evicted_entries"], st["ram_evicted_bytes"]) == (1, 300)
+    assert (st["disk_evicted_entries"], st["disk_evicted_bytes"]) == (1, 40)
+    assert (st["disk_backup_entries"], st["disk_backup_bytes"]) == (0, 0)
+
+
 def test_retention_never_writes_backup_entries(tmp_path):
     # A backup's checkpoint is still in VRAM: past twice the retention, idle or busy, it stays in RAM (no SSD copy).
     eng = Base()
@@ -488,3 +505,29 @@ def test_ui_has_the_backup_counter_and_entry_count():
     assert '["已備份 backed_up", "backed_up"]' in html
     assert "VRAM 備份" in html
     assert "t.backup_entries" in html  # (a missing key shows "–", as the other counters)
+
+
+# ------------------------------------------------------------ restrained backup: only the next victims
+
+def test_idle_backup_asks_for_the_next_victims_only(tmp_path):
+    eng = Engine(vram=2)
+    t = tiers_for(eng, backup_victims=5)
+    s = make_sched(eng, t)
+    s.backup_one()
+    assert eng.victims == [5]
+
+
+def test_stop_flush_backs_up_any_checkpoint(tmp_path):
+    eng = Engine(vram=2)
+    t = tiers_for(eng, tmp_path / "spill", backup_victims=5)
+    t.start()
+    s = make_sched(eng, t)
+    s.flush_on_stop()
+    assert eng.victims and set(eng.victims) == {0}  # (everything that is left, not only the next victims)
+
+
+def test_backup_victims_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SPILL_RAM_GIB", "8")
+    assert TierPolicy.from_env(Base(), log=lambda _m: None).backup_victims == 8
+    monkeypatch.setenv("VRAM_BACKUP_VICTIMS", "3")
+    assert TierPolicy.from_env(Base(), log=lambda _m: None).backup_victims == 3

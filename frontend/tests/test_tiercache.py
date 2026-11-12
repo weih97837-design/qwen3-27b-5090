@@ -28,10 +28,10 @@ class FakeEngine:
         self.fail_export = set()
         self.fail_drop = set()  # ids whose drop raises, as when the entry was promoted back to the GPU
 
-    def add_ram(self, size):
+    def add_ram(self, size, pos=10_000):  # (pos: the token count; the default is above SPILL_SSD_MIN_TOKENS)
         entry_id = self.next_id
         self.next_id += 1
-        self.entries[entry_id] = {"id": entry_id, "pos": 0, "ram_bytes": size, "on_disk": False,
+        self.entries[entry_id] = {"id": entry_id, "pos": pos, "ram_bytes": size, "on_disk": False,
                                   "last_use": 0, "path": ""}
         return entry_id
 
@@ -455,3 +455,69 @@ def test_start_fails_loudly_when_spill_dir_is_not_writable(tmp_path):
         assert not any(d.iterdir())  # the probe file is not left behind
     finally:
         d.chmod(0o755)
+
+
+def _retention(env):
+    env.clock.t = 0
+    env.tier.tick(idle=True)
+    env.clock.t = 3600
+    env.tier.tick(idle=True)
+
+
+def test_short_entry_past_retention_is_dropped_not_exported(env):
+    short, long_ = env.eng.add_ram(400, pos=100), env.eng.add_ram(400, pos=8192)
+    _retention(env)
+    assert env.eng.exports == [long_]
+    assert env.eng.drops == [short] and short not in env.eng.entries
+    assert env.eng.entries[long_]["on_disk"]
+    assert env.tier.status()["ssd_skipped_short"] == 1
+    assert list(env.dir.glob("*" + tiercache.SUFFIX)) == [pathlib.Path(env.eng.entries[long_]["path"])]
+
+
+def test_short_entry_is_kept_in_ram_before_retention(env):
+    short = env.eng.add_ram(400, pos=100)
+    env.clock.t = 0
+    env.tier.tick(idle=True)
+    env.clock.t = 3599
+    env.tier.tick(idle=True)
+    assert env.eng.drops == [] and short in env.eng.entries
+
+
+def test_min_tokens_zero_exports_everything(env):
+    env.tier.ssd_min_tokens = 0
+    rid = env.eng.add_ram(400, pos=1)
+    _retention(env)
+    assert env.eng.exports == [rid] and env.eng.drops == []
+    assert env.tier.status()["ssd_skipped_short"] == 0
+
+
+def test_short_entry_on_disk_is_unaffected(env):
+    rid = env.eng.add_ram(400, pos=100)
+    env.tier.ssd_min_tokens = 0
+    _retention(env)
+    assert env.eng.entries[rid]["on_disk"]
+    env.tier.ssd_min_tokens = 8192
+    env.clock.t = 3700
+    env.tier.tick(idle=True)
+    assert rid in env.eng.entries and env.eng.entries[rid]["on_disk"] and env.eng.drops == []
+    assert env.tier.status()["ssd_skipped_short"] == 0
+
+
+def test_flush_on_stop_skips_short_entries(env):
+    short, long_ = env.eng.add_ram(400, pos=5), env.eng.add_ram(400, pos=9000)
+    assert env.tier.flush(10)["written"] == 1
+    assert env.eng.exports == [long_] and short in env.eng.entries
+
+
+def test_from_env_reads_min_tokens(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPILL_RAM_GIB", "4")
+    monkeypatch.setenv("SPILL_DIR", str(tmp_path))
+    monkeypatch.delenv("SPILL_SSD_MIN_TOKENS", raising=False)
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 8192
+    monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "0")
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 0
+    monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "2000.9")
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 2000
+    monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "many")
+    with pytest.raises(ValueError, match="SPILL_SSD_MIN_TOKENS"):
+        TierPolicy.from_env(FakeEngine(), log=lambda _m: None)

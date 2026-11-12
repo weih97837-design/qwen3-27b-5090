@@ -568,6 +568,7 @@ void Model::reset() {
   spec_pending_ = false;
   release_seq();
   plan_.clear();
+  ring_from_ = 0;
   ring_valid_ = false;
   spec_last_ = -1;
   Q27_CUDA(cudaStreamSynchronize(s_));
@@ -613,14 +614,23 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
   upload_pages(table + have, pages.data() + have, pages.size() - have);
 }
 
-bool Model::evict_checkpoint() {
+bool Model::evict_checkpoint(bool for_slot) {
   // (SPILL_ASYNC_PROMOTE; spill.cc (F)) The least recently used checkpoint that is neither loading (its host -> device
   // copy is still queued) nor held (restored, its request has not run yet); else the oldest held one; else, with only
   // loading ones left, the oldest of those is finished synchronously (a rare stall instead of KvFull) and evicted.
+  // Within that, when a state slot is wanted (for_slot), a checkpoint another one of its chain covers (ckpt_covered: the
+  // turns of one conversation each save theirs, and the deepest resumes all of them) goes before any other, least
+  // recently used first; the rest is LRU. Callers that want pool pages take plain LRU: a covered checkpoint shares its pages
+  // with the deeper one, so evicting it frees next to none.
   auto oldest = [&](bool held) {
     auto it = ckpts_.end();
-    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c)
-      if (!c->loading && c->held == held && (it == ckpts_.end() || c->last_use < it->last_use)) it = c;
+    bool it_covered = false;
+    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c) {
+      if (c->loading || c->held != held) continue;
+      if (it != ckpts_.end() && c->last_use >= it->last_use && it_covered) continue;  // (cannot beat a covered LRU one)
+      const bool cov = for_slot && ckpt_covered(*c);
+      if (it == ckpts_.end() || (cov && !it_covered) || (cov == it_covered && c->last_use < it->last_use)) it = c, it_covered = cov;
+    }
     return it;
   };
   auto it = oldest(false);
@@ -676,6 +686,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   for (auto& c : ckpts_)
     if (!c.loading && c.pos() == pos && c.ring >= ring && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
       c.last_use = ++use_clock_;
+      if (share_take(pos)) c.share_until = use_clock_ + kShareTtl;
       return;
     }
   // A free allocated slot; else allocate another one; else evict the least recently used checkpoint.
@@ -684,7 +695,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
     for (size_t i = 0; i < slot_used_.size() && slot < 0; i++)
       if (slot_mem_[i] && !slot_used_[i]) slot = int(i);
     if (slot >= 0) break;
-    if (!grow_state_cache(1) && !evict_checkpoint()) fail("checkpoint: no state slot");
+    if (!grow_state_cache(1) && !evict_checkpoint(true)) fail("checkpoint: no state slot");
   }
   Checkpoint ck;
   ck.ids = ids;
@@ -693,6 +704,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   ck.slot = slot;
   ck.ring = ring;
   ck.last_use = ++use_clock_;
+  if (share_take(pos)) ck.share_until = use_clock_ + kShareTtl;
   slot_used_[slot] = true;
   // State -> staging (device, fast) -> host slot on the copy stream, overlapping what follows.
   Q27_CUDA(cudaStreamWaitEvent(s_, stage_ev_));
@@ -724,6 +736,9 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     const_cast<Checkpoint*>(best)->held = false;  // (its owner is here)
+    // The shared checkpoints on this chain have served their waiter (a later one, deeper, is the match now).
+    for (auto& c : ckpts_)
+      if (c.share_until && c.pos() <= cached && std::equal(c.ids.begin(), c.ids.end(), ids)) c.share_until = 0;
     // The state from its host slot (after its device -> host copy), before anything can evict it.
     Q27_CUDA(cudaStreamSynchronize(cs_));
     const char* src = slot_mem_[best->slot];
@@ -1413,6 +1428,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
           break;
         }
       const int skip = std::clamp(target - ddims::kWindow - pos_, 0, T);
+      if (skip > 0) ring_from_ = pos_ + skip;  // (add_checkpoint_at: a checkpoint's window must start after the last skipped row)
       draft_->append_ctx(cap_ + size_t(skip) * ddims::kCtxFeatures * kHidden, T - skip, pos_dev_, skip - T, nullptr,
                          skinny_ws_, kSkinnyWsBytes, big1_, size_t(opt_.prefill_chunk) * kInter * 4, s_);
     }
@@ -1905,6 +1921,7 @@ void Model::seq_take(SeqState& st) {
   st.mm = std::move(mm_spans_);
   st.spec_last = spec_last_;
   st.ring_valid = ring_valid_;
+  st.ring_from = ring_from_;
   st.smp = spec_smp_;
   seq_pages_.clear(), seq_ids_.clear(), plan_.clear(), mm_spans_.clear();
   pos_ = 0;
@@ -1921,6 +1938,7 @@ void Model::seq_give(SeqState& st) {
   mm_spans_ = std::move(st.mm);
   spec_last_ = st.spec_last;
   ring_valid_ = st.ring_valid;
+  ring_from_ = st.ring_from;
   spec_smp_ = st.smp;
   st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
   if (!seq_pages_.empty())
@@ -2043,6 +2061,47 @@ void Model::seq_drop(int a) {
   st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
   st.used = false;
   release_area(a);
+}
+
+bool Model::add_checkpoint_at(int a, int pos) {
+  if (!cache_on_) return false;
+  std::vector<int32_t>* plan = &plan_;
+  int cur = pos_, ring_from = ring_from_;
+  if (a >= 0) {
+    if (a >= int(parked_.size()) || !parked_[a].used) return false;
+    plan = &parked_[a].plan, cur = parked_[a].pos, ring_from = parked_[a].ring_from;
+  }
+  const int p = pos / kGdnChunk * kGdnChunk;
+  if (p - cur <= kSkinnyMaxM) return false;
+  if (std::find(plan->begin(), plan->end(), p) != plan->end()) return true;  // (planned already: a second sharer)
+  if (std::any_of(plan->begin(), plan->end(), [&](int32_t q) { return std::abs(q - p) <= kSkinnyMaxM; })) return false;
+  // With a draft, earlier chunks skipped the context rows more than a window before THEIR next checkpoint: p's window
+  // must lie past the last skipped row, or the checkpoint would claim a ring with a hole (prompt_chunks).
+  if (draft_ && p - ddims::kWindow < ring_from) return false;
+  plan->insert(std::upper_bound(plan->begin(), plan->end(), p), p);
+  share_mark(p);
+  return true;
+}
+
+void Model::share_mark(int pos) {
+  const int p = pos / kGdnChunk * kGdnChunk;
+  for (auto& m : share_marks_)
+    if (m.pos == p) {
+      m.until = use_clock_ + kShareTtl;
+      return;
+    }
+  if (share_marks_.size() >= 16) share_marks_.erase(share_marks_.begin());
+  share_marks_.push_back({p, use_clock_ + kShareTtl});
+}
+
+bool Model::share_take(int pos) {
+  bool found = false;
+  for (size_t i = 0; i < share_marks_.size();) {
+    if (share_marks_[i].until <= use_clock_) share_marks_.erase(share_marks_.begin() + i);
+    else if (share_marks_[i].pos == pos) found = true, share_marks_.erase(share_marks_.begin() + i);
+    else i++;
+  }
+  return found;
 }
 
 void Model::seq_suspend(int a) {

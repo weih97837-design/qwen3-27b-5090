@@ -310,6 +310,14 @@ int q27_seq_unpark(void* m, int area) {
 int q27_seq_swap(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_swap(area); });
 }
+// ok = 1 when the position was added to the plan of the sequence in `area` (-1: the running one), else 0.
+int q27_add_checkpoint_at(void* m, int area, int pos, int* ok) {
+  return guard([&] { *ok = static_cast<Model*>(m)->add_checkpoint_at(area, pos) ? 1 : 0; });
+}
+// Marks pos as shared with a waiting request (kept from the covered-first eviction until it is used).
+int q27_share_mark(void* m, int pos) {
+  return guard([&] { static_cast<Model*>(m)->share_mark(pos); });
+}
 int q27_seq_drop(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_drop(area); });
 }
@@ -435,7 +443,12 @@ int q27_spill_grow_pinned(void* m, int n, int* added) {
 
 // *done: 1 when a checkpoint was copied to host memory (it stays in the pool), 0 when none needed a copy.
 int q27_spill_backup_one(void* m, int* done) {
-  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(); });
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(0); });
+}
+// The idle backup: only one of the next `victims` checkpoints the pool would evict (and within half the RAM cap).
+// (A new export, so that the frontend can tell an older library, which has only q27_spill_backup_one.)
+int q27_spill_backup_next(void* m, int victims, int* done) {
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(victims); });
 }
 
 // out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.

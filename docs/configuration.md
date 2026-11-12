@@ -111,7 +111,7 @@ everywhere above.
 | `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft) or `none` |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
-| `STATE_HOST_CACHE` | 4 | GiB of pinned host memory for prefix-cache checkpoints (4 = 21 checkpoints; 0 disables the cache; the server sets 4 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning 4 GiB takes about 1.8 s on WSL2): one by one while the server is idle, or when a checkpoint needs one |
+| `STATE_HOST_CACHE` | 8 | GiB of pinned host memory for prefix-cache checkpoints (8 = about 42 checkpoints, twice the 21 of 4; 0 disables the cache; the server sets 8 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning takes about 0.45 s per GiB on WSL2): one by one while the server is idle, or when a checkpoint needs one |
 | `KV_POOL_TOKENS` | 524288 | KV pool size in tokens: the default is 512K (about 9 GiB of VRAM with NVFP4 KV). 0 = all the VRAM budget leaves. When set, it is the KV cache with every parking area in use; the pool is that plus the parking areas (P7-13). Checkpoints evicted from the pool go to the spill tiers ([tiered-cache.md](tiered-cache.md)). With MAX_TOKENS_FIT=1 (the default) a pool the VRAM budget cannot hold is lowered to what fits (logged), and MAX_TOKENS with it if needed. |
 | `SPILL_RAM_GIB` | 64 | Host RAM for KV checkpoints evicted from the GPU pool, in GiB. 0: off (the evicted checkpoints are dropped). Counts against the WSL2 VM's memory ([tiered-cache.md](tiered-cache.md#wsl2-注意事項)) |
 | `SPILL_PINNED_GIB` | 0 | Pinned host memory (GiB) for spill entries, pinned in 1 GiB slabs while the server is idle (`SPILL_PINNED_SLAB_MIB`). Faster copies. An entry is stored in segments (each inside one slab), so entries larger than a slab are pinned too; an entry the pool cannot hold completely uses normal memory. Part of the `SPILL_RAM_GIB` budget: the whole pinned pool counts toward it (reserved host memory, even when unused), and the value is clamped at startup to below it, leaving room for one checkpoint (at least 0.25 GiB). 0: off (default). Counts against Windows shared GPU memory ([tiered-cache.md](tiered-cache.md#加速選項預設關閉)). Turn on only after `scripts/tiered_cache_test.py` passes on your GPU |
@@ -121,11 +121,13 @@ everywhere above.
 | `SPILL_RAM_RETENTION_S` | 3600 | Seconds a checkpoint stays in RAM before `frontend/tiercache.py` writes it to SSD (only when idle) |
 | `SPILL_SSD_GIB` | 100 | Cap of the SSD tier in GiB; the oldest files are deleted first |
 | `SPILL_SSD_MIN_FREE_GIB` | 10 | The SSD tier never fills the disk below this much free space |
+| `SPILL_SSD_MIN_TOKENS` | 8192 | Spilled checkpoints shorter than this many tokens are never written to the SSD: past `SPILL_RAM_RETENTION_S` they are dropped from RAM instead. Every entry carries a ~190 MiB recurrent state whatever its length, and a short prefix recomputes in about 0.2-0.4 s, about the time a read takes. 0: no minimum (every entry is written). Entries already on disk are unaffected |
 | `SPILL_TTL_DAYS` | 7 | Files not reused for this many days are deleted |
 | `SPILL_TICK_S` | 30 | Seconds between the tier maintenance passes |
+| `VRAM_BACKUP_VICTIMS` | 8 | The idle backup copies only one of the next N checkpoints the pool would evict (0: any); the copies also stay within half of `SPILL_RAM_GIB`. Environment only |
 | `VRAM_BACKUP_IDLE_S` | 60 | Seconds the engine must be idle before it copies VRAM checkpoints to RAM while keeping them in VRAM (idle backup, [tiered-cache.md](tiered-cache.md#閒置時預先備份vram-保留)). Needs `SPILL_RAM_GIB` above 0. 0: off |
 | `SPILL_FLUSH_ON_STOP_S` | 8 | Seconds a stop (idle unload, restart, shutdown) may spend backing up VRAM checkpoints (half of it) and writing RAM entries to `SPILL_DIR`. Cut to 8: `server.py` gives the engine 15 s to exit on an unload or restart and 10 s on shutdown, then terminates it. 0: off |
-| `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
+| `CHECKPOINT_INTERVAL` | 4096 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
 | `IMAGE_TOKENS` | 16384 | Image tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB) |
@@ -257,6 +259,7 @@ variables:
 | `spill_ram_retention_s` | `SPILL_RAM_RETENTION_S` | Seconds, 0 or more (3600) |
 | `spill_ssd_gib` | `SPILL_SSD_GIB` | GiB, 0 or more (100) |
 | `spill_ssd_min_free_gib` | `SPILL_SSD_MIN_FREE_GIB` | GiB, 0 or more (10) |
+| `spill_ssd_min_tokens` | `SPILL_SSD_MIN_TOKENS` | Tokens, 0 or more (8192; 0: no minimum; a fraction is rounded down) |
 | `spill_ttl_days` | `SPILL_TTL_DAYS` | Days, 0 or more (7) |
 | `vram_backup_idle_s` | `VRAM_BACKUP_IDLE_S` | Seconds, 0 or more (60; 0: off) |
 | `spill_pinned_gib` | `SPILL_PINNED_GIB` | GiB, 0 or more (0: off; the engine clamps it below `SPILL_RAM_GIB`) |
@@ -391,7 +394,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
-| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
+| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_SSD_MIN_TOKENS`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |

@@ -31,7 +31,7 @@ struct Options {
   // checkpoints inside long prompts.
   double state_cache_gib = 0;
   int kv_pool_tokens = 0;
-  int checkpoint_interval = 8192;
+  int checkpoint_interval = 4096;
   // Tiered cache (needs the prefix cache): GiB of host memory for checkpoints the KV pool gives up (0: off, they are
   // dropped as before), and the folder they are written to when that is full (empty: the oldest is dropped then).
   double spill_ram_gib = 0;
@@ -179,7 +179,7 @@ class Model {
   // Idle backup: copies the least recently used pool checkpoint that has no valid backup to host memory and keeps it
   // in the pool too. Its eviction then only marks the copy as the sole one (no copy stall). 1: one was copied, 0: none
   // needed it (or no tiered cache). Called by the frontend while the engine is idle, repeatedly until 0.
-  int spill_backup_one();
+  int spill_backup_one(int victims = 0);
   // SPILL_ASYNC_PROMOTE (Options::spill_async_promote; delay-hit scheduling: the frontend admits other requests while
   // an entry loads). All three run on the engine thread between steps and never block on the GPU or the disk.
   // spill_match: the best spilled entry (not an idle backup) deeper than the pool's best visible match, by spill_lookup's
@@ -228,6 +228,16 @@ class Model {
   void seq_drop(int a);
   void seq_suspend(int a);
   int park_slots() const { return int(parked_.size()); }
+  // Adds a checkpoint position to the plan of a sequence that is already prefilling: the running one (a < 0) or the
+  // one in parking area a. pos is rounded down to a multiple of 64 and must lie more than 64 tokens past the
+  // sequence's position and from every planned one (a shorter chunk takes the decode GEMMs and would not match an
+  // uncut prefill bit for bit, prefix_begin); the caller also keeps it more than 64 before the end of that prompt
+  // (the engine does not know it). True also when it is planned already; false, with nothing changed, when it cannot be.
+  bool add_checkpoint_at(int a, int pos);
+  // Marks pos (rounded down to 64) as a position a waiting request shares (add_checkpoint_at does it itself; the frontend
+  // calls this for one it put in the plan of a request that has not begun). The checkpoint saved there next is kept from
+  // the covered-first eviction until a prefix_begin uses it or kShareTtl further uses of the cache have passed.
+  void share_mark(int pos);
 
   // Batched speculative steps (P6-10). One step of each of n (2..4) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
@@ -271,11 +281,12 @@ class Model {
   void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
-  bool evict_checkpoint();           // the least recently used one; false when there is none
+  bool evict_checkpoint(bool for_slot = false);           // the least recently used one (for_slot: a covered one first); false when there is none
   // Tiered cache (spill.cc).
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
+  bool ckpt_covered(const Checkpoint& c) const;  // a deeper, usable checkpoint of the same chain is in the pool and c is long
   uint64_t spill_copy(const Checkpoint& c, bool live);  // the copy of c's pages and state as a new entry; 0: no memory
   uint64_t spill_add(const Checkpoint& c, Spilled&& s, bool live);  // s (copied from c) becomes entry spill_next_; its id
   void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's
@@ -381,6 +392,7 @@ class Model {
   std::vector<int32_t> seq_ids_;     // tokens fed so far (== pos_ once nothing is pending)
   int32_t spec_last_ = -1;           // last token returned by spec_begin / spec_step (fed by the next step)
   bool ring_valid_ = false;          // the draft's context ring holds the last 2,048 positions
+  int ring_from_ = 0;                // prefill with a draft: the context rows from this position on were all appended (earlier chunks skip those a window before the next checkpoint)
   size_t kv_page_bytes_ = 0;         // one page of one layer's K (or V)
   // The KV pool is block-major (P7-13): pages come in blocks of kv_block_; a block holds the K and V slices
   // (kKvSlices: layer l's K is slice 2 l, its V 2 l + 1) of its pages, slice by slice, each slice the block's
@@ -439,6 +451,10 @@ class Model {
   bool spill_sync_lookup_ = true;
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
   uint64_t use_clock_ = 0;
+  struct ShareMark { int pos; uint64_t until; };
+  std::vector<ShareMark> share_marks_;  // positions planned for a waiting sibling, not saved yet (share_mark)
+  static constexpr uint64_t kShareTtl = 512;  // (use_clock_ ticks: saves and lookups)
+  bool share_take(int pos);  // erases the live mark at pos (and the expired ones); whether there was one
   CacheStats cstats_;
   std::map<uint64_t, Spilled> spill_;  // (a map: entries stay put while others come and go)
   uint64_t spill_next_ = 1;
@@ -477,6 +493,7 @@ class Model {
     std::vector<MmSpan> mm;
     int32_t spec_last = -1;
     bool ring_valid = false;
+    int ring_from = 0;
     SpecSampling smp{};
     int32_t scalars[kSeqScalars] = {};
   };

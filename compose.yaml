@@ -80,9 +80,9 @@ services:
       SPEC: ${SPEC:-dflash2}                       # dflash2 | none
       Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
       Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
-      STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
+      STATE_HOST_CACHE: ${STATE_HOST_CACHE:-8}     # prefix cache: GiB of pinned state checkpoints (0: off)
       KV_POOL_TOKENS: ${KV_POOL_TOKENS:-524288}    # 524288 = 512K tokens (about 9 GiB VRAM with NVFP4 KV); 0: what the VRAM budget leaves
-      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-8192}
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-4096}
       SPILL_RAM_GIB: ${SPILL_RAM_GIB:-64}          # host RAM for checkpoints evicted from the KV pool (0: off; the tiers are in docs/tiered-cache.md)
       SPILL_PINNED_GIB: ${SPILL_PINNED_GIB:-0}     # pinned host memory for spill entries, faster copies (off by default: turn on only after scripts/tiered_cache_test.py passes on your GPU; counts against Windows shared GPU memory, see docs/tiered-cache.md)
       SPILL_PINNED_SLAB_MIB: ${SPILL_PINNED_SLAB_MIB:-1024}  # size of each pinned slab, pinned one per idle step (an entry may span several; only used with SPILL_PINNED_GIB)
@@ -92,9 +92,11 @@ services:
       SPILL_RAM_RETENTION_S: ${SPILL_RAM_RETENTION_S:-3600}  # seconds a checkpoint stays in RAM before it is written to SSD (idle time)
       SPILL_SSD_GIB: ${SPILL_SSD_GIB:-100}         # SSD tier cap; the oldest files are deleted first
       SPILL_SSD_MIN_FREE_GIB: ${SPILL_SSD_MIN_FREE_GIB:-10}  # never fill the disk below this much free space
+      SPILL_SSD_MIN_TOKENS: ${SPILL_SSD_MIN_TOKENS:-8192}  # spilled checkpoints shorter than this many tokens are never written to SSD (dropped instead; 0: no minimum)
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # files not reused for this many days are deleted
       SPILL_TICK_S: ${SPILL_TICK_S:-30}            # seconds between the tier maintenance passes
       VRAM_BACKUP_IDLE_S: ${VRAM_BACKUP_IDLE_S:-60}  # idle seconds before VRAM checkpoints are copied to RAM, kept in VRAM (0: off)
+      VRAM_BACKUP_VICTIMS: ${VRAM_BACKUP_VICTIMS:-8}  # the idle backup copies only the next N checkpoints the pool would evict (0: any)
       SPILL_FLUSH_ON_STOP_S: ${SPILL_FLUSH_ON_STOP_S:-8}  # seconds a stop may spend backing up and writing RAM entries to SSD (0: off; at most 8)
       VISION: ${VISION:-host}                      # off | host | fp8 | bf16: image input (P4-12)
       IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-4194304}  # images are resized to at most this many pixels

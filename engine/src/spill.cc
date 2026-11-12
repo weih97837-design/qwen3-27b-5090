@@ -90,6 +90,7 @@
 #include <new>
 #include <sstream>
 #include <system_error>
+#include <tuple>
 
 #include "model.h"
 
@@ -306,6 +307,26 @@ bool Model::spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const {
   return false;
 }
 
+// Whether evicting c loses little: one deeper checkpoint of the same chain (same tokens up to c's) is in the pool and
+// usable and every other checkpoint extending c lies on that same chain (a branch point, where two conversations
+// diverge, is kept), and c is past kKeepShort (shorter ones are shared by new conversations, kept like in
+// spill_subsumed). The deeper one resumes everything c would, except a retry that branches off before c's end. Not
+// loading ones: they are not usable yet.
+bool Model::ckpt_covered(const Checkpoint& c) const {
+  if (c.pos() <= kKeepShort || c.share_until > use_clock_) return false;  // (a sibling-share one: its waiter has not used it)
+  const Checkpoint* deepest = nullptr;
+  for (const auto& o : ckpts_)
+    if (&o != &c && !o.loading && o.ids.size() > c.ids.size() && covers(o.ids, o.ring, c.ids, c.ring) &&
+        (!deepest || o.ids.size() > deepest->ids.size()))
+      deepest = &o;
+  if (!deepest) return false;
+  for (const auto& o : ckpts_)
+    if (&o != &c && !o.loading && o.ids.size() > c.ids.size() && covers(o.ids, o.ring, c.ids, c.ring) &&
+        !covers(deepest->ids, deepest->ring, o.ids, o.ring))
+      return false;
+  return true;
+}
+
 void Model::spill_checkpoint(const Checkpoint& c) {
   if (spill_subsumed(c, 0)) {
     sstats_.subsumed++;
@@ -386,17 +407,49 @@ uint64_t Model::spill_add(const Checkpoint& c, Spilled&& s, bool live) {
   return id;
 }
 
-int Model::spill_backup_one() {
+int Model::spill_backup_one(int victims) {
   if (!spill_on()) return 0;
-  // The least recently used pool checkpoint with no valid backup that spill_checkpoint would not subsume.
+  // The pool checkpoint to copy: no valid backup, and one spill_checkpoint would not subsume. victims > 0 (the idle
+  // backup): only among the first `victims` of those in the order evict_checkpoint takes them (not held, then the ones
+  // a deeper checkpoint covers (never needing a copy: subsumed), then least recently used), so the RAM tier holds
+  // copies of what is about to leave the pool, not of everything. victims <= 0 (the stop flush): all of them.
+  // (Page-pressure eviction, evict_checkpoint without for_slot, is plain LRU; this order puts covered ones first. The two
+  // nearly agree all the same: a covered checkpoint is mostly skipped below as subsumed, never needing a copy, so the
+  // ranking among the rest is LRU in both.)
+  std::vector<Checkpoint*> order;
+  for (auto& c : ckpts_)
+    if (!c.loading) order.push_back(&c);  // (C) a loading one's pages are still being filled
+  std::vector<char> covered(order.size());
+  for (size_t i = 0; i < order.size(); i++) covered[i] = ckpt_covered(*order[i]);
+  std::vector<size_t> idx(order.size());
+  for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+  std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+    return std::make_tuple(order[a]->held, !covered[a], order[a]->last_use) <
+           std::make_tuple(order[b]->held, !covered[b], order[b]->last_use);
+  });
   Checkpoint* pick = nullptr;
-  for (auto& c : ckpts_) {
-    if (c.loading) continue;  // (C) its pages are still being filled
-    if (c.backup && spill_.find(c.backup) != spill_.end()) continue;  // (a)
-    if (pick && c.last_use >= pick->last_use) continue;
-    if (!spill_subsumed(c, 0)) pick = &c;  // (b): as spill_checkpoint's rules
+  int ranked = 0;
+  for (size_t i : idx) {
+    Checkpoint& c = *order[i];
+    const bool backed = c.backup && spill_.find(c.backup) != spill_.end();  // (a)
+    // (b): as spill_checkpoint's rules. (A backed-up one counts, though its own copy "subsumes" it: it is a victim.)
+    if (!backed && spill_subsumed(c, 0)) continue;
+    if (victims > 0 && ++ranked > victims) break;
+    if (backed) continue;
+    pick = &c;
+    break;
   }
   if (!pick) return 0;
+  // The idle backup also leaves room: its live copies together stay under half the RAM cap (the other half is for
+  // checkpoints the pool really gave up, whose only copy this is).
+  if (victims > 0) {
+    size_t live = 0;
+    for (const auto& kv : spill_)
+      if (kv.second.live) live += kv.second.ram_bytes();
+    if (live + ckpt_bytes_ + pick->pages.size() * size_t(kKvSlices) * kv_page_bytes_ >
+        size_t(opt_.spill_ram_gib * double(size_t(1) << 30)) / 2)
+      return 0;
+  }
   // A backup never makes spill_enforce_ram evict anything: the copy must fit under the RAM cap as it is. (Otherwise
   // the enforce would drop another backup, which the next call picks again: an endless loop.)
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
