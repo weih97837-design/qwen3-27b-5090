@@ -238,7 +238,7 @@ SPILL_TTL_DAYS=7
 
 ## 9. 更新
 
-- `update.cmd` 查詢的 Release 來源是 `-Repo`，預設為本 fork `weih97837-design/qwen3-27b-5090`（`scripts/windows/update.ps1:32`）。本 fork **目前沒有 Windows Release**，所以 `update.cmd` 會失敗並顯示中英文說明。請依下列步驟，用自行建置的 zip 更新（`update.cmd -Zip <zip 路徑>` 也可以安裝它，但不檢查 SHA-256）。**不要**用 `-Repo mkyt/qwen3-27b-5090`：那會換成上游程式碼，不適用於本分支。
+- `update.cmd` 查詢的 Release 來源是 `-Repo`，預設為本 fork `weih97837-design/qwen3-27b-5090`（`scripts/windows/update.ps1:32`）。本 fork 從 `v0.3.0-cache-tiered` 起有 Windows Release，`update.cmd` 會裝最新一版。查不到 Release 時（例如沒有網路），它會停止並顯示中英文說明；這時請依下列步驟，用自行建置的 zip 更新（`update.cmd -Zip <zip 路徑>` 也可以安裝它，但不檢查 SHA-256）。**不要**用 `-Repo mkyt/qwen3-27b-5090`：那會換成上游程式碼，不適用於本分支。
 - 要更新本分支：
   1. 用托盤選單 **Quit** 結束程式。
   2. 在資料夾中刪除 `python\` 與 `app\`（舊版檔案不能留在新版旁邊，`docs/configuration.md#updating`）。

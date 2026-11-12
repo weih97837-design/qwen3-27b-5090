@@ -111,5 +111,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view $env:GITHUB_REF_NAME 2>$null
-          if ($LASTEXITCODE) { gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes }
+          # (docs/releases/<tag>.md are the release notes when there is one; else GitHub's generated list)
+          $notes = "docs\releases\$env:GITHUB_REF_NAME.md"
+          if ($LASTEXITCODE) {
+            if (Test-Path $notes) { gh release create $env:GITHUB_REF_NAME --verify-tag --title $env:GITHUB_REF_NAME --notes-file $notes }
+            else { gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes }
+          }
           gh release upload $env:GITHUB_REF_NAME "dist\$env:PKG.zip" "dist\$env:PKG.zip.sha256" --clobber
