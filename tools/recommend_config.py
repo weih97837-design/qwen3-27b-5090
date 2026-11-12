@@ -79,7 +79,7 @@ SPILL_DIR_DEFAULT = "/cache/kv"
 # compose.yaml defaults, used when a value cannot be detected.
 DEFAULT_KV_POOL_TOKENS = 524288
 DEFAULT_MAX_TOKENS = 262144
-DEFAULT_SPILL_RAM_GIB = 32
+DEFAULT_SPILL_RAM_GIB = 64
 DEFAULT_SPILL_SSD_GIB = 100
 
 # nvidia-smi memory.used above this means something (usually the engine itself) already holds VRAM.

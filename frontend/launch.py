@@ -30,11 +30,11 @@ GiB = 1 << 30
 # unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
 # cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): a 512K-token KV pool, and
-# 32 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
+# 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
 # Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
 ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4", "KV_POOL_TOKENS": "524288",
-                       "SPILL_RAM_GIB": "32", "SPILL_DIR": "/cache/kv"}
+                       "SPILL_RAM_GIB": "64", "SPILL_DIR": "/cache/kv"}
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
              "max_tokens": "MAX_TOKENS", "vram_reserve_gib": "VRAM_RESERVE_GIB"}

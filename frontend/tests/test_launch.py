@@ -225,7 +225,7 @@ def test_engine_defaults_applied_when_unset(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
     launch.set_engine_env(tmp_path)
     assert os.environ["KV_POOL_TOKENS"] == "524288"
-    assert os.environ["SPILL_RAM_GIB"] == "32"
+    assert os.environ["SPILL_RAM_GIB"] == "64"
     assert os.environ["SPILL_DIR"] == ("/cache/kv" if os.name != "nt" else launch.spill_dir_default())
     assert os.environ["MAX_TOKENS_FIT"] == "1" and os.environ["STATE_HOST_CACHE"] == "4"
 

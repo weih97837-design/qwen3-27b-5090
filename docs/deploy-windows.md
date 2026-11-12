@@ -12,7 +12,7 @@
 - **NVIDIA RTX 5090**（32 GB VRAM）與支援 CUDA 13 的驅動程式。
 - 64 位元 Windows。不需要系統管理員權限。
 - **磁碟可用空間約 150 GB**：權重約 23 GB（第一次啟動時下載）；分層快取的 SSD 層預設上限 100 GiB（`SPILL_SSD_GIB`），並保留 10 GiB 可用空間（`SPILL_SSD_MIN_FREE_GIB`）；其餘是程式包與解壓縮所需的空間。
-- 主機 RAM：`docs/deploy-launcher.md` 建議至少 16 GB。RAM 層的 checkpoint 上限預設為 32 GiB（`SPILL_RAM_GIB`），那是上限而非必要用量。`bench.cmd` 預設使用 40 GiB（見第 7 節），**所需 RAM 未驗證**。
+- 主機 RAM：`docs/deploy-launcher.md` 建議至少 16 GB。RAM 層的 checkpoint 上限預設為 64 GiB（`SPILL_RAM_GIB`），那是上限而非必要用量。`bench.cmd` 預設使用 40 GiB（見第 7 節），**所需 RAM 未驗證**。
 - **不需要**：WSL、Docker、Python、CUDA Toolkit、Visual Studio、PyTorch。程式包內含嵌入式 Python 與所需套件，只需要 NVIDIA 驅動程式。
 
 ---
@@ -111,7 +111,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | 名稱 | 預設 | 說明 |
 | --- | --- | --- |
 | `KV_POOL_TOKENS` | `524288` | GPU 上的 KV 池（token 數，512K） |
-| `SPILL_RAM_GIB` | `32` | 被逐出的 checkpoint 放在主機 RAM 的上限（GiB）；`0` 關閉分層 |
+| `SPILL_RAM_GIB` | `64` | 被逐出的 checkpoint 放在主機 RAM 的上限（GiB）；`0` 關閉分層 |
 | `SPILL_DIR` | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` | SSD 層的資料夾 |
 | `SPILL_SSD_GIB` | `100` | SSD 層的上限（GiB），超過時刪除最舊的檔案 |
 | `WEIGHTS` | `gdnfp4` | 權重版本 |
