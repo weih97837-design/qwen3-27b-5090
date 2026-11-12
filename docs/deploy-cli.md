@@ -65,7 +65,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
   - **成功判準**：`.env` 產生或更新，結束碼 0。若 `.env` 已存在，工具會先建立 `.env.bak`。
   - 只會更新工具管理的鍵：`KV_POOL_TOKENS`、`MAX_TOKENS`、`MAX_SEQS`、`KV_DTYPE`、`SPILL_RAM_GIB`、`SPILL_SSD_GIB`、`SPILL_DIR`、`SPILL_RAM_RETENTION_S`、`SPILL_TTL_DAYS`、`SPILL_TICK_S`。
   - **失敗時**：`--write` 失敗時結束碼為 1；檢查路徑與權限。
-- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=4`、`KV_POOL_TOKENS=524288`、`SPILL_RAM_GIB=32`、`SPILL_SSD_GIB=100` 等）。這是正常狀態，不是錯誤。
+- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=4`、`KV_POOL_TOKENS=524288`、`SPILL_RAM_GIB=64`、`SPILL_SSD_GIB=100` 等）。這是正常狀態，不是錯誤。
 - **SSD 層所在磁碟的量測（第一次啟動後才能做）**：`kvcache` 是 Docker 具名磁碟區，位於 WSL 虛擬磁碟。取得其主機路徑後，用 `--spill-dir` 量測：
 
   ```bash

@@ -9,7 +9,7 @@
 流程如下：
 
 1. **VRAM**：活躍的 KV 池。池滿時，最久未用的 checkpoint 被逐出。
-2. **RAM**：引擎把被逐出的 checkpoint 存進主機 RAM（`SPILL_RAM_GIB`，預設 32 GiB），而不是丟棄。
+2. **RAM**：引擎把被逐出的 checkpoint 存進主機 RAM（`SPILL_RAM_GIB`，預設 64 GiB），而不是丟棄。
 3. **SSD**：`frontend/tiercache.py` 在閒置時，把存在 RAM 超過 `SPILL_RAM_RETENTION_S`（預設 3600 秒）的項目寫到
    `SPILL_DIR`（預設 `/cache/kv`，即 Docker 具名磁碟區 `kvcache`）。忙碌時則在超過兩倍保留時間後寫出。
    同一個程式也會執行 SSD 容量上限（`SPILL_SSD_GIB`，最舊的檔案先刪）。此上限一律執行，即使磁碟已被其他檔案佔滿。
@@ -50,7 +50,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | --- | --- | --- |
 | `KV_POOL_TOKENS` | `524288`（512K） | GPU 上的 KV 池大小（tokens）。`0` 表示使用 VRAM 預算剩下的全部空間 |
 | `MAX_SEQS` | `4` | 同時執行的請求數上限 |
-| `SPILL_RAM_GIB` | `32` | 主機 RAM 中保存被逐出 checkpoint 的容量（GiB）。`0` 表示關閉分層 |
+| `SPILL_RAM_GIB` | `64` | 主機 RAM 中保存被逐出 checkpoint 的容量（GiB）。`0` 表示關閉分層 |
 | `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache` |
 | `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後才寫入 SSD |
 | `SPILL_SSD_GIB` | `100` | SSD 層容量上限（GiB），最舊的檔案先刪除 |

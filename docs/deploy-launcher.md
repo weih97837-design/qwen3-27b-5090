@@ -150,14 +150,14 @@
 [env]
 KV_POOL_TOKENS=524288
 MAX_SEQS=4
-SPILL_RAM_GIB=32
+SPILL_RAM_GIB=64
 SPILL_SSD_GIB=100
 SPILL_DIR=D:\kvcache
 SPILL_RAM_RETENTION_S=3600
 SPILL_TTL_DAYS=7
 ```
 
-- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 32 GiB（`SPILL_RAM_GIB=32`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
+- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
 - **生效方式**：`[env]` 的變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
