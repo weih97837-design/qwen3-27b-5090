@@ -430,7 +430,8 @@ class Engine:
     # ---- tiered cache (SPILL_RAM_GIB > 0; frontend/tiercache.py)
 
     def spill_list(self):
-        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "busy", "path"}] of the checkpoints the KV pool gave
+        """(ram_bytes is the entry's LOGICAL size: with RAM dedup its chunks may be shared, see spill_stats for the physical use.)
+        [{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "busy", "path"}] of the checkpoints the KV pool gave
         up (backup: the entry is an idle backup of a checkpoint still in the pool; busy: it is being restored in the
         background, SPILL_ASYNC_PROMOTE, and can be neither written out nor dropped)."""
         n = 1 << 16
@@ -486,13 +487,17 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 20)()
+        out = (ctypes.c_int64 * 26)(*([-1] * 26))  # (an older engine writes the first 20 and leaves the rest -1)
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
                 # SPILL_ASYNC_PROMOTE: restores in progress, finished / failed async restores, their total ms and bytes
-                "restoring", "restored_async", "restore_failed", "restore_ms_total", "restore_bytes_total")
-        return dict(zip(keys, out))
+                "restoring", "restored_async", "restore_failed", "restore_ms_total", "restore_bytes_total",
+                # RAM dedup (docs/tiered-cache.md): the entries' logical size, what the RAM tier physically holds (ram_bytes
+                # is the same number), shared chunks resident, chunk hits / misses of spilled entries, logical - physical
+                "logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes")
+        # An engine built before RAM dedup never writes the last six: absent, not a misleading 0 (callers use .get()).
+        return {k: v for k, v in zip(keys, out) if v != -1}
 
     # ---- SPILL_ASYNC_PROMOTE (delay-hit scheduling, docs/tiered-cache.md): engine thread only, never block
 

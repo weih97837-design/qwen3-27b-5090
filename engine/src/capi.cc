@@ -138,6 +138,8 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   // SPILL_ASYNC_PROMOTE (1: the frontend may restore a spilled checkpoint in the background while other requests run;
   // off by default, then spill_match / spill_restore_* do nothing).
   if (const char* e = getenv("SPILL_ASYNC_PROMOTE")) o.spill_async_promote = atoi(e) != 0;
+  // SPILL_DEDUP (default 1): spilled entries share identical 4096-token chunks in RAM; 0 keeps every entry's KV whole.
+  if (const char* e = getenv("SPILL_DEDUP")) o.spill_dedup = atoi(e) != 0;
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
@@ -402,10 +404,11 @@ int q27_spill_import(void* m, const char* path, uint64_t* id) {
   return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
 }
 
-// Writes min(n, 20) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
+// Writes min(n, 26) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
 // entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
 // pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to pageable memory,
-// restores in progress, async restores finished, async restores failed, their wall time (ms) and bytes.
+// restores in progress, async restores finished, async restores failed, their wall time (ms) and bytes, then (RAM dedup)
+// logical bytes, physical bytes, shared chunks, chunk hits, chunk misses, dedup_saved_bytes.
 int q27_spill_stats(void* m, int64_t* out, int n) {
   return guard([&] { static_cast<Model*>(m)->spill_stats(out, n); });
 }

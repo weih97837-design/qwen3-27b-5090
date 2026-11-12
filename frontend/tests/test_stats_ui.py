@@ -139,6 +139,36 @@ def test_tiers_block_fields(tmp_path):
     json.dumps(out)
 
 
+def test_tiers_block_dedup_fields_absent_on_an_older_engine(tmp_path):
+    out = stats.tiers_block(FakeEngine(), FakeTiers(tmp_path), environ={})
+    assert out["ram_logical_bytes"] is None and out["ram_physical_bytes"] is None and out["ram_dedup_ratio"] is None
+    assert out["ram_dedup_saved_bytes"] is None and out["ram_chunks"] is None
+    assert out["chunk_hits"] is None and out["chunk_misses"] is None
+    json.dumps(out)
+
+
+class DedupEngine(FakeEngine):
+    def __init__(self, logical, physical):
+        super().__init__()
+        self.logical, self.physical = logical, physical
+
+    def spill_stats(self):
+        d = super().spill_stats()
+        d.update(ram_bytes=self.physical, logical_bytes=self.logical, physical_bytes=self.physical, chunks=7,
+                 chunk_hits=5, chunk_misses=9, dedup_saved_bytes=self.logical - self.physical)
+        return d
+
+
+def test_tiers_block_dedup_fields(tmp_path):
+    out = stats.tiers_block(DedupEngine(8 * GiB, 2 * GiB), FakeTiers(tmp_path), environ={"SPILL_RAM_GIB": "4"})
+    assert out["ram_bytes"] == 2 * GiB and out["ram_logical_bytes"] == 8 * GiB and out["ram_physical_bytes"] == 2 * GiB
+    assert out["ram_dedup_ratio"] == 4.0 and out["ram_dedup_saved_bytes"] == 6 * GiB
+    assert out["ram_chunks"] == 7 and out["chunk_hits"] == 5 and out["chunk_misses"] == 9
+    json.dumps(out)
+    # nothing in RAM: no ratio (not a division by zero)
+    assert stats.tiers_block(DedupEngine(0, 0), FakeTiers(tmp_path), environ={})["ram_dedup_ratio"] is None
+
+
 def test_tiers_block_no_directory_and_unset_ram():
     out = stats.tiers_block(FakeEngine(), FakeTiers(None), environ={})
     assert out["dir"] is None and out["disk_free_bytes"] is None and out["ram_cap_bytes"] is None

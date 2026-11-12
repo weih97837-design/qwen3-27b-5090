@@ -26,6 +26,16 @@ checks the spill counters to show that the intended path was taken.
                       id as restored, another request runs before the owner (the restored checkpoint is held), and the follow-up's
                       prefix_begin must report the restored length; the tokens must be identical.
 
+  h  RAM dedup        N=4 conversations whose prompts share a long common prefix (6 chunks = 24576 tokens; the chunk is
+                      the RAM tier's 4096-token dedup unit, engine/src/chunk_store.h) and differ in their tails; a fifth,
+                      unrelated one evicts the last so that all four are spilled. The spilled entries must hold less than
+                      0.6x their logical size in RAM (physical_bytes < 0.6 * logical_bytes) with chunk_hits > 0; each is
+                      then resumed (promoted back, the chunks copied into pool pages; the last two through files written
+                      from the shared chunks) and its tokens must equal the uncached reference. Needs a ~25K-token pool and 25K-token prefills (a few minutes).
+  i  RAM dedup, pinned + async I/O + async promote   as h, with SPILL_PINNED_GIB=1, SPILL_PINNED_SLAB_MIB=16,
+                      SPILL_ASYNC_IO=1, SPILL_ASYNC_PROMOTE=1 and SPILL_RAM_GIB=4 (the chunks are pinned segments, copied on
+                      the I/O stream and shared by events; every follow-up is restored through spill_match / spill_restore_*).
+
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens. The driver sizes the conversations
 to the engine's pool, including its block rounding (choose_prompt_len): the prompt length is raised until two
@@ -67,24 +77,36 @@ SCENARIOS = {
     "e": ("speculative decoding (ring checkpoints)", ["full"]),
     "f": ("pinned segments + async I/O", ["full"]),
     "g": ("async promote (delay hits): RAM and SSD", ["full"]),
+    "h": ("RAM dedup: shared prefix, spill, promote", ["full"]),
+    "i": ("RAM dedup with pinned segments + async I/O", ["full"]),
 }
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
 SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
-            "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"}}
+            "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"},
+            "i": {"SPILL_PINNED_GIB": "1", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1",
+                  "SPILL_RAM_GIB": "4"}}
 SUFFIX = ".q27kv"  # the name frontend/tiercache.py indexes at start()
 FOLLOW = 300  # new tokens of each follow-up turn
 KEYS = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "backed_up", "pinned_bytes",
         "pin_hits", "pin_misses", "restoring", "restored_async", "restore_failed")
+# RAM dedup counters (an older engine does not report them: shown only when present)
+DEDUP_KEYS = ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes")
+H_CHUNKS = 6  # scenario h / i: the shared prefix, in dedup chunks (engine kChunkPages * kPageTokens = 4096 tokens each)
+H_PREFIX = H_CHUNKS * 4096
+H_MIN_TAIL = 512  # the shortest distinct tail of a prompt of scenario h
+H_N = 4  # conversations that share the prefix
 # Variables the tiered cache reads at engine creation: the driver sets them per run, never inherits them.
 CACHE_VARS = {"STATE_HOST_CACHE", "KV_POOL_TOKENS", "CHECKPOINT_INTERVAL", "MAX_SEQS", "VRAM_BACKUP_IDLE_S"}
 
 
 # ---- pure helpers (no GPU, no engine import)
 
-def load_docs(min_len):
-    """The golden prompts of at least min_len tokens (bench/golden/prompts.jsonl)."""
+def load_docs(min_len, tile=False):
+    """The golden prompts of at least min_len tokens (bench/golden/prompts.jsonl). tile: with none that long, the longest
+    one (make_prompt tiles a short document)."""
     docs = [json.loads(line)["ids"] for line in open(ROOT / "bench/golden/prompts.jsonl", encoding="utf-8")]
-    docs = [d for d in docs if len(d) >= min_len]
+    longest = max(len(d) for d in docs)
+    docs = [d for d in docs if len(d) >= (min(min_len, longest) if tile else min_len)]
     if not docs:
         raise SystemExit(f"bench/golden/prompts.jsonl has no prompt of {min_len} tokens or more")
     return docs
@@ -193,7 +215,7 @@ def delta(before, after, key):
 
 
 def stats_line(st):
-    return " ".join(f"{k}={st[k]}" for k in KEYS)
+    return " ".join(f"{k}={st[k]}" for k in KEYS + tuple(k for k in DEDUP_KEYS if k in st))
 
 
 # ---- the run: requests on one engine (cache on or the reference)
@@ -483,7 +505,63 @@ def scen_g(R, spill_dir):
     R.turn2("C", R.prompt(8)[:FOLLOW], pre=lambda p2: async_restore(R, "C", p2, True))
 
 
-SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g}
+def h_prompt(R, i):
+    """Conversation i of scenario h: the common prefix (H_PREFIX tokens, chunk-aligned) and a tail of its own."""
+    prefix = make_prompt(R.docs, H_PREFIX, 0)
+    return prefix + make_prompt(R.docs, R.L - H_PREFIX, 1 + i)
+
+
+def scen_h(R, spill_dir):
+    if R.L < H_PREFIX + H_MIN_TAIL:
+        raise SystemExit(f"scenario h needs prompts of at least {H_PREFIX + H_MIN_TAIL} tokens (got {R.L})")
+    prompts = [h_prompt(R, i) for i in range(H_N)]
+    if len({tuple(p[H_PREFIX:H_PREFIX + 64]) for p in prompts}) != H_N or any(p[:H_PREFIX] != prompts[0][:H_PREFIX] for p in prompts):
+        raise SystemExit("scenario h: the prompts must share the prefix and differ in their tails")
+    keys = "ABCD"[:H_N]
+    s0 = R.snap("before the conversations")
+    for k, p in zip(keys, prompts):  # each prefill evicts the previous conversation's checkpoint (the pool holds one)
+        R.turn1(k, p)
+    R.turn1("E", make_prompt(R.docs, R.L, 7))  # an unrelated conversation: its prefill evicts the last of A-D
+    s1 = R.snap("all of A-D spilled (RAM)")
+    R.eviction_check(f"the {H_N} conversations' checkpoints were all spilled to RAM", delta(s0, s1, "spilled") >= H_N,
+                     f"spilled +{delta(s0, s1, 'spilled')}")
+    R.check(f"the {H_N} entries are in RAM", s1["in_ram"] >= H_N and s1["on_disk"] == 0,
+            f"in_ram {s1['in_ram']}, on_disk {s1['on_disk']}")
+    if R.cache:
+        have = all(k in s1 for k in DEDUP_KEYS)
+        R.check("the engine reports the RAM dedup counters", have, "an engine without RAM dedup?" if not have else "")
+        if have:
+            logical, physical = s1["logical_bytes"], s1["physical_bytes"]
+            R.check("shared prefix chunks are stored once: physical < 0.6 * logical", logical > 0 and physical < 0.6 * logical,
+                    f"logical {logical / 2**20:.0f} MiB, physical {physical / 2**20:.0f} MiB, ratio {physical / max(logical, 1):.2f}")
+            R.check("the later entries found the earlier ones' chunks (chunk_hits > 0)", s1["chunk_hits"] > 0,
+                    f"hits {s1['chunk_hits']}, misses {s1['chunk_misses']}, resident chunks {s1['chunks']}")
+    async_promote = R.cache and os.environ.get("SPILL_ASYNC_PROMOTE") == "1"  # (scenario i: the delay-hit restore API)
+
+    def follow(k, on_disk):  # k's follow-up: its checkpoint is promoted back (chunks + tail copied into pool pages)
+        s_before = R.snap(f"before {k}'s follow-up")
+        pre = (lambda p2: async_restore(R, k, p2, on_disk)) if async_promote else None
+        R.turn2(k, make_prompt(R.docs, 1000, 9 + ord(k))[:FOLLOW], pre=pre)
+        s_after = R.snap(f"after {k}'s follow-up")
+        R.check(f"{k}'s follow-up restored its checkpoint from {'the file' if on_disk else 'RAM'}",
+                delta(s_before, s_after, "restored") > 0, f"restored +{delta(s_before, s_after, 'restored')}")
+
+    for k in keys[:H_N // 2]:  # from RAM
+        follow(k, False)
+    # The rest are written to files (spill_write puts the shared chunks and the tails back into the linear stream) and
+    # restored from there.
+    n = export_ram(R.eng, spill_dir) if R.cache else 0
+    s2 = R.snap("RAM entries written to SPILL_DIR")
+    R.check("RAM entries written to SPILL_DIR", n > 0 and s2["on_disk"] > 0, f"{n} files, on_disk {s2['on_disk']}")
+    for k in keys[H_N // 2:]:
+        follow(k, True)
+    if R.cache and all(x in s1 for x in DEDUP_KEYS):
+        sf = R.snap("end")
+        R.check("physical <= logical at the end", sf["physical_bytes"] <= sf["logical_bytes"] or sf["logical_bytes"] == 0,
+                f"logical {sf['logical_bytes']}, physical {sf['physical_bytes']}")
+
+
+SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g, "h": scen_h, "i": scen_h}
 
 
 # ---- worker: one process, one mode (ref | tiered), one phase
@@ -521,10 +599,10 @@ def worker(a):
     if a.spec and not eng.has_draft:
         return write_json(a.out, {"skip": "the engine has no draft model"})
     grow_pinned(eng, a.mode == "tiered")
-    docs = load_docs(a.prompt_len)
+    docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i"))
     R = Run(eng, a.mode == "tiered", a.spec, a.tokens, docs, a.prompt_len, a.phase, print)
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
-    if len(heads) != 4:
+    if len(heads) != 4 and a.scenario not in ("h", "i"):  # (h builds its own prompts, which share their first tokens)
         raise SystemExit("the prompts do not differ in their first 64 tokens")
     if a.prior:
         R.load_prior(a.prior)
@@ -582,6 +660,16 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
     return json.load(open(out))
 
 
+def scen_args(a, scen):
+    """The arguments a scenario runs with: h and i need prompts longer than the shared prefix (and a pool that is still too
+    small for two of them), so their length is raised and the pool re-sized for it."""
+    if scen not in ("h", "i") or a.pool_tokens:
+        return a
+    b = argparse.Namespace(**vars(a))
+    b.prompt_len = choose_prompt_len(max(a.prompt_len, H_PREFIX + H_MIN_TAIL), a.tokens, a.kv_dtype)
+    return b
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS,
@@ -593,7 +681,7 @@ def main():
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--pool-tokens", type=int,
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
-    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g", help="a,b,c,d,e,f,g")
+    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i", help="a,b,c,d,e,f,g,h,i")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     ap.add_argument("--worker-cmd", metavar="SCENARIO",
                     help="print the exact worker command lines of a scenario (its reference and tiered runs) and exit")
@@ -613,7 +701,7 @@ def main():
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
         if s not in SCENARIOS:
-            ap.error(f"unknown scenario {s} (a-g)")
+            ap.error(f"unknown scenario {s} (a-i)")
     if a.pool_tokens:
         _, max_tokens = sizes(a.prompt_len, a.tokens)
         say("pool: " + describe_pool(a.prompt_len, a.tokens, a.kv_dtype, a.pool_tokens, max_tokens), flush=True)
@@ -632,10 +720,11 @@ def main():
     if a.worker_cmd:
         s_ = a.worker_cmd
         if s_ not in SCENARIOS:
-            ap.error(f"unknown scenario {s_} (a-g)")
+            ap.error(f"unknown scenario {s_} (a-i)")
         base = pathlib.Path(a.keep_dir or "KEEP_DIR")  # (a placeholder without --keep-dir)
         say(f"worker commands of scenario {s_} ({SCENARIOS[s_][0]}), as the driver runs them; the other SPILL_* and cache")
         say("variables of your environment are unset. Windows cmd: set each NAME=VALUE first. Replace KEEP_DIR if needed.")
+        a = scen_args(a, s_)
         set_env, cmd = worker_invocation(a, s_, "ref", "full", "", base / f"ref_{s_}.json")
         show_invocation("reference (cache off)", set_env, cmd)
         prior = None
@@ -654,7 +743,10 @@ def main():
         spill_dir = work / f"spill_{s}"
         shutil.rmtree(spill_dir, ignore_errors=True)
         spill_dir.mkdir(parents=True)
-        ref = run_worker(a, s, "ref", "full", "", work / f"ref_{s}.json")
+        sa = scen_args(a, s)
+        if sa is not a:
+            say(f"prompt-len {a.prompt_len} -> {sa.prompt_len} for scenario {s} (a prefix of {H_PREFIX} shared tokens + tails)")
+        ref = run_worker(sa, s, "ref", "full", "", work / f"ref_{s}.json")
         if "error" in ref:
             say(f"FAIL {s}: the reference run exited {fmt_rc(ref['error'])}", flush=True)
             fails += 1
@@ -664,7 +756,7 @@ def main():
             continue
         outs, checks, stats, prior, err, skip = {}, [], [], None, None, None
         for ph in phases:
-            r = run_worker(a, s, "tiered", ph, spill_dir, work / f"tiered_{s}_{ph}.json", prior)
+            r = run_worker(sa, s, "tiered", ph, spill_dir, work / f"tiered_{s}_{ph}.json", prior)
             if "error" in r:
                 err = f"the tiered run ({ph}) exited {fmt_rc(r['error'])}"
                 break

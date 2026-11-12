@@ -88,6 +88,7 @@ services:
       SPILL_PINNED_SLAB_MIB: ${SPILL_PINNED_SLAB_MIB:-1024}  # size of each pinned slab, pinned one per idle step (an entry may span several; only used with SPILL_PINNED_GIB)
       SPILL_ASYNC_IO: ${SPILL_ASYNC_IO:-0}         # KV copies on their own stream, no stall of GPU work; frees the CPU only for pinned entries, so use with SPILL_PINNED_GIB (off by default: turn on only after scripts/tiered_cache_test.py passes on your GPU)
       SPILL_ASYNC_PROMOTE: ${SPILL_ASYNC_PROMOTE:-0}  # a request that matches a spilled checkpoint waits for it to load in the background while others run (delay hit), instead of stalling the engine (off by default: turn on only after scripts/tiered_cache_test.py passes (scenario g), together with SPILL_PINNED_GIB and SPILL_ASYNC_IO)
+      SPILL_DEDUP: ${SPILL_DEDUP:-1}  # RAM tier: spilled entries that share a prefix share its 4096-token chunks in RAM (0: every entry keeps its whole KV; docs/tiered-cache.md)
       SPILL_DIR: ${SPILL_DIR:-/cache/kv}           # where spilled checkpoints are written (the kvcache volume above)
       SPILL_RAM_RETENTION_S: ${SPILL_RAM_RETENTION_S:-3600}  # seconds a checkpoint stays in RAM before it is written to SSD (idle time)
       SPILL_SSD_GIB: ${SPILL_SSD_GIB:-100}         # SSD tier cap; the oldest files are deleted first
