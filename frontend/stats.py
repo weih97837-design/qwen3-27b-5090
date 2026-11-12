@@ -10,6 +10,7 @@ driver on Windows); without it the GPU fields are null.
 import collections
 import ctypes
 import os
+import shutil
 import threading
 import time
 
@@ -110,6 +111,127 @@ def request_meta(path, headers, body):
             "tools": len(body.get("tools") or []),
             "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens") or body.get("max_output_tokens"),
             "preview": last[:PREVIEW] + ("…" if len(last) > PREVIEW else "")}
+
+
+DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
+                   "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS")
+DAY_S = 86400.0
+
+
+def slot_rows(seqs, n, target=None, last_lanes=None):
+    """The lanes 1..n of the UI (worker.Scheduler.stats). seqs: (state, area, row) in admission order for the admitted
+    and running requests and the parked ones (not the waiting ones), where row holds the request's fields and area is
+    its parking area (None while running or admitted). Lanes above target (default n) are not open: an idle one is
+    "closed", a busy one keeps its state with open false.
+
+    Lanes stay put between snapshots: a parked request keeps its lane, area + 1 (parking areas are 0 .. n - 2); a
+    request that is not parked takes the lane it had in last_lanes (rid -> lane, 1-based) if that lane is free, and
+    the rest take the free lanes in admission order. last_lanes, when given, is replaced with this snapshot's mapping,
+    so the rids that finished drop out of it."""
+    target = n if target is None else target
+    lanes = [None] * (n + 1)  # 1-based; lanes[0] unused
+    rest = []
+    for state, area, row in seqs:
+        if state == "parked" and area is not None and 0 <= area < n - 1 and lanes[area + 1] is None:
+            lanes[area + 1] = (state, row)
+        else:
+            rest.append((state, row))
+    later = []
+    for state, row in rest:
+        lane = (last_lanes or {}).get(row["rid"])
+        if lane is not None and 1 <= lane <= n and lanes[lane] is None:
+            lanes[lane] = (state, row)
+        else:
+            later.append((state, row))
+    free = (i for i in range(1, n + 1) if lanes[i] is None)
+    for (state, row), i in zip(later, free):
+        lanes[i] = (state, row)
+    if last_lanes is not None:
+        last_lanes.clear()
+        last_lanes.update({held[1]["rid"]: i for i, held in enumerate(lanes) if i and held is not None})
+    out = []
+    for i in range(1, n + 1):
+        is_open = i <= target
+        held = lanes[i]
+        if held is None:
+            out.append({"lane": i, "state": "idle" if is_open else "closed", "open": is_open, "rid": None,
+                        "phase": None, "prompt": 0, "cached": 0, "out": 0, "tok_s": None, "age": 0.0})
+            continue
+        state, row = held
+        decode_wall, out_n = row.get("decode_wall") or 0.0, row["out"]
+        out.append({"lane": i, "state": state, "open": is_open, "rid": row["rid"], "phase": row["phase"],
+                    "prompt": row["prompt"], "cached": row["cached"], "out": out_n,
+                    "tok_s": (out_n - 1) / decode_wall if out_n > 1 and decode_wall > 0 else None,
+                    "age": row["age"]})
+    return out
+
+
+def _env_float(env, name):
+    try:
+        return float(env.get(name))
+    except (TypeError, ValueError):
+        return None
+
+
+def tiers_block(engine, tiers, environ=None):
+    """The tiered cache for the UI (None without a tier policy): the engine's spill counters, the policy's SSD use and
+    the disk. Never raises: a failure is {"error": text}."""
+    if tiers is None:
+        return None
+    try:
+        env = os.environ if environ is None else environ
+        sp, ts = engine.spill_stats(), tiers.status()
+        directory = getattr(tiers, "directory", None)
+        disk_free = None
+        if directory:
+            try:
+                disk_free = shutil.disk_usage(str(directory)).free
+            except (OSError, TypeError, ValueError):
+                disk_free = None
+        ram_gib = _env_float(env, "SPILL_RAM_GIB")
+        ttl_s = getattr(tiers, "ttl_s", None)
+        return {"ram_bytes": sp["ram_bytes"], "ram_cap_bytes": int(ram_gib * (1 << 30)) if ram_gib is not None else None,
+                "in_ram": sp["in_ram"], "on_disk": sp["on_disk"], "ssd_bytes": ts.get("ssd_bytes"),
+                "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
+                "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
+                "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],
+                "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
+                "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
+                "dir": str(directory) if directory else None}
+    except Exception as e:  # noqa: BLE001 - the stats must not stop the engine
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def host_info(started, now=None, meminfo="/proc/meminfo"):
+    """The machine: CPUs, load (None without os.getloadavg, i.e. on Windows), RAM from /proc/meminfo (None if
+    unavailable), and the uptime of the server process."""
+    now = time.time() if now is None else now
+    try:
+        load1, load5, _ = os.getloadavg()
+    except (AttributeError, OSError):
+        load1 = load5 = None
+    total = avail = None
+    try:
+        with open(meminfo, encoding="utf-8") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    kib = int(rest.split()[0]) * 1024
+                    if key == "MemTotal":
+                        total = kib
+                    else:
+                        avail = kib
+    except (OSError, ValueError, IndexError):
+        total = avail = None
+    return {"cpu_count": os.cpu_count(), "load1": load1, "load5": load5, "ram_total_bytes": total,
+            "ram_avail_bytes": avail, "uptime_s": now - started}
+
+
+def deploy_info(started, engine_state, environ=None):
+    """How the server was started: the engine's state and the settings from the environment (None if unset)."""
+    env = os.environ if environ is None else environ
+    return {"started_at": started, "engine_state": engine_state,
+            "settings": {k: env.get(k) for k in DEPLOY_SETTINGS}}
 
 
 class Hub:
@@ -380,7 +502,11 @@ class Hub:
             return {"t": time.time(), "engine": self.engine_state, "seqs": seqs, "vram": self.vram(), "cache": cache,
                     "idle": self.engine_idle() if self.engine_idle else None,
                     "sample": self.samples[-1] if self.samples else None,
-                    "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None}
+                    "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None,
+                    "slots": snap.get("slots", []) if snap else [],
+                    "tiers": snap.get("tiers") if snap else None,
+                    "host": host_info(self.started),
+                    "deploy": deploy_info(self.started, self.engine_state)}
 
     def init(self):
         with self.lock:

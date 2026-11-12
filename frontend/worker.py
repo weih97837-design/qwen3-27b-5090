@@ -141,6 +141,10 @@ class Scheduler:
                 os.environ[k] = v
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
+        from tiercache import TierPolicy  # (tiered cache: SPILL_RAM_GIB; the frontend dir is on sys.path)
+        self.tiers = TierPolicy.from_env(self.engine, log)
+        if self.tiers is not None:
+            self.tiers.start()
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
         # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
         self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
@@ -159,6 +163,7 @@ class Scheduler:
         self.im_start = cfg["im_start"]
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
+        self.slot_lanes = {}     # rid -> UI lane (1-based) in the last stats snapshot (slot_rows keeps lanes still)
         self.by_id = {}
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
@@ -405,6 +410,11 @@ class Scheduler:
                 self.guarded(*job)
             # (stats also once more when the work is done, and after each idle wait)
             self.report(force=not (self.alive or self.waiting))
+            if self.tiers is not None:
+                try:
+                    self.tiers.tick(idle=not self.alive and not self.waiting)
+                except Exception as e:  # noqa: BLE001 - the cache policy must not stop the engine
+                    log(f"tiered cache: {e}")
 
     def report(self, force=False):
         """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
@@ -808,14 +818,25 @@ class Scheduler:
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
+        if self.tiers is not None:
+            sp, ts = self.engine.spill_stats(), self.tiers.status()
+            out.update({"q27:tier_ram_bytes": sp["ram_bytes"], "q27:tier_in_ram": sp["in_ram"],
+                        "q27:tier_on_disk": sp["on_disk"], "q27:tier_spilled": sp["spilled"],
+                        "q27:tier_restored": sp["restored"], "q27:tier_written": sp["written"],
+                        "q27:tier_dropped": sp["dropped"], "q27:tier_subsumed": sp["subsumed"],
+                        "q27:tier_failed": sp["failed"], "q27:tier_ssd_bytes": ts["ssd_bytes"],
+                        "q27:tier_ssd_budget_bytes": ts["ssd_budget_bytes"]})
         return out
 
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
+        from stats import slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
+        if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
+            self.slot_lanes = {}
         st = self.engine.cache_stats()
-        seqs = []
+        seqs, lanes = [], []
         for s in self.alive + list(self.waiting):
             if s.dead:
                 continue
@@ -832,10 +853,14 @@ class Scheduler:
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "marks": s.marks})
+            if state != "waiting":
+                lanes.append((state, s.area, seqs[-1]))
         return {"t": now, "seqs": seqs, "cache": st, "device": self.engine.device_memory(),
                 "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
                 "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
-                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
+                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
+                "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
+                "tiers": tiers_block(self.engine, getattr(self, "tiers", None))}
 
 
 def allows(m, t, eos):

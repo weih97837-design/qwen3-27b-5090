@@ -135,6 +135,24 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
   padding: 3px 10px; cursor: pointer; }
 @media (max-width: 600px) { .opts { grid-template-columns: 1fr; } .opts > .k { padding-top: 0; } }
 @media (max-width: 600px) { main { padding: 16px; } .tile .value { font-size: 18px; } }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.trunc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.split { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; }
+.slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+@media (max-width: 600px) { .slots { grid-template-columns: 1fr; } }
+.slot { display: grid; gap: 8px; align-content: start; }
+.slot.idle { opacity: 0.5; }
+.slot.closed { opacity: 0.3; }
+.slot .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; }
+.slot .lane { color: var(--ink2); font-size: 12px; white-space: nowrap; }
+.slot .speed { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.slot .speed span { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.tiers-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 600px) { .tiers-grid { grid-template-columns: 1fr; } }
+.tier .meter { margin-top: 6px; }
+.warnbox { border: 1px solid var(--warning); border-left-width: 4px; border-radius: 6px; padding: 6px 10px;
+  color: var(--ink); background: var(--wash); font-size: 12px; overflow-wrap: anywhere; margin-top: 10px; }
+.warnbox b { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -162,6 +180,14 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 
   <section class="tiles" id="tiles"></section>
 
+  <section class="card" id="slots-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">推理 Slot</h2>
+      <span class="muted" id="slots-sum"></span>
+    </div>
+    <div class="slots" id="slots"></div>
+  </section>
+
   <section class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:8px">
       <h2 style="margin:0">GPU and throughput</h2>
@@ -186,6 +212,21 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
       </div>
       <div class="scroll"><table id="vram-table"></table></div>
     </div>
+  </section>
+
+  <section class="card" id="tiers-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">分層快取</h2>
+      <span class="muted" id="tiers-sum"></span>
+    </div>
+    <div id="tiers-body"></div>
+  </section>
+
+  <section class="card" id="deploy-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">部署與硬體</h2>
+    </div>
+    <div id="deploy-body"></div>
   </section>
 
   <section class="card">
@@ -220,7 +261,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 "use strict";
 const $ = (id) => document.getElementById(id);
 const GiB = 1024 ** 3, MiB = 1024 ** 2;
-const state = { info: {}, history: [], log: [], tick: null, range: 300, sampleS: 1, hover: null, open: new Set() };
+const state = { info: {}, history: [], log: [], tick: null, init: null, ui: null, range: 300, sampleS: 1, hover: null, open: new Set() };
 
 // ---------------------------------------------------------------- formatting
 const fmtGiB = (b) => b == null ? "–" : (b / GiB).toFixed(b >= 10 * GiB ? 1 : 2) + " GiB";
@@ -579,6 +620,145 @@ function drawLog() {
 }
 for (const id of ["f-req", "f-sub", "f-ev"]) $(id).addEventListener("change", drawLog);
 
+// ---------------------------------------------------------------- slots, tiers, host (new blocks)
+// Where the backend puts the new blocks is not fixed, so each lookup tries, in order: the worker stats
+// snapshot (state.tick.stats), the tick itself, the init payload (state.init), init's info, and /ui/state
+// (state.ui). The first source that has the key wins. undefined = not sent (older server): the panel hides.
+// null from the server is a real value (tiers null = spill off), so only undefined counts as missing.
+function block(key) {
+  for (const src of [state.tick?.stats, state.tick, state.init, state.info, state.ui?.tick])
+    if (src && typeof src === "object" && src[key] !== undefined) return src[key];
+  return undefined;
+}
+const snapSlots = () => block("slots");    // [{lane, state, rid, phase, prompt, cached, out, tok_s, age}] | null
+const snapTiers = () => block("tiers");    // {ram_bytes, ...} | {error} | null (SPILL_RAM_GIB=0)
+const snapHost = () => block("host");      // {cpu_count, load1, load5, ram_total_bytes, ram_avail_bytes, uptime_s}
+const snapDeploy = () => block("deploy");  // {started_at, engine_state, settings: {...}}
+async function loadUiState() {  // /ui/state: fallback source only; a failure just leaves state.ui null
+  try { const r = await fetch("/ui/state", { cache: "no-store" }); state.ui = r.ok ? await r.json() : null; }
+  catch (e) { state.ui = null; }
+  drawSlots(); drawTiers(); drawDeploy();
+}
+const kvRow = (k, v) => el("div", {}, el("span", {}, k + " "), el("b", {}, v));
+const warnBox = (title, text) => el("div", { class: "warnbox" }, el("b", {}, title + "："), String(text));
+const toDate = (v) => {
+  if (v == null || v === "") return null;
+  const ms = typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);  // epoch seconds, ms, or ISO text
+  return isFinite(ms) ? new Date(ms) : null;
+};
+const fmtUptime = (s) => {
+  if (s == null || !isFinite(s)) return "–";
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d} 天 ${h} 時` : h ? `${h} 時 ${m} 分` : `${m} 分 ${Math.floor(s % 60)} 秒`;
+};
+const f2 = (v) => v == null ? "–" : v.toFixed(2);
+const fmtSetting = (v) => v == null ? "–" : typeof v === "number" ? v.toLocaleString() : typeof v === "boolean" ? (v ? "是" : "否") : String(v);
+
+const SLOT_STATE = { running: ["推理中", "--good"], parked: ["暫停", "--s1"], admitted: ["排隊", "--warning"], idle: ["閒置", "--muted"],
+  closed: ["未開放", "--muted"] };
+const PHASE_ZH = { prefill: "預填", decode: "解碼" };
+function slotTile(s, i) {
+  const key = SLOT_STATE[s.state] ? s.state : "idle", [label, color] = SLOT_STATE[key];
+  const idle = key === "idle", closed = key === "closed";
+  const head = el("div", { class: "head" },
+    el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${color})` }), label),
+    el("span", { class: "lane" }, `第 ${s.lane ?? i + 1} 道`));
+  if (closed) return el("div", { class: "card slot closed" }, head, el("div", { class: "muted", style: "font-size:12px" }, "超過目前的併發上限，未開放"));
+  const prompt = s.prompt, cached = s.cached;
+  const pct = prompt && cached != null ? fmtPct(Math.min(cached, prompt) / prompt) : "–";
+  return el("div", { class: "card slot" + (idle ? " idle" : "") },
+    head,
+    el("div", { class: "rid mono trunc", title: s.rid || "" }, s.rid || "–"),
+    el("div", { class: "kv" },
+      kvRow("階段", PHASE_ZH[s.phase] || s.phase || "–"),
+      kvRow("提示詞", prompt != null ? fmtTok(prompt) + " tok" : "–"),
+      kvRow("快取", cached != null ? `${fmtTok(cached)} (${pct})` : "–"),
+      kvRow("輸出", s.out != null ? fmtTok(s.out) + " tok" : "–"),
+      kvRow("年齡", fmtS(s.age))),
+    el("div", { class: "speed num" }, s.tok_s == null ? "–" : fmtRate(s.tok_s), el("span", {}, "tok/s 吐字速度")));
+}
+function drawSlots() {
+  const slots = snapSlots(), sec = $("slots-sec");
+  if (!Array.isArray(slots)) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const used = slots.filter((s) => s.state === "running" || s.state === "parked" || s.state === "admitted").length;
+  const open = slots.filter((s) => s.open !== false).length;  // no "open" field (older server): every lane is open
+  $("slots-sum").textContent = `使用中 ${used} ／ 開放 ${open} ／ 上限 ${slots.length}`;
+  $("slots").replaceChildren(...(slots.length ? slots.map(slotTile) : [el("div", { class: "empty" }, "沒有推理 slot。")]));
+}
+
+// Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
+const TIER_COUNTERS = [["溢出 spilled", "spilled"], ["還原 restored", "restored"], ["寫入 SSD written", "written"],
+  ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+function tierCol(title, used, cap, note) {
+  const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
+  return el("div", { class: "tier" },
+    el("div", { class: "split" }, el("h2", { style: "margin:0" }, title), el("span", { class: "num" }, `${fmtGiB(used)} / ${fmtGiB(cap)}`)),
+    el("div", { class: "meter" }, el("div", { style: `width:${(pct * 100).toFixed(1)}%;background:var(${pct > 0.9 ? "--serious" : "--s1"})` })),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, note));
+}
+function drawTiers() {
+  const t = snapTiers(), sec = $("tiers-sec"), body = $("tiers-body"), sum = $("tiers-sum");
+  if (t === undefined || (t !== null && typeof t !== "object")) { sec.hidden = true; return; }
+  sec.hidden = false;
+  if (t === null) {
+    sum.textContent = "";
+    body.replaceChildren(el("div", { class: "empty" }, "分層快取未啟用"));
+    return;
+  }
+  const kids = [];
+  if (t.error) kids.push(warnBox("錯誤", t.error));
+  sum.textContent = `RAM ${t.in_ram ?? "–"} 筆 · SSD ${t.on_disk ?? "–"} 筆`;
+  const n = (v) => v == null ? "–" : Number(v).toLocaleString();
+  const cols = [];  // a bar only when its used bytes are known; a null cap shows as "X / –"
+  if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 筆在 RAM`));
+  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}`));
+  if (cols.length) kids.push(el("div", { class: "tiers-grid" }, ...cols));
+  kids.push(el("div", { class: "kv", style: "margin-top:12px" },
+    ...TIER_COUNTERS.map(([label, key]) => el("div", {},
+      el("span", {}, label + " "), el("b", { style: key === "failed" && t.failed > 0 ? "color:var(--critical)" : "" }, n(t[key]))))));
+  kids.push(el("div", { class: "kv", style: "margin-top:10px" },
+    kvRow("保留 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
+    kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")));
+  if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
+  if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));
+  body.replaceChildren(...kids);
+}
+
+// Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
+const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
+  "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS"];
+function drawDeploy() {
+  const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
+  const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
+  if (!hostOk && !deployOk) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const kids = [];
+  const started = deployOk ? toDate(d.started_at) : null;
+  const uptime = hostOk && h.uptime_s != null ? h.uptime_s : started ? (Date.now() - started) / 1000 : null;
+  kids.push(el("div", { class: "kv" },
+    kvRow("引擎狀態", deployOk ? d.engine_state ?? "–" : "–"),
+    kvRow("啟動時間", started ? started.toLocaleString([], { hour12: false }) : "–"),
+    kvRow("運作時間", fmtUptime(uptime)),
+    kvRow("CPU 核心", hostOk ? h.cpu_count ?? "–" : "–"),
+    kvRow("負載 1 / 5 分", hostOk ? `${f2(h.load1)} / ${f2(h.load5)}` : "–")));
+  if (hostOk && h.ram_total_bytes) {
+    const total = h.ram_total_bytes, avail = h.ram_avail_bytes, used = avail == null ? 0 : total - avail;
+    kids.push(el("div", { style: "margin-top:12px" },
+      el("div", { class: "split" }, el("span", { class: "sub" }, "主機 RAM"),
+        el("span", { class: "num" }, `${fmtGiB(total)} 總計 · ${fmtGiB(avail)} 可用`)),
+      el("div", { class: "meter" }, el("div", { style: `width:${(Math.min(1, used / total) * 100).toFixed(1)}%` }))));
+  }
+  if (deployOk && d.settings && typeof d.settings === "object") {
+    const s = d.settings;
+    kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
+      el("table", {}, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
+        ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
+          el("td", { class: "r", style: "overflow-wrap:anywhere" }, fmtSetting(s[k])))))));
+  }
+  body.replaceChildren(...kids);
+}
+
 // ---------------------------------------------------------------- header, stream
 const fmtDur = (s) => s < 60 ? `${Math.ceil(s)} s` : `${Math.ceil(s / 60)} min`;
 function drawHeader() {
@@ -604,7 +784,7 @@ function drawHeader() {
   }
   b.append(" ", $("launch").hidden ? "▾" : "▴");
 }
-function drawAll() { drawHeader(); drawGo(); drawTiles(); drawCharts(); drawVram(); drawSessions(); }
+function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawDeploy(); drawSessions(); }
 
 async function engineAction(a) {
   const n = state.tick?.seqs?.length || 0, changes = launchChanges();
@@ -807,7 +987,7 @@ function connect() {
   const es = new EventSource("/ui/stream");
   es.addEventListener("init", (ev) => {
     const d = JSON.parse(ev.data);
-    state.info = d.info; state.sampleS = d.sample_s || 1; state.history = d.history; state.log = d.log; state.tick = d.tick;
+    state.info = d.info; state.init = d; state.sampleS = d.sample_s || 1; state.history = d.history; state.log = d.log; state.tick = d.tick;
     $("conn").textContent = "live";
     drawAll(); drawLog();
   });
@@ -827,6 +1007,8 @@ function connect() {
 }
 buildCharts();
 loadLaunch(true);
+loadUiState();
+setInterval(loadUiState, 10000);
 try { if (localStorage.getItem("q27-launch-open")) showLaunch(true); } catch (e) { /* (no storage) */ }
 connect();
 </script>
