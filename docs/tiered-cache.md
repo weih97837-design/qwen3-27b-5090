@@ -214,8 +214,16 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | f pinned＋async I/O | 同 a、b，`SPILL_PINNED_GIB=2`、`SPILL_ASYNC_IO=1`（entry 分成多個 pinned 區段） | `pin_hits` 增加 |
 | g 背景載入 | 同 a、b，再加 `SPILL_ASYNC_PROMOTE=1`，直接呼叫引擎 API：`spill_match` → `spill_restore_begin`（RAM 回 1、檔案回 2）→ 載入中的 checkpoint 對 `prefix_begin` 不可見 → `spill_restore_poll` 直到回報該 id | `restored_async` 增加、`restore_failed` 不變；續談從上一回合結束處開始 |
 
-每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。若情境失敗，先確認 `--pool-tokens`：池太大時不會逐出，
-檢查會失敗而不是通過，此時把池調小（預設為一段對話加其 checkpoint 再加 1K tokens）。
+每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
+
+**池的大小由腳本自動決定**：腳本依引擎的分頁算法計算池，包含 KV 區塊的捨入（每區塊的頁數為 2 MiB 除以每頁位元組數，
+NVFP4 為 57 頁、FP8 為 32 頁、BF16 為 16 頁；`Q27_KV_BLOCK` 可覆寫）。從 `--prompt-len`（預設 3000）起逐步加大，直到兩段對話
+超過可用頁數（餘 4 頁），使第二段的 prefill 必定逐出第一段的 checkpoint；開頭會印出 `prompt-len A -> P`，以及池的數字
+（`max_pages`、`pool_pages`、`kv_block`、`usable pages`、每段對話的頁數）。一般不需要手動調 `--pool-tokens`。
+
+若某個需要逐出的情境失敗，錯誤訊息會附上引擎 `cache_stats()` 的 `evicted`、`pool_pages`、`free_pages`；`evicted` 為 0 時會寫
+`no eviction happened: pool too large`，表示池太大、沒有逐出。指定 `--pool-tokens` 時不會調整 `--prompt-len`，只印出數字；
+若兩段對話沒有超過可用頁數，會警告「不預期逐出」。
 
 **PASS 的意義**：該情境的每一段輸出 token（貪婪解碼，每回合 `--tokens` 個）與關閉快取的參考完全相同，而且所有檢查都通過，
 表示確實走了該情境的路徑。任何一個 FAIL 則 exit code 為 1。
