@@ -12,6 +12,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
 import sys
 import threading
 
@@ -93,6 +94,12 @@ def tier_env_value(key, value):
     return ("1" if value else "0") if TIER_SETTINGS[key][2] == "flag" else str(value)
 
 
+def atoi(text):
+    """C's atoi: leading white space, an optional sign, then the digits ("1.0" is 1, "true" and "" are 0)."""
+    m = re.match(r"[ \t\n\v\f\r]*([+-]?)([0-9]+)", text)
+    return 0 if not m else (-1 if m.group(1) == "-" else 1) * int(m.group(2))
+
+
 def parse_tier(key, text, warn=None):
     """The tier setting `key` from the text of its variable (unset or empty: the default). A text TierPolicy or the
     engine would refuse (not a number, or negative) gives the default, with a warning."""
@@ -102,10 +109,7 @@ def parse_tier(key, text, warn=None):
     if text is None or not text.strip():
         return default
     if kind == "flag":
-        try:
-            return int(text) != 0  # (capi.cc: atoi(value) != 0)
-        except ValueError:
-            return False
+        return atoi(text) != 0  # (capi.cc: atoi(value) != 0)
     try:
         v = float(text)
         if math.isfinite(v) and v >= 0:

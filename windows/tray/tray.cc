@@ -1187,15 +1187,17 @@ bool engine_holds_vram() {
     return app.shared.phase == Phase::running && !h.empty() && h != "unloaded" && h != "stopped";
 }
 
-// Whether the control's value is not the running engine's (numbers by value: 32.0 is 32).
-bool engine_value_differs(const Row& row) {
-    std::wstring value = value_of(row), running = engine_running_value(row);
+// Whether two values of the row differ (the numbers of the tiered cache by value: 32.0 is 32).
+bool values_differ(const Row& row, const std::wstring& value, const std::wstring& other) {
     if (tier_number_row(row)) {
-        std::wstring a = tier_number_text(value), b = tier_number_text(running);
+        std::wstring a = tier_number_text(value), b = tier_number_text(other);
         if (!a.empty() && !b.empty()) return a != b;
     }
-    return value != running;
+    return value != other;
 }
+
+// Whether the control's value is not the running engine's.
+bool engine_value_differs(const Row& row) { return values_differ(row, value_of(row), engine_running_value(row)); }
 
 struct ApplyPlan {
     bool any = false, server = false, engine = false, live = false;
@@ -1328,7 +1330,7 @@ void update_controls() {
         for (const auto& field : settings.engine["keep_env"].fields) {
             std::wstring var = widen(field.first), value = env_text(field.second);
             Row* row = row_of(var);
-            if (!row || value_of(*row) == value) continue;
+            if (!row || !values_differ(*row, value_of(*row), value)) continue;
             settings.keep[var] = value;
             keep += (keep.empty() ? L"" : L", ") + var + L"=" + value_name(*row, value);
         }
@@ -1377,8 +1379,10 @@ void show_rows() {
         std::wstring var = row.var;
         if (var == L"ENGINE_AUTOSTART") {
             fill_choice(row, {{L"0", L"At the first request"}, {L"1", L"When the server starts"}}, row.initial, true);
-        } else if (tier_flag_row(row)) {
+        } else if (tier_flag_row(row) && row.known) {
             fill_flag(row, row.initial);
+        } else if (tier_flag_row(row)) {
+            fill_choice(row, {{L"", L"(the default)"}}, L"", false);  // (until the server's default is known)
         } else if (row.kind == Kind::choice) {
             fill_choice(row, {{row.initial, row.known ? value_name(row, row.initial) : L"(the default)"}}, row.initial, false);
         } else {
@@ -1619,6 +1623,12 @@ void fill_defaults(const Json& at_start) {
     }
 }
 
+// The rows of the tiered cache have no plan choices: they are free to edit once the server's settings are known.
+void enable_tier_rows() {
+    for (auto& row : settings.rows)
+        if (row.key && row.known && tier_row(row)) EnableWindow(row.control, TRUE);
+}
+
 void on_engine_answer(const HttpAnswer& answer) {
     Json parsed;
     if (!answer.answered || answer.status != 200 || !JsonReader(answer.body).read(&parsed)) return;
@@ -1627,12 +1637,14 @@ void on_engine_answer(const HttpAnswer& answer) {
     if (settings.restarting) set_message(L"Saved. The server has restarted.", false, true);
     settings.restarting = false;
     fill_defaults(settings.engine["at_start"]);
+    enable_tier_rows();
     settings.plan_wanted = true;
 }
 
 // The answer of POST /admin/engine/plan or frontend/plan.py: the choices and what each leaves for the context.
 void on_plan_answer(const Json& parsed) {
     fill_defaults(parsed["at_start"]);
+    enable_tier_rows();  // (also when there is no estimate)
     const Json& plan = parsed["plan"];
     if (plan.type != Json::object) {
         SetWindowTextW(settings.summary, (L"No estimate: " + widen(parsed["error"].text)).c_str());
@@ -1654,10 +1666,7 @@ void on_plan_answer(const Json& parsed) {
 
     for (auto& row : settings.rows) {
         if (!row.key) continue;
-        if (tier_row(row)) {  // (no plan choices: they are free to edit once the server's settings are known)
-            EnableWindow(row.control, TRUE);
-            continue;
-        }
+        if (tier_row(row)) continue;  // (no plan choices)
         if (SendMessageW(row.control, CB_GETDROPPEDSTATE, 0, 0)) continue;  // (not while someone is choosing)
         std::vector<std::pair<std::wstring, std::wstring>> items;
         std::wstring current = value_of(row);
@@ -1830,17 +1839,21 @@ void set_settings_font() {
 void layout_settings() {
     UINT dpi = GetDpiForWindow(settings.window);
     auto px = [dpi](int dip) { return MulDiv(dip, dpi, 96); };
+    // Two columns: the groups of the server and the engine on the left, the tiered cache on the right (so the window
+    // stays about as tall as it was: the buttons stay on a 1080p screen). Each is a group box at [left, left + width).
     constexpr int WIDTH = 680, MARGIN = 12, INSET = 12, ROW = 28, LABEL = 180;
-    const int control_x = MARGIN + INSET + LABEL, control_w = WIDTH - control_x - MARGIN - INSET;
+    constexpr int TIER_LEFT = WIDTH, TIER_WIDTH = 540, TOTAL = TIER_LEFT + TIER_WIDTH + MARGIN;
     int y = MARGIN;
     auto place = [&](HWND w, int x, int top, int width, int height) { MoveWindow(w, px(x), px(top), px(width), px(height), TRUE); };
-    place(settings.state, MARGIN, y, WIDTH - 2 * MARGIN, 20);
+    place(settings.state, MARGIN, y, TOTAL - 2 * MARGIN, 20);
     y += 26;
+    const int column_top = y;
 
-    auto place_rows = [&](size_t first, size_t last) {
+    auto place_rows = [&](size_t first, size_t last, int left, int width_of_group) {
+        const int label_x = left + INSET, control_x = left + INSET + LABEL, control_w = width_of_group - 2 * INSET - LABEL;
         for (size_t i = first; i <= last; i++) {
             Row& row = settings.rows[i];
-            place(row.label_window, MARGIN + INSET, y + 3, LABEL - 6, 20);
+            place(row.label_window, label_x, y + 3, LABEL - 6, 20);
             int width = row.hint ? 110 : control_w;
             if (!wcscmp(row.var, L"HF_HOME")) {
                 width = control_w - 100;
@@ -1851,48 +1864,53 @@ void layout_settings() {
             y += ROW;
         }
     };
-    auto group = [&](int index, int top) { place(settings.groups[index], MARGIN, top, WIDTH - 2 * MARGIN, y + 8 - top); y += 16; };
+    auto group = [&](int index, int top, int left, int width) { place(settings.groups[index], left, top, width, y + 8 - top); y += 16; };
 
+    // The left column: x from MARGIN to WIDTH - MARGIN.
     int top = y;
     y += 20;
-    place_rows(0, ROW_SERVER_LAST);
+    place_rows(0, ROW_SERVER_LAST, MARGIN, WIDTH - 2 * MARGIN);
     place(settings.folder_note, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET) - 110, 52);
     place(settings.fix_links, WIDTH - MARGIN - INSET - 100, y, 100, 26);
     y += 54;
     place(settings.host_warning, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET), 20);
     y += 22;
-    group(2, top);
+    group(2, top, MARGIN, WIDTH - 2 * MARGIN);
 
     top = y;
     y += 20;
-    place_rows(ROW_SERVER_LAST + 1, ROW_ENGINE_LAST);
+    place_rows(ROW_SERVER_LAST + 1, ROW_ENGINE_LAST, MARGIN, WIDTH - 2 * MARGIN);
     place(settings.summary, MARGIN + INSET, y + 2, WIDTH - 2 * (MARGIN + INSET), 36);
     y += 40;
-    group(0, top);
+    group(0, top, MARGIN, WIDTH - 2 * MARGIN);
 
     top = y;
     y += 20;
-    place_rows(ROW_ENGINE_LAST + 1, ROW_LOAD_LAST);
+    place_rows(ROW_ENGINE_LAST + 1, ROW_LOAD_LAST, MARGIN, WIDTH - 2 * MARGIN);
     place(settings.load_warning, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET), 20);
     y += 22;
-    group(1, top);
+    group(1, top, MARGIN, WIDTH - 2 * MARGIN);
+    const int left_bottom = y;
 
-    top = y;
+    // The right column: the tiered cache, from the top of the left one.
+    y = top = column_top;
     y += 20;
-    place_rows(ROW_LOAD_LAST + 1, ROW_TIER_LAST);
-    group(3, top);
+    place_rows(ROW_LOAD_LAST + 1, ROW_TIER_LAST, TIER_LEFT, TIER_WIDTH);
+    group(3, top, TIER_LEFT, TIER_WIDTH);
+    y = std::max(y, left_bottom);
 
-    place(settings.keep_text, MARGIN, y + 3, WIDTH - 2 * MARGIN - 110, 36);
-    place(settings.keep_button, WIDTH - MARGIN - 100, y, 100, 26);
+    // Under both columns.
+    place(settings.keep_text, MARGIN, y + 3, TOTAL - 2 * MARGIN - 110, 36);
+    place(settings.keep_button, TOTAL - MARGIN - 100, y, 100, 26);
     y += 40;
-    place(settings.message, MARGIN, y, WIDTH - 2 * MARGIN, 36);
+    place(settings.message, MARGIN, y, TOTAL - 2 * MARGIN, 36);
     y += 40;
     place(settings.open_ini, MARGIN, y, 130, 28);
-    place(settings.apply, WIDTH - MARGIN - 190, y, 90, 28);
-    place(settings.close, WIDTH - MARGIN - 90, y, 90, 28);
+    place(settings.apply, TOTAL - MARGIN - 190, y, 90, 28);
+    place(settings.close, TOTAL - MARGIN - 90, y, 90, 28);
     y += 28 + MARGIN;
 
-    RECT frame{0, 0, px(WIDTH), px(y)};
+    RECT frame{0, 0, px(TOTAL), px(y)};
     DWORD style = GetWindowLongW(settings.window, GWL_STYLE);
     AdjustWindowRectExForDpi(&frame, style, FALSE, GetWindowLongW(settings.window, GWL_EXSTYLE), dpi);
     SetWindowPos(settings.window, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);

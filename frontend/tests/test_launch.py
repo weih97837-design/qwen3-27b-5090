@@ -322,6 +322,15 @@ def test_tier_env_settings_are_read_like_tierpolicy_and_the_engine(monkeypatch):
     assert launch.Launch({"prefill_chunk": 1}, dict(DEFAULTS, **{k: s[k] for k in launch.TIER_SETTINGS})).settings["spill_ram_gib"] == 48.5
 
 
+def test_tier_flags_are_read_like_atoi(monkeypatch):
+    for text, want in [("1", True), ("0", False), ("1.0", True), ("0.9", False), (" 2", True), ("\t-1", True), ("+1", True),
+                       ("true", False), ("yes", False), ("00", False), ("-0", False), ("1abc", True), ("x1", False), ("- 1", False)]:
+        assert launch.parse_tier("spill_async_io", text) is want, text
+        monkeypatch.setenv("SPILL_ASYNC_PROMOTE", text)
+        assert launch.env_settings()["spill_async_promote"] is want, text
+    assert launch.parse_tier("spill_async_io", "") is False and launch.parse_tier("spill_async_io", None) is False
+
+
 def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path):
     """Launch.config's env is what worker.Scheduler puts in os.environ before TierPolicy.from_env reads it."""
     lc = settings()
