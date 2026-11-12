@@ -151,7 +151,7 @@ struct Spilled {
   uint32_t hits = 0;
   uint64_t last_hit = 0;
   mutable std::vector<uint64_t> bh;  // retention.h block_hashes(ids), filled when the retention rules first look at it
-  int io_fails = 0;     // restores of its files that failed on an I/O error in a row (Model::spill_io_failed)
+  int io_fails = 0;     // restores of its files that failed on an I/O error in a row (Model::spill_io_failed); reset by a good read
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
   bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
   // SPILL_ASYNC_IO: the device -> host copy that fills kv (or the host -> device copy that reads it) is queued on the

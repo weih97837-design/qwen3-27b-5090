@@ -316,10 +316,12 @@ class Model {
   // Tiered cache (spill.cc).
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
   // (retention.h) The superseded flags of every spilled entry, recomputed when an entry or a checkpoint was added / removed.
-  bool spill_superseded(uint64_t id) const;
+  bool spill_superseded(uint64_t id, bool durable = false) const;  // durable: only an extender with a manifest on the SSD counts
   void spill_retention_refresh() const;
-  mutable std::map<uint64_t, char> sup_;
-  mutable int64_t sup_key_[6] = {-1, -1, -1, -1, -1, -1};
+  mutable std::map<uint64_t, char> sup_, sup_dur_;
+  // Generation of everything the flags depend on (entries, checkpoints, owners, manifests): bumped at each change, the cache key.
+  uint64_t ret_gen_ = 0;
+  mutable uint64_t sup_key_ = ~uint64_t(0);
   uint64_t owner_next_ = 0, seq_owner_ = 0;  // set_owner; the running sequence's owner
   uint32_t seq_hits_ = 0;                    // reuse count inherited from the checkpoint it resumed from (retention.h inherited_hits)
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)

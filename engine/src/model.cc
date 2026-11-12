@@ -659,12 +659,14 @@ bool Model::evict_checkpoint(bool for_slot) {
     b->second.live = false;
     b->second.last_use = it->last_use;
     b->second.hits = it->hits, b->second.last_hit = it->last_hit, b->second.owner = it->owner;  // (hits since the copy was made)
+    ret_gen_++;
   } else if (spill_on()) {
     spill_checkpoint(*it);
   }
   for (int32_t p : it->pages) pool_.unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
+  ret_gen_++;
   cstats_.evicted++;
   return true;
 }
@@ -726,6 +728,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
+  ret_gen_++;
   cstats_.saved++;
 }
 
@@ -748,6 +751,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     const_cast<Checkpoint*>(best)->held = false;  // (its owner is here)
     const_cast<Checkpoint*>(best)->hits++;  // (retention: reused)
+    ret_gen_++;
     const_cast<Checkpoint*>(best)->last_hit = use_clock_;
     seq_hits_ = inherited_hits(cached, best->hits);  // (the checkpoints this sequence saves carry the reuse on)
     // The shared checkpoints on this chain have served their waiter (a later one, deeper, is the match now).

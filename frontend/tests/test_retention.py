@@ -151,6 +151,28 @@ def test_flush_does_not_write_superseded_entries(tmp_path):
     assert env.eng.exports == [keep] and sup in env.eng.entries
 
 
+def test_flush_writes_an_entry_whose_deeper_one_is_not_on_the_ssd_yet(tmp_path):
+    # superseded (a deeper one exists in VRAM / RAM) but not superseded_durable: a stop must still write it, deeper entries first
+    env = make(tmp_path, budget=10_000)
+    shallow = env.eng.add_ram(100, pos=9000, superseded=True)
+    env.eng.entries[shallow]["superseded_durable"] = False
+    deep = env.eng.add_ram(100, pos=20000)
+    durable_sup = env.eng.add_ram(100, pos=9000, superseded=True)
+    env.eng.entries[durable_sup]["superseded_durable"] = True
+    assert env.tier.flush(10)["written"] == 2
+    assert env.eng.exports == [deep, shallow] and durable_sup in env.eng.entries
+
+
+def test_ram_to_ssd_drops_only_durably_superseded_entries(tmp_path):
+    env = make(tmp_path, budget=10_000, retention=0)
+    pending = env.eng.add_ram(100, owner=1, superseded=True)
+    env.eng.entries[pending]["superseded_durable"] = False
+    gone = env.eng.add_ram(100, owner=1, superseded=True)
+    env.eng.entries[gone]["superseded_durable"] = True
+    env.tier.tick(idle=True)
+    assert pending in env.eng.exports and gone in env.eng.drops and env.tier.status()["ssd_skipped_superseded"] == 1
+
+
 def test_status_reuse_split_and_agent_rows(tmp_path):
     env = make(tmp_path, budget=10_000, retention=3600)
     env.eng.add_disk(env.dir, 300, owner=1, hits=2)

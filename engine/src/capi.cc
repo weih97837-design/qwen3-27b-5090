@@ -408,7 +408,7 @@ int q27_spill_list_ex(void* m, char* buf, int cap) {
 }
 
 // Retention (retention.h, Model::set_owner / spill_meta / spill_agents). q27_set_owner: the agent id of the next prefix_begin's
-// sequence (0: unknown). q27_spill_meta: "id\towner\thits\tsuperseded" per entry. q27_spill_agents: "owner\tram_bytes\tssd_bytes\t
+// sequence (0: unknown). q27_spill_meta: "id\towner\thits\tsuperseded\tsuperseded_durable" per entry (the last: superseded counting only deeper entries that have a manifest on the SSD). q27_spill_agents: "owner\tram_bytes\tssd_bytes\t
 // ram_entries\tssd_entries" per agent. The two lists are copied as q27_spill_list copies its list.
 int q27_set_owner(void* m, uint64_t owner) {
   return guard([&] { static_cast<Model*>(m)->set_owner(owner); });

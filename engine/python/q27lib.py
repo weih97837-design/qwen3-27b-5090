@@ -476,7 +476,7 @@ class Engine:
         meta = self.spill_meta()
         if meta is not None:
             for e in out:
-                e.update(meta.get(e["id"], {"owner": 0, "hits": 0, "superseded": False}))
+                e.update(meta.get(e["id"], {"owner": 0, "hits": 0, "superseded": False, "superseded_durable": False}))
         return out
 
     # ---- retention (docs/tiered-cache.md "Retention"; engine/src/retention.h)
@@ -506,10 +506,12 @@ class Engine:
         return [ln.split("\t") for ln in buf.value.decode("utf-8", "replace").split("\n") if ln]
 
     def spill_meta(self):
-        """{entry id: {"owner", "hits", "superseded"}} of the spilled entries, or None with a library without retention."""
+        """{entry id: {"owner", "hits", "superseded", "superseded_durable"}} of the spilled entries, or None with a library without retention."""
         if not self.has_retention:
             return None
-        return {int(f[0]): {"owner": int(f[1]), "hits": int(f[2]), "superseded": f[3] == "1"}
+        return {int(f[0]): {"owner": int(f[1]), "hits": int(f[2]), "superseded": f[3] == "1",
+                    # (an older library reports no durable flag: the plain one is then the best there is)
+                    "superseded_durable": (f[4] == "1") if len(f) >= 5 else f[3] == "1"}
                 for f in self._text(lib().q27_spill_meta, "q27_spill_meta") if len(f) >= 4}
 
     def spill_agents(self):
