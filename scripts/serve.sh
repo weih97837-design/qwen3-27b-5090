@@ -13,9 +13,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# PORT as compose.yaml takes it: the environment, then .env, then 8000.
+# PORT as compose.yaml takes it: the environment, then .env, then 46320.
 PORT=${PORT:-$( { sed -n 's/^PORT=//p' .env 2>/dev/null || true; } | tail -n 1 | tr -d "\"'\r")}
-PORT=${PORT:-8000}
+PORT=${PORT:-46320}
 NAME=qwen3-27b-5090
 
 case "${1:-}" in

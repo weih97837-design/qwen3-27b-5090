@@ -66,7 +66,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 
 ```
  clients (Claude Code, Codex, OpenAI / Anthropic SDKs)
-    |  HTTP 127.0.0.1:8000
+    |  HTTP 127.0.0.1:46320
     v
  frontend/server.py   API server (asyncio): chat template, tokenizer, reasoning and tool-call parsing,
     |                 image preprocessing, streaming, metrics, admin API

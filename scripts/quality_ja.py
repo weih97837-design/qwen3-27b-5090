@@ -10,7 +10,7 @@ the source, the reference and the output. Generation and judging are separate st
 model at a time: generate with the configuration under test, then start the judge model and judge the file.
 
     uv run scripts/quality_ja.py gen --label sglang-agent             # -> bench/results/<ts>-ja-<label>.json
-    uv run scripts/quality_ja.py judge bench/results/<file>.json      # judge server on :8000 (default Gemma 4)
+    uv run scripts/quality_ja.py judge bench/results/<file>.json      # judge server on :46320 (default Gemma 4)
     uv run scripts/quality_ja.py judge <file> --control shuffled      # sanity check: outputs of other items
     uv run scripts/quality_ja.py summary <file> [<file> ...]
     uv run scripts/quality_ja.py compare <baseline.json> <candidate.json>   # paired differences, bootstrap CI
@@ -357,7 +357,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gen")
     g.add_argument("--label", required=True)
-    g.add_argument("--base-url", default="http://127.0.0.1:8000")
+    g.add_argument("--base-url", default="http://127.0.0.1:46320")
     g.add_argument("--model", default="qwen3.8-27b")
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--tasks", nargs="*", choices=list(COUNTS), help="default: all")
@@ -366,7 +366,7 @@ def main():
     g.add_argument("--temperature", type=float, default=0.0, help="0 = greedy (the gate); >0 only for controls")
     j = sub.add_parser("judge")
     j.add_argument("result")
-    j.add_argument("--base-url", default="http://127.0.0.1:8000")
+    j.add_argument("--base-url", default="http://127.0.0.1:46320")
     j.add_argument("--model", default="gemma-4-26b-a4b")
     j.add_argument("--control", choices=["none", "shuffled"], default="none")
     j.add_argument("--thinking", action="store_true")

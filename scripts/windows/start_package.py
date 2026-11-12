@@ -42,7 +42,7 @@ def server_env(environ, settings, root):
             notes.append(f"{k}={v} from settings.ini (the environment has {env[k]})")
     env.update(settings)
     env.setdefault("HOST", "127.0.0.1")
-    env.setdefault("PORT", "8000")
+    env.setdefault("PORT", "46320")
     env["HF_HOME"] = os.path.abspath(os.path.join(root, env.get("HF_HOME", "huggingface")))
     return env, notes
 

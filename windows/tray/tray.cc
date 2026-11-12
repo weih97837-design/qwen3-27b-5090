@@ -63,7 +63,7 @@ struct App {
     std::wstring root, python, server, download, plan;  // the package's files
     std::wstring log_dir, log_path, old_log, ini;    // the package keeps what it writes in its own folder
     std::wstring host = L"127.0.0.1";
-    int port = 8000;
+    int port = 46320;
 
     std::mutex mutex;
     Shared shared;
@@ -241,7 +241,7 @@ std::map<std::wstring, std::wstring> server_env(std::vector<std::string>* notes)
         env[k] = v;
     }
     env.try_emplace(L"HOST", L"127.0.0.1");
-    env.try_emplace(L"PORT", L"8000");
+    env.try_emplace(L"PORT", L"46320");
     env.try_emplace(L"ENGINE_AUTOSTART", L"0");         // no VRAM in use until the first request ...
     env.try_emplace(L"ENGINE_IDLE_UNLOAD_S", L"1800");  // ... and again after half an hour without one
     env.try_emplace(L"HF_HOME", L"huggingface");

@@ -6,7 +6,7 @@
 3. the same question with another image -> no reuse of the first image's tokens beyond the system prefix;
 4. two images in one message; 5. a non-data URL -> HTTP 400.
 
-    python3 scripts/vision_api_test.py [--base-url http://127.0.0.1:8000]   # (standard library only)
+    python3 scripts/vision_api_test.py [--base-url http://127.0.0.1:46320]   # (standard library only)
 """
 
 import argparse
@@ -29,7 +29,7 @@ def data_url(name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     args = ap.parse_args()
     off = {"enable_thinking": False}
 

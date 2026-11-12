@@ -115,7 +115,7 @@
 
 - **第一次**：不需要手動建立。按 **Apply** 或 **Open settings.ini** 時，托盤程式會自行建立 `settings.ini`。
 - 視窗分為三組（群組與欄位名稱即視窗上的文字，對應變數在括號內）：
-  - **Server: changing these restarts it**（改動會重新啟動伺服器）：**Address**（`HOST`，預設 `127.0.0.1`）、**Port**（`PORT`，預設 `8000`）、**Weights folder (HF_HOME)**（權重的資料夾）。
+  - **Server: changing these restarts it**（改動會重新啟動伺服器）：**Address**（`HOST`，預設 `127.0.0.1`）、**Port**（`PORT`，預設 `46320`）、**Weights folder (HF_HOME)**（權重的資料夾）。
   - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM budget (GiB)**（`VRAM_BUDGET_GIB`）。
   - **When it holds the VRAM**：**Load the engine**（`ENGINE_AUTOSTART`）、**Unload when idle (seconds)**（`ENGINE_IDLE_UNLOAD_S`，閒置多久後釋放 VRAM）、**Smallest KV pool (tokens)**（`MIN_KV_TOKENS`）。
 - 按鈕：**Browse...**（選擇權重資料夾）、**Open settings.ini**（用文字編輯器開啟檔案）、**Apply**（儲存並套用）、**Close**。
@@ -123,7 +123,7 @@
 
 **注意**：分層快取的設定（`SPILL_*`）不在視窗的欄位中。要改它們，按 **Open settings.ini** 直接編輯 `[env]` 區段，參見 `docs/tiered-cache.md`。
 
-**要讓 MAD 接上**，`Address` 維持 `127.0.0.1`，只有 MAD 在同一台電腦上時就夠用。
+**要讓其他程式連線**，`Address` 維持 `127.0.0.1` 即可（同一台電腦上的用戶端）。
 
 ---
 
@@ -150,7 +150,7 @@ SPILL_TTL_DAYS=7
 
 ## 5. /ui 頁面：啟動、停止、重新啟動與設定
 
-伺服器執行後，在瀏覽器開啟 **http://127.0.0.1:8000/ui**（選單的 **Open stats page** 也會開啟它）。
+伺服器執行後，在瀏覽器開啟 **http://127.0.0.1:46320/ui**（選單的 **Open stats page** 也會開啟它）。
 
 **你會看到**：
 
@@ -190,7 +190,7 @@ SPILL_TTL_DAYS=7
 
 如果你偏好主控台視窗，可以雙擊 `start.cmd`（同一個資料夾內）。
 
-- **你會看到**：一個主控台視窗，裡面是下載（第一次）與伺服器的輸出；伺服器在 http://127.0.0.1:8000 監聽，瀏覽器會開啟 /ui（`OPEN_UI=1`）。
+- **你會看到**：一個主控台視窗，裡面是下載（第一次）與伺服器的輸出；伺服器在 http://127.0.0.1:46320 監聽，瀏覽器會開啟 /ui（`OPEN_UI=1`）。
 - **關閉視窗 = 停止伺服器**。
 - `start.cmd` 會讀取 `settings.ini`，而且會直接載入引擎（`ENGINE_AUTOSTART` 預設為 1）。
 
@@ -201,7 +201,7 @@ SPILL_TTL_DAYS=7
 | 你看到的 | 原因與處理 |
 | --- | --- |
 | 提示文字是 `Not enough VRAM to load the model` | VRAM 不夠。關閉其他使用 GPU 的程式（遊戲、其他 AI 工具），或在 Settings 降低 `MAX_TOKENS`、設定 `VRAM_BUDGET_GIB`。 |
-| 視窗或記錄顯示 `Port 8000 is in use by another server.` | 8000 埠已被其他伺服器佔用（托盤程式不會啟動第二個）。在 Settings 改 **Port**，或先停止另一個伺服器。 |
+| 視窗或記錄顯示 `Port 46320 is in use by another server.` | 46320 埠已被其他伺服器佔用（托盤程式不會啟動第二個）。在 Settings 改 **Port**，或先停止另一個伺服器。 |
 | Windows 跳出安全性警告 | 程式未簽章，README 說明 Windows 可能會警告。自行建置的 zip 沒有上游 Release 的 SHA-256 可比對，請確認是你自己建置的檔案。 |
 | `The weights could not be downloaded. The log has the reason.` | 下載失敗。看 **Show log**，中斷後重新啟動即可續傳。 |
 | `The server exited with code N.` | 伺服器異常結束。看 **Show log** 的最後幾行。 |
@@ -210,21 +210,14 @@ SPILL_TTL_DAYS=7
 
 ---
 
-## 8. 接上 MultiAgentDepartment（MAD）
+## 8. 連接 OpenAI 相容用戶端
 
 以下是人類操作的步驟。API 的細節與指令版本見 `docs/deploy-cli.md` 第 8 節。
 
 1. **確認伺服器就緒**：在 /ui 頁面看到引擎狀態為可用（托盤提示為 `Ready`，或 `Waiting: the first request loads the model`）。
-2. **在 MAD 設定本機模型的端點**：在 MAD 的 provider 設定中（或用 `POST /api/providers`），把 **base URL** 設為 `http://127.0.0.1:8000/v1`，**模型名稱**設為 `qwen3.8-27b`。
-3. **把 KV 快取後端設為 `q27`，slots 設為 4**：MAD 沒有這個設定的介面，只能用它的本機 API（預設 `http://127.0.0.1:8765`；`MAD_PORT` 或 `--port` 可改）。在 PowerShell 執行，`<provider_id>` 換成 MAD 的 provider 編號（可用 `Invoke-RestMethod http://127.0.0.1:8765/api/providers` 查看）：
-
-   ```powershell
-   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/api/kv-cache/config -ContentType 'application/json' -Body '{"providers": {"<provider_id>": {"backend": "q27", "slots": 4}}}'
-   ```
-
-   再執行 `Invoke-RestMethod http://127.0.0.1:8765/api/kv-cache`，確認該 provider 的 backend 為 `q27`。
-4. **同時推論數**：在啟動 MAD 之前設定環境變數 `MAD_MAX_CONCURRENT_AGENTS`，值與伺服器的 **Requests at once**（`MAX_SEQS`，預設 4）相同。範圍 1 到 8；未設定、0 或無效值為 1。Windows 上如何設定，**未驗證**。
-5. **確認**：傳送一則訊息，看 MAD 是否得到回應；在 /ui 頁面的分層快取與請求區可以看到請求的進行。
+2. **用戶端設定**：Base URL 設為 `http://127.0.0.1:46320/v1`，API key 填任意值，模型名稱用 `http://127.0.0.1:46320/v1/models` 查到的名稱（預設 `qwen3.8-27b`）。
+3. **並行**：用戶端同時送出的請求數最多為 **Requests at once**（`MAX_SEQS`，預設 4）時可並行執行；超過的請求排隊等候。
+4. **確認**：送出一則請求得到回應；在 /ui 頁面可以看到請求的進行。
 
 ---
 

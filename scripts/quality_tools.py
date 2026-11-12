@@ -269,7 +269,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gen")
     g.add_argument("--label", required=True)
-    g.add_argument("--base-url", default="http://127.0.0.1:8000")
+    g.add_argument("--base-url", default="http://127.0.0.1:46320")
     g.add_argument("--model", default="qwen3.8-27b")
     g.add_argument("--categories", nargs="*", default=list(CATEGORIES), choices=CATEGORIES)
     g.add_argument("--concurrency", type=int, default=4)

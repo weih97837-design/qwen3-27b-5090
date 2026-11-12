@@ -1,7 +1,7 @@
 name: qwen3-27b-5090
 
-# The engine served on port 8000 (its own small image, Dockerfile), and the development services (dev/Dockerfile).
-#   docker compose up -d --build serve                    # the serving image, built from this checkout; the OpenAI / Anthropic API on 127.0.0.1:8000
+# The engine served on port 46320 (its own small image, Dockerfile), and the development services (dev/Dockerfile).
+#   docker compose up -d --build serve                    # the serving image, built from this checkout; the OpenAI / Anthropic API on 127.0.0.1:46320
 #   docker compose --profile dev run --rm dev-cpu <cmd>   # no GPU attached (safe while another env is serving)
 #   docker compose --profile dev run --rm dev <cmd>       # GPU attached (microbenchmarks, GPU reference, engine tests)
 x-dev: &dev
@@ -53,9 +53,9 @@ services:
     gpus: all
     container_name: qwen3-27b-5090
     ports:
-      # The address on the host; the server in the container always listens on 8000 (HOST=0.0.0.0: the network, and
+      # The address on the host; the server in the container always listens on 46320 (HOST=0.0.0.0: the network, and
       # /admin has no authentication).
-      - "${HOST:-127.0.0.1}:${PORT:-8000}:8000"
+      - "${HOST:-127.0.0.1}:${PORT:-46320}:46320"
     environment:
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
       ENGINE_AUTOSTART: ${ENGINE_AUTOSTART:-1}     # 0: the server starts with the engine stopped (no VRAM; start it at /ui)
@@ -99,7 +99,7 @@ services:
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty = FP8 with NVFP4 KV (P7-7), 1 = also with FP8 KV, 0 = BF16 / f16
       Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up, then the silu step
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:46320/health', timeout=4)"]
       interval: 10s
       timeout: 5s
       start_period: 600s

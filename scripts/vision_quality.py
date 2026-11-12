@@ -185,7 +185,7 @@ def run(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["make", "run"])
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--label", default="server")
     ap.add_argument("--out")
     ap.add_argument("--max-tokens", type=int, default=32)

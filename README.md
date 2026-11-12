@@ -96,12 +96,12 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose up -d --build serve          # builds the serving image from this checkout; serves 127.0.0.1:8000
+docker compose up -d --build serve          # builds the serving image from this checkout; serves 127.0.0.1:46320
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+curl -s http://127.0.0.1:46320/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
@@ -172,7 +172,7 @@ server then takes no VRAM until the first request and frees it after 30 minutes 
 first start (compare the zip's SHA-256 with the release's).
 
 Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
-the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:8000
+the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:46320
 and the browser opens its stats page.
 
 The package is portable: its settings (`settings.ini`, see `settings.example.ini`), weights and log stay in its folder, so
@@ -183,7 +183,7 @@ faster natively (about 5.8 GB/s against 2.6–2.8 GB/s from WSL2's `/mnt`).
 
 ### Stats page
 
-http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
+http://127.0.0.1:46320/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
 activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
 with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
 restarts it with other settings (weights, KV cache type, speculative decoding, vision tower, requests at once,
@@ -192,13 +192,13 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 
 ## Clients
 
-- **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,
+- **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:46320/v1`, any API key,
   model `qwen3.8-27b`. Reasoning comes back in both `reasoning_content` and `reasoning`; `reasoning_effort` and
   `chat_template_kwargs.enable_thinking` are honored.
 - **Anthropic-compatible** (messages, count_tokens), e.g. Claude Code:
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:8000`, `ANTHROPIC_MODEL=qwen3.8-27b` (and the same for the small / fast model),
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:46320`, `ANTHROPIC_MODEL=qwen3.8-27b` (and the same for the small / fast model),
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`.
-- **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:8000/v1"` and `wire_api = "responses"`.
+- **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:46320/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
 - Images as data URLs or http(s) URLs. No video.
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as

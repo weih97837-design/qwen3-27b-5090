@@ -14,7 +14,7 @@ def test_settings_come_before_the_environment_and_the_defaults(tmp_path):
     assert env["PORT"] == "8002" and env["HOST"] == "0.0.0.0" and env["PATH"] == "x"
     assert len(notes) == 1 and "PORT=8002" in notes[0] and "8001" in notes[0]
     env, notes = sp.server_env({}, {}, str(tmp_path))
-    assert env["HOST"] == "127.0.0.1" and env["PORT"] == "8000" and not notes
+    assert env["HOST"] == "127.0.0.1" and env["PORT"] == "46320" and not notes
 
 
 def test_the_weights_stay_in_the_folder_unless_settings_say_otherwise(tmp_path):

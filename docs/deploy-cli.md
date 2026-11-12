@@ -25,7 +25,7 @@
 | 5 | `free -g` | `Mem: total` 至少 16（README：至少 16 GB 主機 RAM） | 增加 WSL2 記憶體，或改用較小的 `SPILL_RAM_GIB`（見 `docs/tiered-cache.md`） |
 | 6 | `df -h .` | 可用空間至少 25 GB 供權重（README：權重約 23 GB）；Docker 建置也需要空間 | 清出空間，或把 `./hf` 做成符號連結到別的磁碟（見第 4 節） |
 | 7 | `python3 --version` | 3.10 或以上（`scripts/download-weights.sh` 與 `tools/recommend_config.py` 需要；否則腳本會改用 `uv`） | 安裝 Python 3.10+ 或 `uv` |
-| 8 | `docker ps --filter "publish=8000" --format '{{.Names}}'` | 沒有輸出，或只有 `qwen3-27b-5090` | 其他容器佔用 8000 埠。只能同時跑一個模型（GPU 只放得下一個），先停掉它（`scripts/serve.sh up` 也會做同樣的檢查） |
+| 8 | `docker ps --filter "publish=46320" --format '{{.Names}}'` | 沒有輸出，或只有 `qwen3-27b-5090` | 其他容器佔用 46320 埠。只能同時跑一個模型（GPU 只放得下一個），先停掉它（`scripts/serve.sh up` 也會做同樣的檢查） |
 
 ---
 
@@ -122,7 +122,7 @@ docker compose logs -f serve      # 等到 "engine ready"（`frontend/server.py:
 scripts/serve.sh up --build --idle   # 等同 ENGINE_AUTOSTART=0
 ```
 
-- **成功判準**：`serve.sh` 印出 `server up: http://127.0.0.1:8000/ui`，結束碼 0；`docker compose ps serve` 顯示 running。
+- **成功判準**：`serve.sh` 印出 `server up: http://127.0.0.1:46320/ui`，結束碼 0；`docker compose ps serve` 顯示 running。
 - **建置時間**：README 記載首次約 2 分鐘（**未驗證**：CUDA 編譯時間依機器而異）。
 - **失敗時**：`serve.sh` 會印出 `docker compose logs --tail 30 serve` 的內容並以 1 結束。見第 11 節。
 
@@ -135,13 +135,13 @@ scripts/serve.sh up --build --idle   # 等同 ENGINE_AUTOSTART=0
 ```bash
 ok=0
 for i in $(seq 900); do
-  if curl -sf -m 5 -o /dev/null http://127.0.0.1:8000/health; then ok=1; break; fi
+  if curl -sf -m 5 -o /dev/null http://127.0.0.1:46320/health; then ok=1; break; fi
   sleep 1
 done
 if [ "$ok" = 1 ]; then echo READY; else echo "TIMEOUT: docker compose logs --tail 100 serve"; fi
 ```
 
-- **成功判準**：印出 `READY`。`curl -s http://127.0.0.1:8000/health` 回傳 `{"status": "ok"}`。
+- **成功判準**：印出 `READY`。`curl -s http://127.0.0.1:46320/health` 回傳 `{"status": "ok"}`。
 - **注意**：`/health` 在引擎載入中回傳 503，內容為 `{"status": "<狀態>"}`。若 `ENGINE_AUTOSTART=0`（`--idle`），服務會回傳 200 且 `status` 為 `unloaded`，此時引擎**尚未載入**，需先在 `/ui` 啟動或送出第一個請求。
 - **逾時（15 分鐘）時**：`docker compose logs --tail 100 serve`；必要時看第 11 節。
 
@@ -154,7 +154,7 @@ docker inspect -f '{{.State.Health.Status}}' qwen3-27b-5090    # starting / heal
 ### 6.2 模型清單
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
+curl -s http://127.0.0.1:46320/v1/models | python3 -m json.tool
 ```
 
 - **成功判準**：`"object": "list"`，`data[0].id` 為 `qwen3.8-27b`（`SERVED_MODEL_NAME` 的預設值，`compose.yaml:60`），`data[0].max_model_len` 為實際生效的 `MAX_TOKENS`。
@@ -162,7 +162,7 @@ curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
 ### 6.3 一次簡短的聊天補全
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
+curl -s http://127.0.0.1:46320/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Say hi in one word."}], "max_tokens": 32, "chat_template_kwargs": {"enable_thinking": false}}' \
   | python3 -m json.tool
@@ -179,7 +179,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 ### 6.4 確認分層快取已啟用
 
 ```bash
-curl -s http://127.0.0.1:8000/metrics | grep -E '^q27:tier_'
+curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_'
 ```
 
 - **成功判準**：出現 `q27:tier_ram_bytes`、`q27:tier_in_ram`、`q27:tier_on_disk`、`q27:tier_spilled`、`q27:tier_restored`、`q27:tier_written`、`q27:tier_dropped`、`q27:tier_subsumed`、`q27:tier_failed`、`q27:tier_ssd_bytes`、`q27:tier_ssd_budget_bytes` 等行。
@@ -192,11 +192,11 @@ curl -s http://127.0.0.1:8000/metrics | grep -E '^q27:tier_'
 
 ## 7. 狀態網頁
 
-- 網址：**http://127.0.0.1:8000/ui**
+- 網址：**http://127.0.0.1:46320/ui**
 - 檢查（回傳 200）：
 
   ```bash
-  curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/ui
+  curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:46320/ui
   ```
 
 - **成功判準**：輸出 `200`；瀏覽器可以看到引擎狀態、VRAM、分層快取與請求記錄。
@@ -204,29 +204,17 @@ curl -s http://127.0.0.1:8000/metrics | grep -E '^q27:tier_'
 
 ---
 
-## 8. 接上 MultiAgentDepartment
+## 8. 連接 OpenAI 相容用戶端
 
-以下步驟需要在 MultiAgentDepartment（MAD）那一側設定。MAD 的對應說明在其 repo 的 `docs/KV_CACHE_TIERING_3_0_2.md`。
-
-**(a) provider 端點**：在 MAD 的 provider 設定中（MAD 介面，或 `POST /api/providers`），把 provider 的 base URL 設為 `http://127.0.0.1:8000/v1`，模型名稱設為 `qwen3.8-27b`。
-
-**(b) kv-cache backend 為 `q27`、slots 為 4**：路由在 MAD 的 `app/api/server.py:812`（POST）與 `:489`（GET）。
+- **Base URL**：`http://127.0.0.1:46320/v1`，API key 可填任意值。
+- **模型名稱**：用下列指令查詢 `/v1/models` 回傳的名稱（預設 `qwen3.8-27b`）。
+- **並行**：用戶端同時送出的請求數最多為 `MAX_SEQS`（本 runbook 為 4）時可以並行執行；超過的請求排隊等候。
 
 ```bash
-# MAD 本機 API：預設 http://127.0.0.1:8765（MAD_PORT / MAD_HOST、--port，或 MAD 桌面對話框的「連接埠」可改）
-curl -s -X POST "http://127.0.0.1:8765/api/kv-cache/config" \
-  -H 'Content-Type: application/json' \
-  -d '{"providers": {"<provider_id>": {"backend": "q27", "slots": 4}}}'
-
-curl -s "http://127.0.0.1:8765/api/kv-cache"    # 確認該 provider 的 backend 為 q27
+curl -s http://127.0.0.1:46320/v1/models | python3 -m json.tool
 ```
 
-- **成功判準**：POST 回傳 HTTP 200；GET 顯示該 provider 的 backend 為 `q27`（回應格式**未驗證**）。
-- 這會讓 MAD 設定 `target_seqs=4`（與 `MAX_SEQS=4` 相符）。分層搬移由引擎負責，MAD 不需要匯出或匯入。
-
-**(c) 同時推論數**：啟動 MAD 的行程需要環境變數 `MAD_MAX_CONCURRENT_AGENTS`，值與引擎的 `MAX_SEQS` 相同（本 runbook 為 4）。範圍 1 到 8（MAD `app/providers/registry.py:31` 夾在此範圍）；未設定、0 或無效值為 1。在 Windows 上如何設定環境變數，**未驗證**（依 MAD 的啟動方式而定）。
-
-- 完成後再做一次第 6.2、6.3 節的驗證。
+- **成功判準**：`data` 中有模型名稱，且用該名稱送出的請求得到回應。
 
 ---
 
@@ -249,7 +237,7 @@ scripts/serve.sh up --build
 **停止引擎（保留伺服器，釋放 VRAM）**：在 `/ui` 按 **Stop**，或：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'
+curl -s -X POST http://127.0.0.1:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'
 ```
 
 - **成功判準**：`/health` 不再回傳 200（引擎已停止），`nvidia-smi` 的 VRAM 使用量下降。
@@ -291,12 +279,12 @@ README 也明確提醒這一點。
 | `docker compose` 找不到 `compose.yaml` 或設定錯誤 | `docker compose config --quiet` | 確認在 repo 根目錄；檢查 `.env` 語法 |
 | 建置失敗 | `docker compose build serve`（看完整輸出） | 檢查磁碟空間（第 1 節第 6 項）與網路；**未驗證**：本 repo 未記載常見建置錯誤 |
 | 容器內看不到 GPU | `docker info --format '{{json .Runtimes}}'`；`nvidia-smi`（主機） | 安裝或修復 NVIDIA Container Toolkit（**未驗證** 確切步驟） |
-| 8000 埠被佔用 | `docker ps --filter "publish=8000"` | `serve.sh` 會列出佔用者；先停止它。只能同時執行一個模型 |
-| `/health` 長時間 503 | `curl -s http://127.0.0.1:8000/health`；`docker compose logs --tail 100 serve` | 看狀態字串與日誌中的錯誤。`restart: on-failure:3`（`compose.yaml:108`）會自動重啟最多 3 次 |
-| 引擎拒絕載入（VRAM 不足） | `curl -s http://127.0.0.1:8000/admin/engine`（看 `refused` 欄位）；`nvidia-smi` | 關閉其他 GPU 程式；降低 `MAX_TOKENS` 或 `VRAM_BUDGET_GIB`；`python3 tools/recommend_config.py` 取得建議 |
+| 46320 埠被佔用 | `docker ps --filter "publish=46320"` | `serve.sh` 會列出佔用者；先停止它。只能同時執行一個模型 |
+| `/health` 長時間 503 | `curl -s http://127.0.0.1:46320/health`；`docker compose logs --tail 100 serve` | 看狀態字串與日誌中的錯誤。`restart: on-failure:3`（`compose.yaml:108`）會自動重啟最多 3 次 |
+| 引擎拒絕載入（VRAM 不足） | `curl -s http://127.0.0.1:46320/admin/engine`（看 `refused` 欄位）；`nvidia-smi` | 關閉其他 GPU 程式；降低 `MAX_TOKENS` 或 `VRAM_BUDGET_GIB`；`python3 tools/recommend_config.py` 取得建議 |
 | 權重缺失或載入失敗 | `ls -la hf/hub` | 重跑 `scripts/download-weights.sh`（會續傳） |
 | `/metrics` 沒有 `q27:tier_*` | 第 6.4 節的 `docker inspect` 指令 | `SPILL_RAM_GIB` 為 0 時分層關閉；確認 image 為本分支建置 |
 | SSD 層佔滿磁碟 | `docker volume inspect qwen3-27b-5090_kvcache --format '{{.Mountpoint}}'`；`curl -s .../metrics \| grep tier_ssd` | 引擎會自動刪除最舊的檔案（`SPILL_SSD_GIB` 上限、`SPILL_SSD_MIN_FREE_GIB` 保留）。要調整就改 `.env` 後 `scripts/serve.sh up` |
 | image 不是本分支本地建置的（例如拉到上游 image） | `docker image inspect local/qwen3-27b-5090-serve:tiered-kv-cache --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'` | 本地建置的 image 此欄位為空（README）。有值代表它不是本地建置：執行 `scripts/serve.sh up --build` |
-| MAD 只有一個 agent 在跑 | `curl -s http://127.0.0.1:8000/admin/concurrency`（看 `target_seqs`） | 確認 MAD 的 `MAD_MAX_CONCURRENT_AGENTS=4` 與 `MAX_SEQS=4`；確認第 8(b) 節已執行 |
+| 同時只有一個請求在跑 | `curl -s http://127.0.0.1:46320/admin/concurrency`（看 `target_seqs`） | 確認用戶端確實同時送出多個請求，且 `MAX_SEQS=4`（`target_seqs` 不會超過它） |
 | 生效的設定與預期不同 | `docker compose config`（解析後的 compose 設定）；`docker inspect ...`（容器實際環境） | `.env` 的值優先於 `compose.yaml` 預設值；shell 變數優先於 `.env`。修改後要 `up` 才會套用（`docker compose restart` 不會） |

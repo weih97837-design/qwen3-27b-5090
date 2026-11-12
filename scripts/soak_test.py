@@ -411,7 +411,7 @@ def longbatch(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["soak", "longbatch"])
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--minutes", type=float, default=30)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--sample-every", type=float, default=15)

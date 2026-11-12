@@ -62,7 +62,7 @@ port to the internet.
 private networks. If you closed that prompt, add a rule in an administrator PowerShell:
 
 ```powershell
-New-NetFirewallRule -DisplayName "Qwen3.8-27B" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+New-NetFirewallRule -DisplayName "Qwen3.8-27B" -Direction Inbound -Protocol TCP -LocalPort 46320 -Action Allow
 ```
 
 **Linux firewalls:** Docker publishes ports with its own iptables rules, ahead of `ufw` and `firewalld`'s usual rules, so
@@ -75,18 +75,18 @@ the port opens without a firewall rule and those tools' rules do not close it. T
   run `wsl --shutdown`, and allow the port in an administrator PowerShell:
 
   ```powershell
-  New-NetFirewallHyperVRule -Name "Qwen3.8-27B" -DisplayName "Qwen3.8-27B" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 8000
+  New-NetFirewallHyperVRule -Name "Qwen3.8-27B" -DisplayName "Qwen3.8-27B" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 46320
   ```
 
 - A port proxy, in an administrator PowerShell, plus the Windows Firewall rule above. The WSL address can change when WSL
   restarts; run it again then.
 
   ```powershell
-  netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=8000 connectaddress=(wsl hostname -I).Trim()
+  netsh interface portproxy add v4tov4 listenport=46320 listenaddress=0.0.0.0 connectport=46320 connectaddress=(wsl hostname -I).Trim()
   ```
 
-**On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:8000/v1` (Anthropic
-clients: `http://<address>:8000`) and the stats page at `http://<address>:8000/ui`. With another `PORT`, change the port
+**On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:46320/v1` (Anthropic
+clients: `http://<address>:46320`) and the stats page at `http://<address>:46320/ui`. With another `PORT`, change the port
 everywhere above.
 
 ## Serving
@@ -94,7 +94,7 @@ everywhere above.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
-| `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
+| `PORT` | 46320 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 46320 |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
@@ -128,7 +128,7 @@ everywhere above.
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
-| `SERVE_TAG` | `latest` | Tag of the serving image `ghcr.io/mkyt/qwen3-27b-5090` (compose): `latest` (main), a version such as `1.0.0`, or `sha-<commit>`. `docker compose pull serve` fetches it; `--build` builds it from the checkout instead |
+| `SERVE_TAG` | — | Not a setting on this branch. The serve image is the local `local/qwen3-27b-5090-serve:tiered-kv-cache` (compose: `pull_policy: build`), built from this checkout by `scripts/serve.sh up --build`. Do not `docker compose pull`: the upstream image `ghcr.io/mkyt/qwen3-27b-5090` has no tiered cache |
 | `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use). Requests get 503 until it is started at `/ui` or with `POST /admin/engine`; with `ENGINE_IDLE_UNLOAD_S` above 0, the first generation request loads it instead |
 | `ENGINE_IDLE_UNLOAD_S` | 0 | Seconds without a request after which the engine stops and frees its VRAM; the next generation request loads it again and waits for it ([Unloading when idle](#unloading-when-idle)). 0: off, the engine stays ready |
 | `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
@@ -153,13 +153,13 @@ everywhere above.
   and the state (running, waiting, why requests wait, measured tok/s per number of running requests);
   `POST /admin/concurrency` changes `target_seqs` (1 to `MAX_SEQS`; lowering it does not stop running requests),
   `min_seq_tps`, `admit_kv` and `kv_reserve`. Changes survive an engine restart, not a service restart.
-  Example: `curl -s -X POST localhost:8000/admin/concurrency -d '{"target_seqs": 4}'`.
+  Example: `curl -s -X POST localhost:46320/admin/concurrency -d '{"target_seqs": 4}'`.
 - `/metrics` (Prometheus): among others `q27:target_seqs`, `q27:admission_blocked{reason=...}`,
   `q27:admission_waits_total{reason=...}`, `q27:cached_tokens_total`, `q27:reusable_tokens_total`.
 
 ## Stats page
 
-`http://localhost:8000/ui` shows the server live in the browser (no authentication, like the admin API):
+`http://localhost:46320/ui` shows the server live in the browser (no authentication, like the admin API):
 
 - GPU utilization, power against the limit, clocks and temperature (NVML), and the aggregate decode and prefill
   tokens per second, over the last 1 to 10 minutes.
@@ -180,7 +180,7 @@ The page also starts, stops and restarts the engine (a start takes about 3.3 s w
 reading them from a Windows drive under WSL2: see `Q27_LOAD_THREADS`). The engine process holds all the VRAM; the HTTP server
 holds none, so stopping the engine frees the GPU for other work while the service and the page stay up. Requests in
 flight fail with 503, and so do new ones until the engine is started again. The prefix cache is lost. The same from
-a script: `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'`
+a script: `curl -s -X POST localhost:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'`
 (`start`, `stop` or `restart`; `GET /admin/engine` returns the state: `stopped`, `loading`, `ready`, `restarting`
 after a crash, `stopping`). The JSON content type is required, so that another web page cannot send the action as a
 form.
@@ -204,7 +204,7 @@ a request and does not keep the engine loaded.
 - The stats page tells these states apart (`engine unloaded`: the first request loads it; `engine stopped`: requests get
   503 until a start), shows the time left before an unload and why a load was refused, and changes the time under
   **Unload when idle** in the start settings. From a script:
-  `curl -s -X POST localhost:8000/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
+  `curl -s -X POST localhost:46320/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
   (0: off). It applies at once, the time running from then, and lasts until the service restarts.
 
 ### Too little VRAM
@@ -272,7 +272,7 @@ The same from a script:
   fit (HTTP 400 otherwise; 409 for `start` while the engine runs). With `"action": "save"` (the page's **Save for the
   next load**) they only stay for the next load, while the engine is stopped or unloaded (409 otherwise): it does not
   load, and whether they fit is decided when it does. Example:
-  `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
+  `curl -s -X POST localhost:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
 
 ## Prefix cache
 
