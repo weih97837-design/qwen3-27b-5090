@@ -4,7 +4,7 @@ the Windows package runs it before the server (no huggingface_hub, uv or symlink
     python scripts/download_weights.py [--weights gdnfp4|nvidia|quasar|ORG/NAME[@REVISION]] [--no-draft] [--jobs 4]
                                        [--also nvidia|quasar|bf16|ORG/NAME[@REVISION]]...
 
---weights defaults to $WEIGHTS, else gdnfp4; the DFlash2 draft comes too unless --no-draft or SPEC=none. --also adds
+--weights defaults to $WEIGHTS, else nvidia; the DFlash2 draft comes too unless --no-draft or SPEC=none. --also adds
 more checkpoints (bf16: the BF16 original; scripts/download-weights.sh uses it for --dev, --bf16, --quasar). A profile's
 revision is pinned (reference/qwen27b/paths.py); a repository's branch or tag (default main) is resolved to its
 commit, recorded under refs/ as huggingface_hub does. Before downloading a repository, its safetensors headers (a few
@@ -230,7 +230,7 @@ def fix_links():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default=os.environ.get("WEIGHTS") or "gdnfp4",
+    ap.add_argument("--weights", default=os.environ.get("WEIGHTS") or "nvidia",
                     help="a profile (gdnfp4, nvidia, quasar) or a Hugging Face repository ORG/NAME[@REVISION]")
     ap.add_argument("--no-draft", action="store_true", default=os.environ.get("SPEC") == "none",
                     help="without the DFlash2 draft (speculative decoding off: SPEC=none)")
