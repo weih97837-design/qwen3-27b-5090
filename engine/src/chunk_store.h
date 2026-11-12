@@ -275,7 +275,7 @@ void chunk_free(Store& st, typename Store::C* c, std::vector<Retired>& retired, 
   put_event(out.done);  // (complete: not inflight)
 }
 
-// The entry's linear slice-major stream (the .q27kv payload: page i of slice sl at (sl * n + i) * page_bytes, n =
+// The entry's linear slice-major stream (the old linear file payload; now the layout of a private entry's kv: page i of slice sl at (sl * n + i) * page_bytes, n =
 // chunks * chunk_pages + tail_pages) from its chunks (each [slice][chunk_pages] inside) and tail ([slice][tail_pages]
 // inside): fn(const char*, bytes) in file order. With no chunks this is the tail's stream unchanged.
 template <class C, class F>

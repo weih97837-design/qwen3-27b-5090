@@ -12,7 +12,9 @@
 2. **RAM**：引擎把被逐出的 checkpoint 存進主機 RAM（`SPILL_RAM_GIB`，預設 64 GiB），而不是丟棄。
 3. **SSD**：`frontend/tiercache.py` 在閒置時，把存在 RAM 超過 `SPILL_RAM_RETENTION_S`（預設 3600 秒）的項目寫到
    `SPILL_DIR`（預設 `/cache/kv`，即 Docker 具名磁碟區 `kvcache`）。忙碌時則在超過兩倍保留時間後寫出。
-   同一個程式也會執行 SSD 容量上限（`SPILL_SSD_GIB`，最舊的檔案先刪）。此上限一律執行，即使磁碟已被其他檔案佔滿。
+   檔案分成「manifest ＋ 共用的 chunk 檔」（見下方「SSD 層去重」），共用同一段前綴的 entry 只存一份 chunk。
+   同一個程式也會執行 SSD 容量上限（`SPILL_SSD_GIB`，以**實體**位元組計，每個 chunk 檔只算一次；從寫入最久的 entry 開始刪，
+   優先刪除真的能釋放空間的 entry）。此上限一律執行，即使磁碟已被其他檔案佔滿。
    可用空間保留（`SPILL_SSD_MIN_FREE_GIB`）只在能靠刪除本層自己的檔案達成時才會追求。
    超過 `SPILL_TTL_DAYS` 天的檔案會被刪除，TTL 自寫入 SSD 起算（重用後會重新計時）。每 `SPILL_TICK_S` 秒執行一次。
 4. **刪除**：超過 TTL 或超過容量上限的檔案被刪除。
@@ -59,7 +61,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `KV_POOL_TOKENS` | `524288`（512K） | GPU 上的 KV 池大小（tokens）。`0` 表示使用 VRAM 預算剩下的全部空間 |
 | `MAX_SEQS` | `4` | 同時執行的請求數上限 |
 | `SPILL_RAM_GIB` | `64` | 主機 RAM 中保存被逐出 checkpoint 的容量（GiB）。`0` 表示關閉分層 |
-| `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache` |
+| `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache`。底下有 `entries/`（manifest）與 `chunks/`（共用的 chunk 檔） |
 | `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後才寫入 SSD |
 | `SPILL_SSD_GIB` | `100` | SSD 層容量上限（GiB），最舊的檔案先刪除 |
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | 磁碟可用空間目標。只在能靠刪除本層自己的檔案達成時才追求，不會刪除其他檔案 |
@@ -88,8 +90,8 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 128 位元；命中時再比對儲存的 token id，碰撞只會變成 miss，不會用到錯的 KV），相同內容只存一份，各 entry 以**參照計數**指到它；
 不足一個 chunk 的尾端（含最後一個未滿的頁）與遞迴狀態仍是各 entry 自己的。chunk 一律依 token 數對齊（`pos / 4096`），所以含未滿頁的區塊不會被共用。
 
-- **只動 RAM 層**。SSD 檔案格式不變：寫出時把 chunk 與尾端還原成原本的線性（slice-major）串流；從檔案載入或匯入的 entry 是「私有」的
-  （不去重，行為和以前相同）。還原（promote）時逐塊複製回 KV 池頁，最後放掉參照。
+- **RAM 層與 SSD 層各自去重**。RAM 內以 chunk 共用；寫到 SSD 時同一批 chunk 寫成共用的 chunk 檔（見下一節）。從 SSD 還原的 entry
+  在 RAM 中是「私有」的（整段線性串流，不去重）：它的 KV 隨即複製進 KV 池。還原（promote）時逐塊複製回 KV 池頁，最後放掉參照。
 - **容量**。`SPILL_RAM_GIB` 管的是**實體**位元組（尾端＋狀態＋每個常駐 chunk 只算一次）；SSD 預算與檔案大小仍是各 entry 的**邏輯**大小
   （`spill_list` 的 `ram_bytes`、frontend 的 `ram_logical_bytes`）。超過上限時，先釋放沒人用的 chunk，再逐出「釋放最多記憶體」的 entry
   （釋放量相近時取最久未用者）；與別人共用 chunk 的 entry 釋放得少，所以被保留。
@@ -100,6 +102,45 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 測試：`engine/tests/test_chunk_store.cc`（主機端，ASan／UBSan）與 `scripts/tiered_cache_test.py` 的情境 `h`（共用 6 個 chunk 前綴的
   4 段對話：實體 < 0.6 × 邏輯、`chunk_hits > 0`、還原後 token 與無快取參考完全相同）、`i`（同上，加 pinned 與 async I/O）。
   設計與不變量見 `engine/src/spill.cc` 開頭的 (H)–(L) 與 `engine/src/chunk_store.h`。
+
+## SSD 層去重（chunk 檔 ＋ manifest）
+
+RAM 層去重的同一批 4096 token chunk，寫到 SSD 時也只存一份。`SPILL_DIR` 的結構：
+
+```
+$SPILL_DIR/
+  chunks/<32 位十六進位 key>-<16 位十六進位雜湊>.kvc    一個 chunk 的 KV，多個 entry 共用
+  entries/<id>.q27m                                  一個 entry 的 manifest
+```
+
+- **chunk 檔**（`Q27CHK1`）：標頭（指紋、chunk key、父 chunk 的檔名、頁數、每頁位元組數、slice 數、token 數）、chunk 的 token id、KV 位元組
+  （[slice][chunk 內頁]，與 RAM chunk 的排列相同）、結尾的 Hash64 校驗。檔名由內容推得，不用記憶體中的 uid（重啟後不穩定）：
+  key 是 RAM 層的鏈式 key（含模型／KV 型別指紋與到這個 chunk 為止的所有 token），後半是「父檔名 ＋ 本 chunk token id」的獨立雜湊。
+  相同前綴因此在不同 entry、不同行程、重啟前後都是同一個檔案。
+- **manifest**（`Q27MAN1`）：標頭、全部 token id、chunk 檔名清單、遞迴狀態、尾端 KV（不足一個 chunk 的部分）、Hash64 校驗。
+  `SPILL_DEDUP=0` 或不足 4096 token 的 entry 沒有 chunk，整段 KV 都在尾端（等於舊的整檔，只是換了格式）。
+- **寫出順序（崩潰安全）**：先寫缺少的 chunk 檔（`.tmp` → fsync → rename），再 fsync `chunks/`，**最後**才寫 manifest（同樣 `.tmp` → fsync → rename →
+  fsync `entries/`）。已存在的 chunk 檔會驗證（大小、標頭、token id、父檔名）才略過；對不上就不共用，該次寫出失敗（entry 被丟棄）。
+  Windows 以 `_commit` 取代 fsync，沒有目錄 fsync（只能靠檔案本身的 flush）。
+- **參照計數**：引擎維護磁碟上的 chunk 索引，一個 chunk 檔的計數＝列出它的 manifest 數。只有引擎刪檔：刪除／TTL／容量逐出／還原完成時，先刪 manifest，
+  再讓其 chunk 檔計數減一，歸零才刪檔。還原中（busy）的 entry 仍持有參照，所以正在被讀的檔不會被刪。
+- **啟動**：frontend 對 `entries/*.q27m` 逐一 `spill_import`（索引由 manifest 建立；chunk 檔不存在或大小不對的 manifest 被丟棄），
+  全部匯入後呼叫 `spill_sweep` 刪除 `.tmp` 與沒有任何 manifest 參照的 chunk 檔（崩潰留下的）。引擎不會自己清掃（它不知道匯入何時結束）。
+  frontend 不會列舉或刪除 `chunks/`，只管 `entries/`。
+- **舊檔案**：舊版的 `SPILL_DIR/*.q27kv`（整檔格式）不再被讀取，第一次以新引擎啟動時會全部刪除，並記錄一行 log（它只是快取）。
+  舊引擎（沒有 `q27_spill_disk_usage`）仍用舊的平面檔案配置，檔案不會被當成舊檔刪除。
+- **還原**：讀 manifest 與它列出的所有 chunk 檔到一個私有緩衝區（`DiskRead`，每次還原一條執行緒，只碰自己的緩衝區）；每個檔案驗證標頭、
+  token id、大小與 Hash64。缺少或損毀的 chunk 檔會讓這次還原乾淨地失敗：entry（及其 manifest）被丟棄，該 chunk 檔從索引移除並刪除，
+  之後的寫出會重新寫它。尚未在 RAM 中的 chunk 不會先登記進 RAM 層（避免讀到一半的資料被別的 spill 找到）；也沒有重用 RAM 中已常駐的 chunk 來省略讀取。
+- **容量與統計**。`SPILL_SSD_GIB`、`SPILL_SSD_MIN_FREE_GIB` 與 `make_room` 以實體位元組計（`q27_spill_disk_usage`：每個 chunk 檔一次 ＋ manifest）。
+  要放入一個 entry 時，需要的空間是它「現在會寫出的位元組」（`spill_list_ex` 的 `new_disk_bytes`：manifest ＋ 還不在 SSD 的 chunk）；
+  逐出 entry 釋放的是 `unique_disk_bytes`（它的 manifest ＋ 只有它參照的 chunk 檔）。每次逐出後重新讀清單，因為兄弟 entry 的 unique 與新 entry 的
+  `new_disk_bytes` 都會變。大部分內容與別人共用的 entry 排在後面（釋放得少）；挑選逐出對象的邏輯集中在 `TierPolicy._pick_victim`。
+  TTL 仍從 manifest 的寫入時間起算。`status()` 多了 `ssd_logical_bytes`、`ssd_physical_bytes`、`ssd_dedup_ratio`，`/stats` 的 tiers 區塊、/ui 的 SSD 層
+  （邏輯大小與去重倍率）與 Prometheus（`q27:tier_ssd_logical_bytes`、`q27:tier_ssd_physical_bytes`）同步更新；`ssd_bytes` 現在是實體用量。
+- 測試：`engine/tests/test_spill_files.cc`（格式往返、損毀／截斷偵測、崩潰殘留、參照計數，ASan／UBSan／TSan）、`engine/tests/test_spill_read.cc`
+  （多檔案 `DiskRead`、共用 chunk 檔的並行讀取，TSan）、`frontend/tests/test_tiercache.py`（共用 chunk 的 make_room、unique 位元組、TTL、舊檔處理、舊引擎回退、狀態欄位）、
+  `scripts/tiered_cache_test.py` 的情境 `j`（見下表）。不變量 (M)–(Q) 在 `engine/src/spill.cc` 開頭，檔案格式在 `engine/src/spill_files.h`。
 
 ## 加速選項（v0.3.2 起預設開啟）
 
@@ -200,7 +241,7 @@ worker 記錄每個請求存下的 checkpoint 位置，並以 `Scheduler.agent_o
 ## 限制
 
 - 每段對話只保留最深的一個 checkpoint。
-- RAM 層去重只共用 4096 token 對齊的整塊 chunk；尾端、遞迴狀態不共用，SSD 檔案仍存完整線性串流（不去重）。
+- RAM 層與 SSD 層去重都只共用 4096 token 對齊的整塊 chunk；尾端、遞迴狀態不共用。從 SSD 還原的 entry 在 RAM 中不去重。
 - 從 RAM 或 SSD 還原 4.5 GiB 的 KV 約需 0.5–3 秒，仍遠快於重算 256K tokens。
 - 快取檔案與模型和 KV 型別綁定。若兩者改變，檔案會被丟棄。
 - 尚未在實機上測試。
@@ -245,7 +286,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
 ```
 
-`tiered_cache_test.py` 有七個情境（a–g），各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
+`tiered_cache_test.py` 有十個情境（a–j），各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
 
 | 情境 | 強制走的路徑 | 檢查的計數器 |
 | --- | --- | --- |
@@ -256,6 +297,10 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | e 推測解碼 | 同 a，使用草稿模型（環形 checkpoint）；沒有草稿模型時跳過 | 同 a |
 | f pinned＋async I/O | 同 a、b，`SPILL_PINNED_GIB=2`、`SPILL_ASYNC_IO=1`（entry 分成多個 pinned 區段） | `pin_hits` 增加 |
 | g 背景載入 | 同 a、b，再加 `SPILL_ASYNC_PROMOTE=1`，直接呼叫引擎 API：`spill_match` → `spill_restore_begin`（RAM 回 1、檔案回 2）→ 載入中的 checkpoint 對 `prefix_begin` 不可見 → `spill_restore_poll` 直到回報該 id | `restored_async` 增加、`restore_failed` 不變；續談從上一回合結束處開始 |
+
+| h RAM 去重 | 4 段共用 6 個 chunk（24576 token）前綴的對話，全部溢出到 RAM | 實體 < 0.6 × 邏輯、`chunk_hits > 0`；還原後 token 與參考相同 |
+| i RAM 去重＋pinned＋async | 同 h，加 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`，全部經 `spill_match` / `spill_restore_*` 還原 | 同 h |
+| j SSD 去重 | 4 段共用前綴的對話全部 `spill_export` 到 `SPILL_DIR`（兩個行程）：第一個行程寫出，第二個行程（新的 Engine、同一個目錄）`spill_import`、`spill_sweep`，丟棄一筆後從檔案還原其他筆（兩筆走 `prefix_begin` 的同步 promote，一筆走 `spill_restore_begin`） | `spill_disk_usage` 實體 < 0.6 × 邏輯、`.kvc` 檔數少於 chunk 參照數；重啟後仍然成立；丟棄釋放的位元組恰為 `unique_disk_bytes` 且共用的 `.kvc` 仍在；還原的 token 與參考相同；最後一筆還原後沒有殘留檔案 |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
 
