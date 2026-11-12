@@ -7,9 +7,12 @@
 //
 // Two optional speed-ups, both off by default (Options::spill_pinned_gib, Options::spill_async_io):
 //
-// SPILL_PINNED_GIB: an entry's KV bytes live in one contiguous region of a pinned slab (PinnedPool) when one has room,
-// else in pageable memory as before. Slabs are pinned only while idle (spill_grow_pinned). Pinned memory roughly doubles
-// the PCIe speed of the copies; it changes nothing else (same host layout, same file format).
+// SPILL_PINNED_GIB: an entry's KV bytes live in pinned memory (PinnedPool) when the pool can hold ALL of them, else
+// in one pageable buffer as before. In a pool an entry is a list of segments (HostKv, host_kv.h), each inside one slab
+// and a multiple of the page size long (so no page straddles two segments): entries larger than a slab are pinned
+// too. An entry is fully pinned or fully pageable, never a mix. Slabs are pinned only while idle (spill_grow_pinned).
+// Pinned memory roughly doubles the PCIe speed of the copies; the linear byte stream (and so the file format) is the
+// same. The pool is part of the RAM tier's budget: entries in pinned segments count in spill_ram_ like any other.
 //
 // SPILL_ASYNC_IO: the KV copies run on io_s_ instead of s_ and the CPU does not wait for them. Invariants:
 //  (1) io_s_ READS or WRITES pool pages only after io_begin(): an event recorded on s_ after all work queued so far
@@ -165,27 +168,21 @@ uint64_t Model::spill_fingerprint() const {
   return h;
 }
 
-void Model::copy_pages(const std::vector<int32_t>& pages, char* host, bool to_host) {
+void Model::copy_pages(const std::vector<int32_t>& pages, const HostKv& host, bool to_host) {
   copy_pages_on(pages, host, to_host, s_);
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
-void Model::copy_pages_on(const std::vector<int32_t>& pages, char* host, bool to_host, cudaStream_t st) {
-  const size_t n = pages.size();
-  for (int sl = 0; sl < kKvSlices; sl++)
-    for (size_t i = 0; i < n;) {
-      // Pages p, p + 1 of one block are adjacent in each slice (page_ref), so a run of them is one copy.
-      size_t j = i;
-      while (j + 1 < n && pages[j + 1] == pages[j] + 1 && pages[j + 1] / kv_block_ == pages[i] / kv_block_) j++;
-      char* dev = kv_page(pages[i], sl);
-      char* h = host + (size_t(sl) * n + i) * kv_page_bytes_;
-      const size_t bytes = (j - i + 1) * kv_page_bytes_;
-      if (to_host)
-        Q27_CUDA(cudaMemcpyAsync(h, dev, bytes, cudaMemcpyDeviceToHost, st));
-      else
-        Q27_CUDA(cudaMemcpyAsync(dev, h, bytes, cudaMemcpyHostToDevice, st));
-      i = j + 1;
-    }
+void Model::copy_pages_on(const std::vector<int32_t>& pages, const HostKv& host, bool to_host, cudaStream_t st) {
+  Q27_CHECK(host.total == pages.size() * size_t(kKvSlices) * kv_page_bytes_, "tiered cache: the entry's size does not match its pages");
+  copy_runs(pages, kKvSlices, kv_page_bytes_, kv_block_,
+            [&](int p, int sl) { return kv_page(p, sl); }, host,
+            [&](char* h, char* dev, size_t bytes) {
+              if (to_host)
+                Q27_CUDA(cudaMemcpyAsync(h, dev, bytes, cudaMemcpyDeviceToHost, st));
+              else
+                Q27_CUDA(cudaMemcpyAsync(dev, h, bytes, cudaMemcpyHostToDevice, st));
+            });
 }
 
 void Model::io_begin() {
@@ -225,15 +222,17 @@ void Model::spill_reap() {
   retired_.clear();
 }
 
-KvBuf Model::spill_alloc_kv(size_t bytes) {
-  if (opt_.spill_pinned_gib > 0) {
-    if (char* p = pin_pool_.alloc(bytes)) {
+HostKv Model::spill_alloc_kv(size_t bytes) {
+  HostKv kv;
+  if (opt_.spill_pinned_gib > 0 && bytes > 0) {
+    if (alloc_pinned_kv(pin_pool_, bytes, kv_page_bytes_, kv)) {
       sstats_.pin_hits++;
-      return KvBuf(p, KvDel{&pin_pool_, bytes});
+      return kv;
     }
-    sstats_.pin_misses++;  // (the pool is not grown yet, full, or fragmented, or the entry is larger than a slab)
+    sstats_.pin_misses++;  // (the pool is not grown yet, or too full / fragmented for the whole entry)
   }
-  return KvBuf(new char[bytes], KvDel{});  // (may throw bad_alloc)
+  kv.push(KvBuf(new char[bytes], KvDel{}), bytes);  // (may throw bad_alloc)
+  return kv;
 }
 
 int Model::spill_grow_pinned(int chunks) {
@@ -256,6 +255,7 @@ int Model::spill_grow_pinned(int chunks) {
     pin_pool_.add_slab(static_cast<char*>(p), bytes);
     added++;
   }
+  if (added > 0) spill_enforce_ram();  // (the new slab counts toward the RAM tier at once)
   return added;
 }
 
@@ -307,30 +307,51 @@ uint64_t Model::spill_copy(const Checkpoint& c, bool live) {
     sstats_.failed++;
     return 0;
   }
+  uint64_t id = 0;
   if (!spill_async()) {
-    copy_pages(c.pages, s.kv.get(), true);
+    copy_pages(c.pages, s.kv, true);
     Q27_CUDA(cudaStreamSynchronize(cs_));  // (the state's copy into its host slot may still be on its way)
     std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
+    id = spill_add(c, std::move(s), live);
   } else {
-    io_begin();  // (1)
-    copy_pages_on(c.pages, s.kv.get(), true, io_s_);
-    s.done = spill_event();
-    Q27_CUDA(cudaEventRecord(s.done, io_s_));
-    s.inflight = true;
-    // (2) An eviction frees these pages right after this returns: nothing queued on s_ from now on may run before the
-    // copy has read them. (A live backup keeps its pages, but is waited for below instead.)
-    if (!live) Q27_CUDA(cudaStreamWaitEvent(s_, s.done));
-    Q27_CUDA(cudaStreamSynchronize(cs_));  // (4) the state, meanwhile, as before
-    std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
-    if (live) spill_wait(s);  // (3) an idle backup completes before it is visible to evict_checkpoint / reserve_area
+    // From the first queued copy to the emplace, a throw must not free kv while the copy may still write it (s's
+    // destructor would release it into the pool or delete[] it): wait for io_s_ first, and give the event back.
+    try {
+      io_begin();  // (1)
+      copy_pages_on(c.pages, s.kv, true, io_s_);
+      s.done = spill_event();
+      Q27_CUDA(cudaEventRecord(s.done, io_s_));
+      s.inflight = true;
+      // (2) An eviction frees these pages right after this returns: nothing queued on s_ from now on may run before the
+      // copy has read them. (A live backup keeps its pages, but is waited for below instead.)
+      if (!live) Q27_CUDA(cudaStreamWaitEvent(s_, s.done));
+      Q27_CUDA(cudaStreamSynchronize(cs_));  // (4) the state, meanwhile, as before
+      std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
+      if (live) spill_wait(s);  // (3) an idle backup completes before it is visible to evict_checkpoint / reserve_area
+      id = spill_add(c, std::move(s), live);
+    } catch (...) {
+      cudaStreamSynchronize(io_s_);  // (the copy has finished reading / writing now; errors are not reported here)
+      cudaGetLastError();
+      spill_event_put(s.done);  // (null if it was never created; complete after the synchronize)
+      s.done = nullptr, s.inflight = false;
+      throw;  // (s, and with it kv, is destroyed during the unwinding)
+    }
   }
+  return id;
+}
+
+// Adds the finished copy as an entry. The only throwing step (the map node) comes first, so a failure leaves
+// spill_ram_ and the counters untouched.
+uint64_t Model::spill_add(const Checkpoint& c, Spilled&& s, bool live) {
   s.ids = c.ids;
   s.ring = c.ring;
   s.last_use = c.last_use;
   s.live = live;
-  spill_ram_ += s.ram_bytes();
-  const uint64_t id = spill_next_++;
+  const size_t ram = s.ram_bytes();
+  const uint64_t id = spill_next_;
   spill_.emplace(id, std::move(s));
+  spill_next_++;
+  spill_ram_ += ram;
   return id;
 }
 
@@ -347,8 +368,13 @@ int Model::spill_backup_one() {
   // A backup never makes spill_enforce_ram evict anything: the copy must fit under the RAM cap as it is. (Otherwise
   // the enforce would drop another backup, which the next call picks again: an endless loop.)
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
-  const size_t bytes = pick->pages.size() * size_t(kKvSlices) * kv_page_bytes_ + ckpt_bytes_;
-  if (spill_ram_ + bytes > cap) return 0;
+  const size_t kv_bytes = pick->pages.size() * size_t(kKvSlices) * kv_page_bytes_;
+  // A pinned copy is already counted (its bytes are the pool's, spill_host_use); only its state adds. A pageable copy
+  // adds its KV too. (Fragmentation may force a pageable copy: then this may briefly overshoot, and the next enforce
+  // corrects it. No loop: backup_one never calls enforce.)
+  const size_t pool_free = pin_pool_.total() - pin_pool_.used();
+  const size_t need = ckpt_bytes_ + (pool_free >= kv_bytes ? 0 : kv_bytes);
+  if (spill_host_use() + need > cap) return 0;
   // (c): as spill_checkpoint, the shallower non-busy entries that the copy covers go (live ones too: their
   // checkpoints are in the pool, so nothing is lost).
   for (auto it = spill_.begin(); it != spill_.end();) {
@@ -439,12 +465,12 @@ bool Model::spill_promote(uint64_t id) {
     return give_up(false);
   }
   if (!spill_async()) {
-    copy_pages(pages, s.kv.get(), false);
+    copy_pages(pages, s.kv, false);
   } else {
     // The pages may have been freed by a sequence whose kernels are still queued, or by an eviction whose D2H is
     // queued on io_s_ (ordered by the stream): io_begin covers the first, the single I/O stream the second.
     io_begin();  // (1)
-    copy_pages_on(pages, s.kv.get(), false, io_s_);
+    copy_pages_on(pages, s.kv, false, io_s_);
     if (!s.done) s.done = spill_event();
     Q27_CUDA(cudaEventRecord(s.done, io_s_));
     s.inflight = true;
@@ -471,7 +497,7 @@ bool Model::spill_promote(uint64_t id) {
 
 void Model::spill_enforce_ram() {
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
-  while (spill_ram_ > cap) {
+  while (spill_host_use() > cap) {
     // An idle backup goes first: its checkpoint is still in the pool, so dropping it loses nothing, and it is never
     // written to the SSD (it is not the only copy).
     auto victim = spill_.end();
@@ -485,11 +511,13 @@ void Model::spill_enforce_ram() {
       sstats_.dropped++;
       continue;
     }
-    // Only sole copies are left: written to the directory, or dropped without one.
-    for (auto it = spill_.begin(); it != spill_.end(); ++it)
-      if (it->second.in_ram() && !it->second.busy && !it->second.live &&
-          (victim == spill_.end() || it->second.last_use < victim->second.last_use))
-        victim = it;
+    // Only sole copies are left: written to the directory, or dropped without one. Pageable ones first: evicting a
+    // pinned entry frees only its state bytes from host use (its KV stays in the pool, counted whole).
+    for (int pass = 0; pass < 2 && victim == spill_.end(); pass++)
+      for (auto it = spill_.begin(); it != spill_.end(); ++it)
+        if (it->second.in_ram() && !it->second.busy && !it->second.live && it->second.kv.pinned() == (pass == 1) &&
+            (victim == spill_.end() || it->second.last_use < victim->second.last_use))
+          victim = it;
     if (victim == spill_.end()) return;
     if (!opt_.spill_dir.empty()) {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -527,7 +555,8 @@ void Model::spill_write(Spilled& s, const std::string& path) {
   {
     File f(tmp, "wb");
     ok = f.f && write_all(f.f, &h, sizeof h) && write_all(f.f, s.ids.data(), s.ids.size() * sizeof(int32_t)) &&
-         write_all(f.f, s.state.get(), s.state_bytes) && write_all(f.f, s.kv.get(), s.kv_bytes);
+         write_all(f.f, s.state.get(), s.state_bytes);
+    for (size_t i = 0; ok && i < s.kv.seg.size(); i++) ok = write_all(f.f, s.kv.seg[i].get(), s.kv.len[i]);  // (the linear stream)
     ok = f.f && f.close() && ok;
   }
   if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -553,13 +582,15 @@ bool Model::spill_load(Spilled& s) {
   try {
     spill_reap();
     s.state.reset(new char[h.state_bytes]);
-    s.kv = spill_alloc_kv(h.kv_bytes);  // (assignment, not reset(new ...): the deleter differs)
+    s.kv = spill_alloc_kv(h.kv_bytes);
   } catch (const std::bad_alloc&) {
     s.kv.reset(), s.state.reset();
     return false;
   }
   s.state_bytes = h.state_bytes, s.kv_bytes = h.kv_bytes;
-  if (!read_all(f.f, s.state.get(), s.state_bytes) || !read_all(f.f, s.kv.get(), s.kv_bytes)) {
+  bool ok = read_all(f.f, s.state.get(), s.state_bytes);
+  for (size_t i = 0; ok && i < s.kv.seg.size(); i++) ok = read_all(f.f, s.kv.seg[i].get(), s.kv.len[i]);
+  if (!ok) {
     s.kv.reset(), s.state.reset();
     return false;
   }
@@ -630,8 +661,10 @@ uint64_t Model::spill_import(const std::string& path) {
   return id;
 }
 
-void Model::spill_stats(int64_t* out) const {
-  int64_t ram = 0, disk = 0;
+void Model::spill_stats(int64_t* out, int n) const {
+  int64_t v[kSpillStats], ram = 0, disk = 0;
+  int64_t* const dst = out;
+  out = v;
   for (const auto& kv : spill_) {
     ram += kv.second.in_ram();
     disk += !kv.second.path.empty();
@@ -641,6 +674,7 @@ void Model::spill_stats(int64_t* out) const {
   out[8] = sstats_.subsumed, out[9] = sstats_.failed, out[10] = sstats_.backed_up;
   out[11] = int64_t(pin_pool_.total()), out[12] = int64_t(pin_pool_.used());
   out[13] = sstats_.pin_hits, out[14] = sstats_.pin_misses;
+  for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 
 }  // namespace q27

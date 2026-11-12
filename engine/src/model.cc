@@ -267,9 +267,22 @@ Model::Model(const Options& opt) : opt_(opt) {
       Q27_CUDA(cudaEventCreateWithFlags(&io_ev_, cudaEventDisableTiming));
       log("tiered cache: asynchronous KV copies on their own stream (SPILL_ASYNC_IO)");
     }
-    if (opt.spill_pinned_gib > 0 && opt.spill_ram_gib > 0)
-      log("tiered cache: up to %.1f GiB of pinned host memory for spill entries (pinned while idle, slabs of %d MiB)",
-          opt.spill_pinned_gib, opt.spill_pinned_slab_mib);
+    if (opt.spill_pinned_gib > 0 && opt.spill_ram_gib > 0) {
+      // The whole pinned pool counts toward the RAM tier (spill_host_use), and the state checkpoints (ckpt_bytes_)
+      // need room under the same cap too: pinned stays below SPILL_RAM_GIB minus one checkpoint (at least 0.25 GiB).
+      const double reserve_gib = std::max(double(ckpt_bytes_) / double(size_t(1) << 30), 0.25);
+      const double room_gib = opt.spill_ram_gib - reserve_gib;
+      const double clamped_gib = room_gib > 0 ? std::min(opt.spill_pinned_gib, room_gib) : 0;
+      if (clamped_gib < opt.spill_pinned_gib) {
+        log("tiered cache: SPILL_PINNED_GIB %.1f leaves no room under SPILL_RAM_GIB %.1f next to a %.2f GiB checkpoint "
+            "(the pinned pool counts toward it); using %.1f GiB",
+            opt.spill_pinned_gib, opt.spill_ram_gib, reserve_gib, clamped_gib);
+        opt_.spill_pinned_gib = clamped_gib;
+      }
+      if (opt_.spill_pinned_gib > 0)
+        log("tiered cache: up to %.1f GiB of pinned host memory for spill entries (pinned while idle, slabs of %d MiB)",
+            opt_.spill_pinned_gib, opt.spill_pinned_slab_mib);
+    }
     log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
   }
@@ -442,6 +455,10 @@ Model::~Model() {
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
   // Tiered cache: in-flight copies finish before their host buffers (spill_, retired_) and the pinned slabs go.
   if (io_s_) cudaStreamSynchronize(io_s_);
+  for (auto& kv : spill_)  // (the events of in-flight entries are complete now)
+    if (kv.second.done) cudaEventDestroy(kv.second.done);
+  for (Retired& r : retired_)
+    if (r.done) cudaEventDestroy(r.done);
   spill_.clear();
   retired_.clear();
   for (char* slab : pin_pool_.slab_bases()) cudaFreeHost(slab);

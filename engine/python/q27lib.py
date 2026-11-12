@@ -42,7 +42,7 @@ SIGNATURES = {
     "q27_spill_export": ([P, ctypes.c_uint64, ctypes.c_char_p], I),
     "q27_spill_drop": ([P, ctypes.c_uint64], I),
     "q27_spill_import": ([P, ctypes.c_char_p, P], I),
-    "q27_spill_stats": ([P, P], I),
+    "q27_spill_stats": ([P, P, I], I),
     "q27_spill_backup_one": ([P, P], I),
     "q27_spill_grow_pinned": ([P, I, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
@@ -456,7 +456,7 @@ class Engine:
 
     def spill_stats(self):
         out = (ctypes.c_int64 * 15)()
-        self._check(lib().q27_spill_stats(self.h, out), "q27_spill_stats")
+        self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses")
         return dict(zip(keys, out))

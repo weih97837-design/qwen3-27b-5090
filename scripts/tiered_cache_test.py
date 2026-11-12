@@ -16,6 +16,9 @@ checks the spill counters to show that the intended path was taken.
   d  Idle backup      spill_backup_one copies A's checkpoint to RAM while it stays in VRAM; B's eviction then copies
                       nothing (spilled unchanged); A's follow-up restores the backup.
   e  Speculative      as a, with the draft model (ring checkpoints). Skipped when no draft model is available.
+  f  Pinned + async   as a (then the SSD round trip of b), with SPILL_PINNED_GIB=2, SPILL_PINNED_SLAB_MIB=16 (every entry
+                      is several pinned segments) and SPILL_ASYNC_IO=1; the tokens must be identical and the entries
+                      must have been given pinned memory (pin_hits).
 
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens.
@@ -44,10 +47,14 @@ SCENARIOS = {
     "c": ("restart import", ["write", "read"]),
     "d": ("idle backup reuse", ["full"]),
     "e": ("speculative decoding (ring checkpoints)", ["full"]),
+    "f": ("pinned segments + async I/O", ["full"]),
 }
+# Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
+SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"}}
 SUFFIX = ".q27kv"  # the name frontend/tiercache.py indexes at start()
 FOLLOW = 300  # new tokens of each follow-up turn
-KEYS = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "backed_up")
+KEYS = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "backed_up", "pinned_bytes",
+        "pin_hits", "pin_misses")
 # Variables the tiered cache reads at engine creation: the driver sets them per run, never inherits them.
 CACHE_VARS = {"STATE_HOST_CACHE", "KV_POOL_TOKENS", "CHECKPOINT_INTERVAL", "MAX_SEQS", "VRAM_BACKUP_IDLE_S"}
 
@@ -259,7 +266,15 @@ def scen_d(R, spill_dir):
             f"restored +{delta(s2, s3, 'restored')}")
 
 
-SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a}
+def scen_f(R, spill_dir):
+    scen_a(R, spill_dir)
+    st = R.snap("pinned pool")
+    R.check("the entries were given pinned memory", st["pin_hits"] > 0 and st["pinned_bytes"] > 0,
+            f"pin_hits {st['pin_hits']}, pin_misses {st['pin_misses']}, pinned {st['pinned_bytes'] >> 20} MiB")
+    scen_b(R, spill_dir)  # (the same conversations again, now through the SSD tier: segments written / read in order)
+
+
+SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f}
 
 
 # ---- worker: one process, one mode (ref | tiered), one phase
@@ -267,6 +282,14 @@ SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a}
 def write_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f)
+
+
+def grow_pinned(eng, tiered):
+    """SPILL_PINNED_GIB > 0: pins the slabs now (the frontend does this one per idle pass), so the pinned path is used."""
+    if not tiered or float(os.environ.get("SPILL_PINNED_GIB", "0") or 0) <= 0 or not hasattr(eng, "spill_grow_pinned"):
+        return
+    while eng.spill_grow_pinned(1):
+        pass
 
 
 def worker(a):
@@ -283,6 +306,7 @@ def worker(a):
     eng = Engine(engine_target(a.weights), max_tokens=max_tokens, kv_dtype=a.kv_dtype, draft=draft)
     if a.spec and not eng.has_draft:
         return write_json(a.out, {"skip": "the engine has no draft model"})
+    grow_pinned(eng, a.mode == "tiered")
     docs = load_docs(a.prompt_len)
     R = Run(eng, a.mode == "tiered", a.spec, a.tokens, docs, a.prompt_len, a.phase, print)
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
@@ -310,6 +334,7 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
     else:
         env.update(STATE_HOST_CACHE="1", SPILL_RAM_GIB=str(a.ram_gib), SPILL_DIR=str(spill_dir),
                    VRAM_BACKUP_IDLE_S="0")
+        env.update(SCEN_ENV.get(scen, {}))
     cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), "--worker", "--scenario", scen, "--mode", mode,
            "--phase", phase, "--out", str(out), "--spill-dir", str(spill_dir or ""), "--tokens", str(a.tokens),
            "--prompt-len", str(a.prompt_len), "--kv-dtype", a.kv_dtype, "--weights", a.weights, "--ram-gib",
@@ -332,7 +357,7 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=3000, help="tokens per conversation")
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--pool-tokens", type=int, help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K)")
-    ap.add_argument("--scenarios", default="a,b,c,d,e", help="a,b,c,d,e")
+    ap.add_argument("--scenarios", default="a,b,c,d,e,f", help="a,b,c,d,e,f")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     # internal: one worker process
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -350,7 +375,7 @@ def main():
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
         if s not in SCENARIOS:
-            ap.error(f"unknown scenario {s} (a-e)")
+            ap.error(f"unknown scenario {s} (a-f)")
     work = pathlib.Path(a.keep_dir or tempfile.mkdtemp(prefix="tiered_cache_test_")).resolve()
     work.mkdir(parents=True, exist_ok=True)
     fails = 0

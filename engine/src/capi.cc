@@ -391,10 +391,11 @@ int q27_spill_import(void* m, const char* path, uint64_t* id) {
   return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
 }
 
-// out[15]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
+// Writes min(n, 15) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
+// entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
 // pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to pageable memory.
-int q27_spill_stats(void* m, int64_t* out) {
-  return guard([&] { static_cast<Model*>(m)->spill_stats(out); });
+int q27_spill_stats(void* m, int64_t* out, int n) {
+  return guard([&] { static_cast<Model*>(m)->spill_stats(out, n); });
 }
 
 // *added: slabs of pinned host memory added to the spill pool (0: full, or off). Idle only: pinning is slow.

@@ -18,6 +18,9 @@ time.perf_counter(). The environment is passed through unchanged, so a flag the 
 and the run still works. Compare variants in one command:
 
     python scripts/tiered_cache_bench.py --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
+    python scripts/tiered_cache_bench.py --compare "SPILL_PINNED_GIB=0 SPILL_ASYNC_IO=0" \\
+        "SPILL_PINNED_GIB=8 SPILL_ASYNC_IO=1" "SPILL_PINNED_GIB=8 SPILL_PINNED_SLAB_MIB=256 SPILL_ASYNC_IO=1"
+    (pinned entries are segmented: one entry may span several slabs; SPILL_ASYNC_IO only overlaps the CPU for pinned entries)
     docker compose --profile dev run --rm dev python scripts/tiered_cache_bench.py --spill-dir /cache/kv/bench
 
 Each size builds two engines and prefills 4 conversations of that size, so a run takes several minutes.
@@ -92,6 +95,13 @@ def set_env(size):
     os.environ["VRAM_BACKUP_IDLE_S"] = "0"
 
 
+def grow_pinned(eng):
+    """SPILL_PINNED_GIB > 0: pins the slabs now (the frontend does this while idle), so the entries get pinned memory."""
+    if float(os.environ.get("SPILL_PINNED_GIB", "0") or 0) > 0 and hasattr(eng, "spill_grow_pinned"):
+        while eng.spill_grow_pinned(1):
+            pass
+
+
 def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
     from q27lib import Engine
     from qwen27b.weights import engine_target
@@ -103,6 +113,7 @@ def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
     set_env(size)
     t0 = time.perf_counter()
     eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype)
+    grow_pinned(eng)
     info.append({"size": size, "engine_create_s": round(time.perf_counter() - t0, 2)})
     try:
         # the checkpoint of A (its prefill is not timed)
@@ -157,6 +168,7 @@ def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
 
     # the restart: a second engine imports the file and restores from it
     eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype)
+    grow_pinned(eng)
     try:
         ms, eid = timed(lambda: eng.spill_import(path))
         rows.append(row(size, "import_ssd", ms, fbytes, "" if eid else "import returned 0 (not this model / KV type)"))

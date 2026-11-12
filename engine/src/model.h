@@ -154,15 +154,16 @@ class Model {
   // checkpoint is still in the pool). spill_export writes an entry
   // that is in memory to `path` and frees the memory (it stays found by the lookup). spill_drop forgets an entry and
   // deletes its file. spill_import indexes a file another run wrote (0 when it is not a file of this model and KV
-  // type, or unreadable: the caller deletes it). spill_stats out[15]: entries, in memory, on disk, memory bytes,
+  // type, or unreadable: the caller deletes it). spill_stats writes min(n, kSpillStats) values to out: entries, in memory, on disk, memory bytes,
   // spilled, restored, written, dropped, subsumed (a deeper checkpoint of the same tokens was kept), failed, backed_up;
   // out[11..14] (appended): pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to
-  // pageable memory (both only counted when SPILL_PINNED_GIB > 0). spill_stats out[15] in all.
+  // pageable memory (both only counted when SPILL_PINNED_GIB > 0). kSpillStats = 15 values in all.
   std::string spill_list() const;
   void spill_export(uint64_t id, const std::string& path);
   void spill_drop(uint64_t id);
   uint64_t spill_import(const std::string& path);
-  void spill_stats(int64_t* out) const;
+  static constexpr int kSpillStats = 15;
+  void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
   // takes ~0.45 s per GiB on WSL2 and other CUDA calls wait meanwhile, so only the idle frontend calls this.
@@ -248,21 +249,25 @@ class Model {
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
   uint64_t spill_copy(const Checkpoint& c, bool live);  // the copy of c's pages and state as a new entry; 0: no memory
+  uint64_t spill_add(const Checkpoint& c, Spilled&& s, bool live);  // s (copied from c) becomes entry spill_next_; its id
   void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's
   bool spill_promote(uint64_t id);               // a spilled entry -> a checkpoint in the pool
   void spill_enforce_ram();                      // over spill_ram_gib: write out (or drop) the least recently used
+  // Host bytes the tiered cache holds: spill_ram_ counts the entries (a pinned entry's KV included), and adding the
+  // pool's free part makes it pageable + state + the whole pinned pool.
+  size_t spill_host_use() const { return spill_ram_ + (pin_pool_.total() - pin_pool_.used()); }
   void spill_write(Spilled& s, const std::string& path);
   bool spill_load(Spilled& s);                   // the file's pages and state into memory
   void spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file);
   // pages' K / V slices <-> host [kKvSlices][pages][kv_page_bytes_] (runs of adjacent pages in one copy)
-  void copy_pages(const std::vector<int32_t>& pages, char* host, bool to_host);  // on s_, then waits for the copy
-  void copy_pages_on(const std::vector<int32_t>& pages, char* host, bool to_host, cudaStream_t st);  // queues only
+  void copy_pages(const std::vector<int32_t>& pages, const HostKv& host, bool to_host);  // on s_, then waits for the copy
+  void copy_pages_on(const std::vector<int32_t>& pages, const HostKv& host, bool to_host, cudaStream_t st);  // queues only
   // SPILL_ASYNC_IO (io_s_ exists): see the invariants at the top of spill.cc.
   bool spill_async() const { return io_s_ != nullptr; }
   void io_begin();                       // io_s_ waits for everything queued on s_ so far (before it reads or writes pool pages)
   void spill_wait(Spilled& s);           // CPU: the entry's in-flight copy has completed (no-op unless inflight)
   void spill_reap();                     // frees the host memory of promoted entries whose host -> device copy is done
-  KvBuf spill_alloc_kv(size_t bytes);    // pinned pool region if it has room (and SPILL_PINNED_GIB > 0), else new char[]
+  HostKv spill_alloc_kv(size_t bytes);   // pinned segments if the pool holds ALL of it (SPILL_PINNED_GIB > 0), else one new char[]
   cudaEvent_t spill_event();             // a recycled / new event (no timing)
   void spill_event_put(cudaEvent_t ev);
   uint64_t spill_fingerprint() const;
@@ -375,7 +380,7 @@ class Model {
   bool pin_failed_ = false;          // cudaHostAlloc of a slab failed: no more attempts
   std::vector<cudaEvent_t> ev_free_;  // recycled events
   struct Retired {                    // a promoted entry's host memory, until its host -> device copy is done
-    KvBuf kv;
+    HostKv kv;
     cudaEvent_t done;
   };
   std::vector<Retired> retired_;
