@@ -229,6 +229,15 @@ def test_export_failure_drops_the_ram_entry(env):
     assert not any(env.dir.glob("*.q27kv"))
 
 
+def test_status_reports_logical_ram_bytes(env):
+    # (the engine's physical RAM use, which dedup lowers, is in stats.tiers_block; here the entries' logical sizes)
+    env.eng.add_ram(300)
+    env.eng.add_ram(500)
+    env.tier.tick(idle=False)
+    st = env.tier.status()
+    assert st["ram_bytes"] == 800 and st["ram_logical_bytes"] == 800 and st["ram_entries"] == 2
+
+
 def test_reused_entry_leaves_bookkeeping(env):
     rid = env.eng.add_ram(400)
     env.tier.tick(idle=False)

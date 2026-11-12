@@ -1294,6 +1294,9 @@ class Scheduler:
                         "q27:tier_restored_async": sp.get("restored_async", 0),
                         "q27:tier_restore_failed": sp.get("restore_failed", 0), "q27:tier_ssd_bytes": ts["ssd_bytes"],
                         "q27:tier_ssd_budget_bytes": ts["ssd_budget_bytes"]})
+            for key in ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes"):
+                if key in sp:  # (RAM dedup: an older engine does not report them)
+                    out[f"q27:tier_ram_{key}"] = sp[key]
         return out
 
 

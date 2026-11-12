@@ -80,6 +80,43 @@
 //  (G) Exception safety: the map nodes (restoring_, restore_results_ capacity, ckpts_ capacity) are reserved before a
 //      disk thread starts or any page / slot / event is taken, so no step after one can throw bad_alloc; a failed
 //      reservation is "no restore" (0), never a half-registered one.
+//
+// RAM DEDUP (Options::spill_dedup, default on; SPILL_DEDUP=0 turns it off; chunk_store.h). The RAM tier stores the full
+// kChunkPages-page (4096-token) blocks of an entry once, content-addressed, and entries reference them; only the
+// remainder (the "tail": < kChunkPages pages, with the partial last page) and the recurrent state are per entry. The SSD
+// file format is untouched: spill_write serializes chunks + tail back into the old linear slice-major stream, and an
+// entry loaded from a file or imported is "private" (no chunks, all its pages in kv). Invariants:
+//  (H) Chunk identity. A chunk covers whole, full pages only: nchunks = pos / 4096 by TOKENS (never pages / 64: a partial
+//      page's trailing rows are not defined). Its key chains the keys of all earlier chunks (a chunk's KV depends on the
+//      whole prefix), starting from the model / KV-type fingerprint; a hit is verified against the stored token ids and
+//      the chain continues from the STORAGE key, so a 128-bit collision costs a miss, never wrong KV. Images need no extra
+//      mixing: an image's tokens are ids >= kVocab, consecutive from a hash of the image's bytes and its grid
+//      (reference/qwen27b/image_tokens.py; Checkpoint::ids holds them raw), so a chunk that ends inside an image run
+//      still pins the image and its grid through the ids before it, and no two prompts agree on a partial run of them.
+//      That is the identity the pool's prefix cache already relies on. Like pool pages shared by checkpoints, a shared chunk is
+//      "the KV some entry computed for these exact ids".
+//  (I) Refcounts are explicit (Chunk::refs): one per entry that lists the chunk (and one for an entry under construction,
+//      taken in spill_copy before anything is copied; spill_copy gives them back if anything throws, and frees a chunk it
+//      created whose bytes were not completely written). A chunk reaching 0 refs is freed by spill_chunk_free
+//      only when nothing can still touch its memory: not inflight (CPU waits on its event first, (3)); or, when the caller
+//      issued a host -> device copy that reads it (spill_promote / spill_restore_issue: park), the memory moves to
+//      retired_ with the chunk's own event (async = true: s_ never waited for it) and is freed by spill_reap.
+//  (J) A chunk has its own `done` / `inflight` like an entry: recorded on io_s_ behind the D2H copy that fills it and
+//      re-recorded behind every H2D copy that reads it (the CPU waits for the latest, a superset). spill_wait(Spilled&)
+//      waits for the entry's chunks too, so every place that waited for an entry (3) still holds. s_ waits (2) for ONE
+//      event per entry (s.done, recorded after the last queued copy); when every chunk was resident and the tail is empty
+//      nothing is read from the pool and nothing is recorded or waited for. A resident chunk that is still being filled by
+//      another entry's D2H is only read later (promote / write), after spill_wait, or by the stream order on io_s_.
+//  (K) Accounting. spill_ram_ = the entries' OWN bytes (tails + states); spill_phys() = that + each resident chunk once =
+//      the physical bytes the RAM cap and spill_host_use() are about. The logical size (kv_bytes + state) is what
+//      spill_list reports and what the SSD budget needs; the stats report both. A chunk with 0 refs (an "orphan") stays
+//      resident only inside an OrphanScope (spill_checkpoint / spill_backup_one erase the shallower entries they replace
+//      and then copy the deeper one, which re-finds those chunks instead of copying them again); the scope trims the
+//      orphans when it ends, and spill_enforce_ram trims any it finds first. spill_enforce_ram re-reads spill_host_use()
+//      every iteration and picks the victim that frees the most host memory (spill_freed: an entry whose chunks others
+//      share frees little).
+//  (L) File format. spill_write puts back the linear stream: for each slice, the chunks' slice runs in order, then the
+//      tail's. The size is checked against kv_bytes. spill_load / DiskRead / import only ever see private entries.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -91,6 +128,7 @@
 #include <sstream>
 #include <system_error>
 #include <tuple>
+#include <utility>
 
 #include "model.h"
 
@@ -211,7 +249,13 @@ void Model::io_begin() {
   Q27_CUDA(cudaStreamWaitEvent(io_s_, io_ev_));
 }
 
-void Model::spill_wait(Spilled& s) {
+void Model::spill_wait(Spilled& s, bool with_chunks) {
+  if (with_chunks)
+    for (SpillChunk* c : s.chunks)  // (J) a shared chunk has its own copy in flight, maybe another entry's
+      if (c->inflight) {
+        Q27_CUDA(cudaEventSynchronize(c->done));
+        c->inflight = false;
+      }
   if (!s.inflight) return;
   Q27_CUDA(cudaEventSynchronize(s.done));
   s.inflight = false;
@@ -232,6 +276,104 @@ cudaEvent_t Model::spill_event() {
 // was queued before, which captured the earlier record.)
 void Model::spill_event_put(cudaEvent_t ev) {
   if (ev) ev_free_.push_back(ev);
+}
+
+// ---------------------------------------------------------------- RAM dedup: chunks (invariants (H)-(K) at the top)
+
+size_t Model::spill_chunk_count(size_t ntokens) const {
+  return opt_.spill_dedup ? ntokens / (size_t(kChunkPages) * kPageTokens) : 0;  // by TOKENS: a chunk holds only full pages (H)
+}
+
+namespace {
+std::vector<int32_t> chunk_pages_of(const std::vector<int32_t>& pages, size_t first, size_t n) {
+  return std::vector<int32_t>(pages.begin() + std::ptrdiff_t(first), pages.begin() + std::ptrdiff_t(first + n));
+}
+}  // namespace
+
+// Host bytes that spilling c would add to the RAM tier: its tail and the chunks that are not resident (a dry run).
+size_t Model::spill_new_bytes(const Checkpoint& c) {
+  const size_t nfull = spill_chunk_count(c.ids.size());
+  const size_t tail = (c.pages.size() - nfull * kChunkPages) * size_t(kKvSlices) * kv_page_bytes_;
+  if (nfull == 0) return tail;
+  const size_t chunk_bytes = size_t(kChunkPages) * kKvSlices * kv_page_bytes_;
+  return tail + chunk_missing_bytes(spill_chunks_, chunk_seed(spill_fingerprint(), kChunkPages), c.ids.data(), nfull,
+                                    size_t(kChunkPages) * kPageTokens, chunk_bytes);
+}
+
+// refs == 0: the chunk leaves the store and its memory is freed (I). park: a host -> device copy that reads it may
+// be queued on io_s_ (spill_promote / spill_restore_issue): the memory goes to retired_ with the chunk's own event (async:
+// s_ may not wait for it) instead of waiting for it here. Otherwise an in-flight copy is waited for (3).
+void Model::spill_chunk_free(SpillChunk* c, bool park) {
+  if (c->inflight && park) {
+    retired_.reserve(retired_.size() + 1);  // (the only throw: before the chunk leaves the store)
+    SpillChunk out = spill_chunks_.extract(c);
+    retired_.push_back({std::move(out.kv), out.done, true});
+    return;
+  }
+  if (c->inflight) {
+    Q27_CUDA(cudaEventSynchronize(c->done));
+    c->inflight = false;
+  }
+  SpillChunk out = spill_chunks_.extract(c);
+  spill_event_put(out.done);  // (complete: not inflight)
+  // out.kv goes back to the pool / delete[] here
+}
+
+void Model::spill_chunk_unref(SpillChunk* c, bool park) {
+  if (!spill_chunks_.unref(c)) return;
+  if (defer_orphans_ && !park) return;  // (K) an orphan until the OrphanScope ends
+  spill_chunk_free(c, park);
+}
+
+void Model::spill_trim_orphans() {
+  for (SpillChunk* c : spill_chunks_.orphans()) spill_chunk_free(c, false);
+}
+
+// The entry's memory goes: its chunk references and its own bytes. (The caller waited for the entry, (3), or parked
+// what a copy still reads.) The entry itself stays (it may have a file).
+void Model::spill_release_mem(Spilled& s, bool park) {
+  spill_ram_ -= s.own_bytes();
+  std::vector<SpillChunk*> cs = std::move(s.chunks);
+  s.chunks.clear();
+  s.kv.reset(), s.state.reset();
+  for (SpillChunk* c : cs) spill_chunk_unref(c, park);
+}
+
+bool Model::spill_parts_ok(const Spilled& s) const {
+  const size_t chunk_bytes = size_t(kChunkPages) * kKvSlices * kv_page_bytes_;
+  size_t sum = s.kv.total;
+  for (const SpillChunk* c : s.chunks) {
+    if (c->kv.total != chunk_bytes || c->refs <= 0) return false;
+    sum += c->kv.total;
+  }
+  return sum == s.kv_bytes;
+}
+
+size_t Model::spill_freed(const Spilled& s) const {
+  // What spill_host_use drops when the entry's memory goes: the state, and the pageable pieces nobody else lists. A
+  // pinned piece goes back to the pool, which stays counted whole.
+  size_t n = s.state_bytes + (s.kv.pinned() ? 0 : s.kv.total);
+  for (const SpillChunk* c : s.chunks)
+    if (c->refs == 1 && !c->kv.pinned()) n += c->kv.total;
+  return n;
+}
+
+// Queues the host -> device copies of the entry's chunks and tail into `pages` (all of the entry's pages) on st. record
+// (async I/O): each chunk's own event is recorded behind its copy, so the CPU (spill_wait) and a later parking know when
+// the chunk is no longer read (J).
+void Model::spill_h2d(Spilled& s, const std::vector<int32_t>& pages, cudaStream_t st, bool record) {
+  const size_t nc = s.chunks.size();
+  for (size_t ci = 0; ci < nc; ci++) {
+    SpillChunk* c = s.chunks[ci];
+    copy_pages_on(chunk_pages_of(pages, ci * kChunkPages, kChunkPages), c->kv, false, st);
+    if (record) {
+      if (!c->done) c->done = spill_event();
+      Q27_CUDA(cudaEventRecord(c->done, st));
+      c->inflight = true;
+    }
+  }
+  if (pages.size() > nc * kChunkPages)
+    copy_pages_on(chunk_pages_of(pages, nc * kChunkPages, pages.size() - nc * kChunkPages), s.kv, false, st);
 }
 
 void Model::spill_reap() {
@@ -332,6 +474,7 @@ void Model::spill_checkpoint(const Checkpoint& c) {
     sstats_.subsumed++;
     return;
   }
+  OrphanScope scope(this);  // (K) the chunks of the shallower entries erased below are found again by the copy of c
   for (auto it = spill_.begin(); it != spill_.end();) {
     auto next = std::next(it);
     const Spilled& e = it->second;
@@ -342,7 +485,9 @@ void Model::spill_checkpoint(const Checkpoint& c) {
     it = next;
   }
 
-  if (!spill_copy(c, false)) return;  // (dropped, as without the tiered cache)
+  const uint64_t copied = spill_copy(c, false);
+  scope.end();
+  if (!copied) return;  // (dropped, as without the tiered cache)
   sstats_.spilled++;
   spill_enforce_ram();
 }
@@ -350,60 +495,102 @@ void Model::spill_checkpoint(const Checkpoint& c) {
 uint64_t Model::spill_copy(const Checkpoint& c, bool live) {
   spill_reap();
   Spilled s;
-  s.kv_bytes = c.pages.size() * size_t(kKvSlices) * kv_page_bytes_;
+  const size_t npages = c.pages.size();
+  s.kv_bytes = npages * size_t(kKvSlices) * kv_page_bytes_;
   s.state_bytes = ckpt_bytes_;
+  const size_t nfull = spill_chunk_count(c.ids.size());
+  const size_t ctok = size_t(kChunkPages) * kPageTokens;
+  const size_t chunk_bytes = size_t(kChunkPages) * kKvSlices * kv_page_bytes_;
+  const size_t tail_pages = npages - nfull * kChunkPages;  // (nfull * ctok <= pos: every chunk page is full)
+  // (H) Phase A: the references and the memory, nothing queued on a stream yet. refd: every chunk this entry will list
+  // (a reference taken), fresh: the ones that were not resident (their bytes are copied below).
+  std::vector<SpillChunk*> refd;
+  std::vector<std::pair<size_t, SpillChunk*>> fresh;
+  // Drops what the entry in construction holds, after any copy that may write it has finished. A fresh chunk is freed
+  // whatever its refs (its bytes are not valid yet: it must never be found).
+  auto rollback = [&] {
+    for (SpillChunk* ch : refd) {
+      const bool is_fresh = std::any_of(fresh.begin(), fresh.end(), [&](const auto& f) { return f.second == ch; });
+      if (is_fresh) {
+        spill_chunks_.unref(ch);
+        spill_chunk_free(ch, false);
+      } else {
+        spill_chunk_unref(ch, false);
+      }
+    }
+    refd.clear(), fresh.clear();
+  };
   try {
-    s.kv = spill_alloc_kv(s.kv_bytes);
+    if (tail_pages) s.kv = spill_alloc_kv(tail_pages * size_t(kKvSlices) * kv_page_bytes_);
     s.state.reset(new char[s.state_bytes]);
+    if (nfull)
+      chunk_acquire(spill_chunks_, chunk_seed(spill_fingerprint(), kChunkPages), c.ids.data(), nfull, ctok, chunk_bytes,
+                    [&](size_t bytes) { return spill_alloc_kv(bytes); }, refd, fresh);
+    s.chunks = refd;  // (the entry lists them from here: spill_wait below covers them; refd keeps the rollback list)
   } catch (const std::bad_alloc&) {
+    rollback();
     sstats_.failed++;
     return 0;
   }
   uint64_t id = 0;
-  if (!spill_async()) {
-    copy_pages(c.pages, s.kv, true);
-    Q27_CUDA(cudaStreamSynchronize(cs_));  // (the state's copy into its host slot may still be on its way)
-    std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
-    id = spill_add(c, std::move(s), live);
-  } else {
-    // From the first queued copy to the emplace, a throw must not free kv while the copy may still write it (s's
-    // destructor would release it into the pool or delete[] it): wait for io_s_ first, and give the event back.
-    try {
+  try {
+    if (!spill_async()) {
+      for (auto& [ci, ch] : fresh) copy_pages_on(chunk_pages_of(c.pages, ci * kChunkPages, kChunkPages), ch->kv, true, s_);
+      if (tail_pages) copy_pages_on(chunk_pages_of(c.pages, nfull * kChunkPages, tail_pages), s.kv, true, s_);
+      Q27_CUDA(cudaStreamSynchronize(s_));
+      Q27_CUDA(cudaStreamSynchronize(cs_));  // (the state's copy into its host slot may still be on its way)
+      std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
+    } else {
       io_begin();  // (1)
-      copy_pages_on(c.pages, s.kv, true, io_s_);
-      s.done = spill_event();
-      Q27_CUDA(cudaEventRecord(s.done, io_s_));
-      s.inflight = true;
-      // (2) An eviction frees these pages right after this returns: nothing queued on s_ from now on may run before the
-      // copy has read them. (A live backup keeps its pages, but is waited for below instead.)
-      if (!live) Q27_CUDA(cudaStreamWaitEvent(s_, s.done));
+      for (auto& [ci, ch] : fresh) {
+        copy_pages_on(chunk_pages_of(c.pages, ci * kChunkPages, kChunkPages), ch->kv, true, io_s_);
+        ch->done = spill_event();
+        Q27_CUDA(cudaEventRecord(ch->done, io_s_));
+        ch->inflight = true;
+      }
+      if (tail_pages) copy_pages_on(chunk_pages_of(c.pages, nfull * kChunkPages, tail_pages), s.kv, true, io_s_);
+      if (!fresh.empty() || tail_pages) {  // (nothing queued when every chunk was resident and there is no tail)
+        s.done = spill_event();
+        Q27_CUDA(cudaEventRecord(s.done, io_s_));
+        s.inflight = true;
+        // (2) An eviction frees these pages right after this returns: nothing queued on s_ from now on may run before the
+        // copy has read them. (A live backup keeps its pages, but is waited for below instead.)
+        if (!live) Q27_CUDA(cudaStreamWaitEvent(s_, s.done));
+      }
       Q27_CUDA(cudaStreamSynchronize(cs_));  // (4) the state, meanwhile, as before
       std::memcpy(s.state.get(), slot_mem_[c.slot], ckpt_bytes_);
       if (live) spill_wait(s);  // (3) an idle backup completes before it is visible to evict_checkpoint / reserve_area
-      id = spill_add(c, std::move(s), live);
-    } catch (...) {
-      cudaStreamSynchronize(io_s_);  // (the copy has finished reading / writing now; errors are not reported here)
-      cudaGetLastError();
-      spill_event_put(s.done);  // (null if it was never created; complete after the synchronize)
-      s.done = nullptr, s.inflight = false;
-      throw;  // (s, and with it kv, is destroyed during the unwinding)
     }
+    const size_t nfresh = fresh.size(), nrefd = refd.size();
+    id = spill_add(c, std::move(s), live);
+    sstats_.chunk_hits += int64_t(nrefd - nfresh), sstats_.chunk_misses += int64_t(nfresh);
+  } catch (...) {
+    // From the first queued copy to the emplace, a throw must not free kv (or a fresh chunk) while the copy may still write
+    // it: wait for io_s_ first, and give the events back.
+    cudaStreamSynchronize(spill_async() ? io_s_ : s_);  // (the copy has finished reading / writing now; errors are not reported here)
+    cudaGetLastError();
+    spill_event_put(s.done);  // (null if it was never created; complete after the synchronize)
+    s.done = nullptr, s.inflight = false;
+    for (auto& f : fresh) f.second->inflight = false;  // (complete too; spill_chunk_free then recycles their events)
+    rollback();
+    throw;  // (s, and with it kv, is destroyed during the unwinding)
   }
   return id;
 }
 
-// Adds the finished copy as an entry. The only throwing step (the map node) comes first, so a failure leaves
-// spill_ram_ and the counters untouched.
+// Adds the finished copy as an entry; s.chunks already lists the chunks (references taken by spill_copy, which gives them
+// back if this throws). The only throwing step (the map node) comes first, so a failure leaves spill_ram_ and the
+// counters untouched.
 uint64_t Model::spill_add(const Checkpoint& c, Spilled&& s, bool live) {
   s.ids = c.ids;
   s.ring = c.ring;
   s.last_use = c.last_use;
   s.live = live;
-  const size_t ram = s.ram_bytes();
+  const size_t own = s.own_bytes();
   const uint64_t id = spill_next_;
   spill_.emplace(id, std::move(s));
   spill_next_++;
-  spill_ram_ += ram;
+  spill_ram_ += own;
   return id;
 }
 
@@ -453,7 +640,7 @@ int Model::spill_backup_one(int victims) {
   // A backup never makes spill_enforce_ram evict anything: the copy must fit under the RAM cap as it is. (Otherwise
   // the enforce would drop another backup, which the next call picks again: an endless loop.)
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
-  const size_t kv_bytes = pick->pages.size() * size_t(kKvSlices) * kv_page_bytes_;
+  const size_t kv_bytes = spill_new_bytes(*pick);  // (RAM dedup: its tail and the chunks not resident)
   // A pinned copy is already counted (its bytes are the pool's, spill_host_use); only its state adds. A pageable copy
   // adds its KV too. (Fragmentation may force a pageable copy: then this may briefly overshoot, and the next enforce
   // corrects it. No loop: backup_one never calls enforce.)
@@ -462,6 +649,7 @@ int Model::spill_backup_one(int victims) {
   if (spill_host_use() + need > cap) return 0;
   // (c): as spill_checkpoint, the shallower non-busy entries that the copy covers go (live ones too: their
   // checkpoints are in the pool, so nothing is lost).
+  OrphanScope scope(this);  // (K)
   for (auto it = spill_.begin(); it != spill_.end();) {
     auto next = std::next(it);
     const Spilled& e = it->second;
@@ -472,6 +660,7 @@ int Model::spill_backup_one(int victims) {
     it = next;
   }
   const uint64_t id = spill_copy(*pick, true);
+  scope.end();
   if (id == 0) return 0;
   pick->backup = id;
   sstats_.backed_up++;
@@ -557,14 +746,14 @@ bool Model::spill_promote(uint64_t id) {
       spill_erase(it, true);
       sstats_.failed++;
     } else if (from_disk) {  // (back to disk only)
-      spill_ram_ -= s.ram_bytes();
-      s.kv.reset(), s.state.reset();
+      spill_release_mem(s, false);
     }
     return false;
   };
   if (from_disk && !spill_load(s)) return give_up(true);
   const int npages = int(ceil_div(s.pos(), kPageTokens));
-  if (size_t(npages) * kKvSlices * kv_page_bytes_ != s.kv_bytes || s.state_bytes != ckpt_bytes_) return give_up(true);
+  if (size_t(npages) * kKvSlices * kv_page_bytes_ != s.kv_bytes || s.state_bytes != ckpt_bytes_ || !spill_parts_ok(s))
+    return give_up(true);
 
   // Feasibility first (spill_room): nothing is evicted when it cannot work.
   if (!spill_room(npages)) return give_up(false);
@@ -572,13 +761,22 @@ bool Model::spill_promote(uint64_t id) {
   int slot = -1;
   std::vector<int32_t> pages;
   if (!spill_acquire(npages, &slot, &pages)) return give_up(false);
+  try {  // (G) the parking below cannot throw: its capacity is reserved before a copy is queued (and after the acquire above:
+         // evicting checkpoints can run spill_reap, which replaces retired_)
+    retired_.reserve(retired_.size() + s.chunks.size() + 1);
+  } catch (const std::bad_alloc&) {
+    for (int32_t p : pages) pool_.unref(p);
+    slot_used_[slot] = false;
+    return give_up(false);
+  }
   if (!spill_async()) {
-    copy_pages(pages, s.kv, false);
+    spill_h2d(s, pages, s_, false);
+    Q27_CUDA(cudaStreamSynchronize(s_));
   } else {
     // The pages may have been freed by a sequence whose kernels are still queued, or by an eviction whose D2H is
     // queued on io_s_ (ordered by the stream): io_begin covers the first, the single I/O stream the second.
     io_begin();  // (1)
-    copy_pages_on(pages, s.kv, false, io_s_);
+    spill_h2d(s, pages, io_s_, true);
     if (!s.done) s.done = spill_event();
     Q27_CUDA(cudaEventRecord(s.done, io_s_));
     s.inflight = true;
@@ -594,10 +792,13 @@ bool Model::spill_promote(uint64_t id) {
   ck.last_use = ++use_clock_;
   ckpts_.push_back(std::move(ck));
   if (s.inflight) {  // (3) the H2D copy still reads kv: park it until the copy is done (state was copied above)
-    spill_ram_ -= s.ram_bytes();
+    spill_ram_ -= s.own_bytes();
     retired_.push_back({std::move(s.kv), s.done});
     s.done = nullptr, s.inflight = false;
+    s.state.reset();
   }
+  // (I) the chunks: the references go; one nobody else lists is parked with its own event while its copy may be reading it
+  for (SpillChunk* c : std::exchange(s.chunks, {})) spill_chunk_unref(c, true);
   spill_erase(it, true);  // (the pool's copy is the one now; it is spilled again when the pool gives it up)
   sstats_.restored++;
   return true;
@@ -631,7 +832,8 @@ int Model::spill_restore_begin(uint64_t id) {
   Spilled& s = it->second;
   spill_reap();
   const int npages = int(ceil_div(s.pos(), kPageTokens));
-  if (size_t(npages) * kKvSlices * kv_page_bytes_ != s.kv_bytes || s.state_bytes != ckpt_bytes_) {  // (damaged: as promote)
+  if (size_t(npages) * kKvSlices * kv_page_bytes_ != s.kv_bytes || s.state_bytes != ckpt_bytes_ ||
+      (s.in_ram() && !spill_parts_ok(s))) {  // (damaged: as promote)
     spill_erase(it, true);
     sstats_.failed++;
     sstats_.restore_failed++;
@@ -689,7 +891,7 @@ int Model::spill_restore_begin(uint64_t id) {
     return 0;
   }
   // From here nothing throws: the thread is owned by the registered restore (its destructor joins).
-  spill_ram_ += s.ram_bytes();
+  spill_ram_ += s.own_bytes();  // (a private entry: all its pages are in kv)
   s.busy = true;
   restoring_.at(id).disk = std::move(d);
   return 2;
@@ -711,16 +913,25 @@ int Model::spill_restore_issue(uint64_t id) {
   int slot = -1;
   std::vector<int32_t> pages;
   if (!spill_acquire(npages, &slot, &pages)) return 0;
+  try {  // (G) parking capacity, after the acquire (evicting checkpoints can run spill_reap, which replaces retired_)
+    retired_.reserve(retired_.size() + s.chunks.size() + 1);
+  } catch (const std::bad_alloc&) {
+    for (int32_t p : pages) pool_.unref(p);
+    slot_used_[slot] = false;
+    return 0;
+  }
   // A pageable entry is read by the driver while staging: an earlier D2H into it must have completed first. A pinned
   // one is ordered by io_s_ itself.
-  const bool overlap = spill_async() && s.kv.pinned();
+  bool overlap = spill_async() && (s.kv.pinned() || !s.kv.in_ram());
+  for (const SpillChunk* c : s.chunks) overlap = overlap && c->kv.pinned();  // (a mixed entry waits for its pageable pieces)
   if (!overlap) spill_wait(s);
   cudaEvent_t ev = nullptr;
   if (!spill_async()) {
-    copy_pages(pages, s.kv, false);
+    spill_h2d(s, pages, s_, false);
+    Q27_CUDA(cudaStreamSynchronize(s_));
   } else {
     io_begin();  // (1)
-    copy_pages_on(pages, s.kv, false, io_s_);
+    spill_h2d(s, pages, io_s_, true);
     if (!s.done) s.done = spill_event();
     Q27_CUDA(cudaEventRecord(s.done, io_s_));
     s.inflight = true;
@@ -744,10 +955,11 @@ int Model::spill_restore_issue(uint64_t id) {
     spill_restore_finish(id);
     return 2;
   }
-  spill_ram_ -= s.ram_bytes();  // (D) the copy still reads kv: parked until it is complete
+  spill_ram_ -= s.own_bytes();  // (D) the copy still reads kv: parked until it is complete
   retired_.push_back({std::move(s.kv), s.done, true});
   s.done = nullptr, s.inflight = false;
   s.state.reset();
+  for (SpillChunk* c : std::exchange(s.chunks, {})) spill_chunk_unref(c, true);  // (I) (reserved above: no throw)
   restoring_.at(id).issued = true;
   return 1;
 }
@@ -820,8 +1032,7 @@ int Model::spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap) {
     const int res = spill_restore_issue(id);
     if (res == 0) {  // (the pool filled up meanwhile: back to disk only, the next prefix_begin may still try)
       Spilled& s = it->second;
-      spill_ram_ -= s.ram_bytes();
-      s.kv.reset(), s.state.reset();
+      spill_release_mem(s, false);
       s.busy = false;
       restoring_.erase(id);
       sstats_.restore_failed++;
@@ -854,28 +1065,36 @@ int Model::spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap) {
 
 void Model::spill_enforce_ram() {
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
+  // (K) host use is re-read every iteration: an entry whose chunks others share frees little (or nothing).
   while (spill_host_use() > cap) {
-    // An idle backup goes first: its checkpoint is still in the pool, so dropping it loses nothing, and it is never
-    // written to the SSD (it is not the only copy).
+    // Chunks nobody lists are the cheapest memory to give back.
+    if (spill_chunks_.orphan_count() > 0) {
+      spill_trim_orphans();
+      continue;
+    }
+    // The victim: the entry that gives the most host memory back (spill_freed), the least recently used among those
+    // within a factor 2 of the best (pick_victim). An idle backup goes first: its checkpoint is still in the pool, so
+    // dropping it loses nothing, and it is never written to the SSD (it is not the only copy). Otherwise only sole copies
+    // are left: written to the directory, or dropped without one. Pinned pieces free only the state (their bytes stay in
+    // the pool, counted whole), so pageable ones weigh more.
     auto victim = spill_.end();
-    for (auto it = spill_.begin(); it != spill_.end(); ++it)
-      if (it->second.in_ram() && !it->second.busy && it->second.live &&
-          (victim == spill_.end() || it->second.last_use < victim->second.last_use))
-        victim = it;
+    for (int pass = 0; pass < 2 && victim == spill_.end(); pass++) {
+      std::vector<VictimCand> cand;
+      std::vector<std::map<uint64_t, Spilled>::iterator> its;
+      for (auto it = spill_.begin(); it != spill_.end(); ++it)
+        if (it->second.in_ram() && !it->second.busy && it->second.live == (pass == 0)) {
+          cand.push_back({it->second.last_use, spill_freed(it->second)});
+          its.push_back(it);
+        }
+      if (const int k = pick_victim(cand); k >= 0) victim = its[size_t(k)];
+    }
     // (A victim may be an entry whose D2H copy is still in flight: spill_erase / spill_write wait for it, (3).)
-    if (victim != spill_.end()) {
+    if (victim == spill_.end()) return;
+    if (victim->second.live) {
       spill_erase(victim, true);
       sstats_.dropped++;
       continue;
     }
-    // Only sole copies are left: written to the directory, or dropped without one. Pageable ones first: evicting a
-    // pinned entry frees only its state bytes from host use (its KV stays in the pool, counted whole).
-    for (int pass = 0; pass < 2 && victim == spill_.end(); pass++)
-      for (auto it = spill_.begin(); it != spill_.end(); ++it)
-        if (it->second.in_ram() && !it->second.busy && !it->second.live && it->second.kv.pinned() == (pass == 1) &&
-            (victim == spill_.end() || it->second.last_use < victim->second.last_use))
-          victim = it;
-    if (victim == spill_.end()) return;
     if (!opt_.spill_dir.empty()) {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count();
@@ -913,7 +1132,14 @@ void Model::spill_write(Spilled& s, const std::string& path) {
     File f(tmp, "wb");
     ok = f.f && write_all(f.f, &h, sizeof h) && write_all(f.f, s.ids.data(), s.ids.size() * sizeof(int32_t)) &&
          write_all(f.f, s.state.get(), s.state_bytes);
-    for (size_t i = 0; ok && i < s.kv.seg.size(); i++) ok = write_all(f.f, s.kv.seg[i].get(), s.kv.len[i]);  // (the linear stream)
+    // (the linear stream, as before: the chunks' and the tail's slices put back in slice-major order, (L))
+    size_t written = 0;
+    const size_t tail_pages = size_t(ceil_div(s.pos(), kPageTokens)) - s.chunks.size() * kChunkPages;
+    linear_pieces(s.chunks, s.kv, kKvSlices, kv_page_bytes_, kChunkPages, tail_pages, [&](const char* p, size_t n) {
+      if (ok) ok = write_all(f.f, p, n);
+      written += n;
+    });
+    ok = ok && written == s.kv_bytes;
     ok = f.f && f.close() && ok;
   }
   if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -922,8 +1148,7 @@ void Model::spill_write(Spilled& s, const std::string& path) {
   }
   if (!s.path.empty() && s.path != path) std::remove(s.path.c_str());
   s.path = path;
-  spill_ram_ -= s.ram_bytes();
-  s.kv.reset(), s.state.reset();
+  spill_release_mem(s, false);  // (its chunk references too: a chunk nobody else lists is freed)
   sstats_.written++;
 }
 
@@ -951,14 +1176,17 @@ bool Model::spill_load(Spilled& s) {
     s.kv.reset(), s.state.reset();
     return false;
   }
-  spill_ram_ += s.ram_bytes();
+  spill_ram_ += s.own_bytes();  // (a private entry: all its pages in kv)
   return true;
 }
 
 void Model::spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file) {
-  spill_wait(it->second);  // (3) the buffers are freed below: an in-flight D2H must have finished writing them
+  // (3) the entry's own buffers are freed below: an in-flight D2H must have finished writing them. Its chunks are waited for
+  // only if they go (spill_chunk_free): an erase does not stall behind another entry's copy into a chunk that stays.
+  spill_wait(it->second, false);
   spill_event_put(it->second.done);
-  spill_ram_ -= it->second.ram_bytes();
+  it->second.done = nullptr;
+  spill_release_mem(it->second, false);  // (the entry's memory and its chunk references)
   if (remove_file && !it->second.path.empty()) std::remove(it->second.path.c_str());
   spill_.erase(it);
 }
@@ -1019,20 +1247,24 @@ uint64_t Model::spill_import(const std::string& path) {
 }
 
 void Model::spill_stats(int64_t* out, int n) const {
-  int64_t v[kSpillStats], ram = 0, disk = 0;
+  int64_t v[kSpillStats], ram = 0, disk = 0, logical = 0;
   int64_t* const dst = out;
   out = v;
   for (const auto& kv : spill_) {
     ram += kv.second.in_ram();
     disk += !kv.second.path.empty();
+    logical += int64_t(kv.second.ram_bytes());
   }
-  out[0] = int64_t(spill_.size()), out[1] = ram, out[2] = disk, out[3] = int64_t(spill_ram_);
+  const int64_t phys = int64_t(spill_phys());
+  out[0] = int64_t(spill_.size()), out[1] = ram, out[2] = disk, out[3] = phys;
   out[4] = sstats_.spilled, out[5] = sstats_.restored, out[6] = sstats_.written, out[7] = sstats_.dropped;
   out[8] = sstats_.subsumed, out[9] = sstats_.failed, out[10] = sstats_.backed_up;
   out[11] = int64_t(pin_pool_.total()), out[12] = int64_t(pin_pool_.used());
   out[13] = sstats_.pin_hits, out[14] = sstats_.pin_misses;
   out[15] = int64_t(restoring_.size()), out[16] = sstats_.restored_async, out[17] = sstats_.restore_failed;
   out[18] = sstats_.restore_ns / 1000000, out[19] = sstats_.restore_bytes;
+  out[20] = logical, out[21] = phys, out[22] = int64_t(spill_chunks_.size());
+  out[23] = sstats_.chunk_hits, out[24] = sstats_.chunk_misses, out[25] = std::max<int64_t>(0, logical - phys);
   for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 

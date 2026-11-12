@@ -65,6 +65,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | 磁碟可用空間目標。只在能靠刪除本層自己的檔案達成時才追求，不會刪除其他檔案 |
 | `SPILL_SSD_MIN_TOKENS` | `8192` | 短於此 token 數的 checkpoint 不會寫入 SSD：超過 RAM 保留時間後直接從 RAM 丟棄。每個 checkpoint 都帶約 190 MiB 的遞迴狀態，與長度無關；短前綴重算只需約 0.2–0.4 秒，與讀回時間相近，寫入只會浪費 SSD 空間與寫入壽命。`0`：不設下限（舊行為）。已在磁碟上的檔案不受影響；`/metrics` 的 `ssd_skipped_short` 計算被丟棄的筆數 |
 | `SPILL_TTL_DAYS` | `7` | 自寫入 SSD 起算（重用後會重新計時），超過此天數的檔案會被刪除 |
+| `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
 | `VRAM_BACKUP_VICTIMS` | `8` | 閒置備份只複製「下一批會被逐出」的前 N 個 checkpoint（`0`：全部）。只能用環境變數設定 |
 | `VRAM_BACKUP_IDLE_S` | `60` | 引擎閒置多久後開始把 VRAM checkpoint 複製到 RAM（保留在 VRAM）。`0` 關閉，見上文 |
@@ -79,6 +80,26 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 32 GiB RAM 約可保存 6 個代理。
 - 100 GiB SSD 約可保存 21 個代理。
 - 512K 的 KV 池約佔 9 GiB VRAM。
+
+## RAM 層去重（預設開啟，`SPILL_DEDUP=0` 關閉）
+
+4–8 個共用同一段長 system prompt／工具定義的代理，或同一段對話的多個 checkpoint，它們的 KV 開頭完全相同。RAM 層因此把 entry 的 KV
+切成 **4096 token（64 頁）的 chunk**：整塊 chunk 依內容定址（key 串接：前一塊的 key 加上這一塊的 token id，起點含模型／KV 型別指紋，
+128 位元；命中時再比對儲存的 token id，碰撞只會變成 miss，不會用到錯的 KV），相同內容只存一份，各 entry 以**參照計數**指到它；
+不足一個 chunk 的尾端（含最後一個未滿的頁）與遞迴狀態仍是各 entry 自己的。chunk 一律依 token 數對齊（`pos / 4096`），所以含未滿頁的區塊不會被共用。
+
+- **只動 RAM 層**。SSD 檔案格式不變：寫出時把 chunk 與尾端還原成原本的線性（slice-major）串流；從檔案載入或匯入的 entry 是「私有」的
+  （不去重，行為和以前相同）。還原（promote）時逐塊複製回 KV 池頁，最後放掉參照。
+- **容量**。`SPILL_RAM_GIB` 管的是**實體**位元組（尾端＋狀態＋每個常駐 chunk 只算一次）；SSD 預算與檔案大小仍是各 entry 的**邏輯**大小
+  （`spill_list` 的 `ram_bytes`、frontend 的 `ram_logical_bytes`）。超過上限時，先釋放沒人用的 chunk，再逐出「釋放最多記憶體」的 entry
+  （釋放量相近時取最久未用者）；與別人共用 chunk 的 entry 釋放得少，所以被保留。
+- **統計**。`spill_stats` 在原有欄位後追加 `logical_bytes`、`physical_bytes`、`chunks`、`chunk_hits`、`chunk_misses`、`dedup_saved_bytes`
+  （舊引擎沒有這些鍵）。`/stats` 的 tiers 區塊有 `ram_logical_bytes`、`ram_physical_bytes`、`ram_dedup_ratio`（邏輯 ÷ 實體）、
+  `ram_dedup_saved_bytes`、`ram_chunks`、`chunk_hits`、`chunk_misses`，/ui 的 RAM 層顯示邏輯大小與去重倍率；`ram_bytes` 即實體用量。
+  Prometheus：`q27:tier_ram_logical_bytes` 等。
+- 測試：`engine/tests/test_chunk_store.cc`（主機端，ASan／UBSan）與 `scripts/tiered_cache_test.py` 的情境 `h`（共用 6 個 chunk 前綴的
+  4 段對話：實體 < 0.6 × 邏輯、`chunk_hits > 0`、還原後 token 與無快取參考完全相同）、`i`（同上，加 pinned 與 async I/O）。
+  設計與不變量見 `engine/src/spill.cc` 開頭的 (H)–(L) 與 `engine/src/chunk_store.h`。
 
 ## 加速選項（預設關閉）
 
@@ -167,6 +188,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 ## 限制
 
 - 每段對話只保留最深的一個 checkpoint。
+- RAM 層去重只共用 4096 token 對齊的整塊 chunk；尾端、遞迴狀態不共用，SSD 檔案仍存完整線性串流（不去重）。
 - 從 RAM 或 SSD 還原 4.5 GiB 的 KV 約需 0.5–3 秒，仍遠快於重算 256K tokens。
 - 快取檔案與模型和 KV 型別綁定。若兩者改變，檔案會被丟棄。
 - 尚未在實機上測試。
