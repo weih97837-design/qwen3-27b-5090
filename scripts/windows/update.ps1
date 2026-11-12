@@ -144,6 +144,15 @@ function Find-Release {
   }
 }
 
+# SHA-256 with .NET instead of Get-FileHash: Windows PowerShell started from PowerShell 7 inherits its PSModulePath and
+# then may not find Get-FileHash (Microsoft.PowerShell.Utility of the wrong edition).
+function Sha256-Of($path) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $fs = [System.IO.File]::OpenRead($path)
+  try { return ([System.BitConverter]::ToString($sha.ComputeHash($fs)) -replace "-", "").ToLower() }
+  finally { $fs.Dispose(); $sha.Dispose() }
+}
+
 function Expected-Hash($release, $zipName) {
   $sums = @($release.assets | Where-Object { $_.name -eq "$zipName.sha256" }) +
           @($release.assets | Where-Object { $_.name -ne "$zipName.sha256" -and $_.name -match "sha256" })
@@ -177,10 +186,10 @@ if (-not $Zip) {
   New-Item -ItemType Directory -Force $work | Out-Null
   $Zip = Join-Path $work $asset.name
   $want = Expected-Hash $release $asset.name
-  $have = if ($want -and (Test-Path $Zip)) { (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() } else { "" }
+  $have = if ($want -and (Test-Path $Zip)) { (Sha256-Of $Zip) } else { "" }
   if (-not $want -or $have -ne $want) {
     Download $asset.url $Zip -Resume
-    if ($want -and (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() -ne $want) {
+    if ($want -and (Sha256-Of $Zip) -ne $want) {
       Remove-Item $Zip
       throw "the download's SHA-256 does not match the release's; run update.cmd again"
     }
