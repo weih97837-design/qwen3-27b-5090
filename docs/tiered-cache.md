@@ -268,8 +268,11 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 
 **hits 的傳遞**：`prefix_begin` 選中的 checkpoint 命中數 +1，序列（`seq_hits_`，停放時存在 `SeqState`）把它帶給之後存下的更深 checkpoint（worker 每回合結尾都會存一個），
 所以持續被使用的對話最深處不會被當成「從未重用」；命中長度 ≤ 16384 token（`kKeepShort`，各對話共用的系統提示詞）時**不**傳遞，否則每個以熱門系統提示詞開頭的新對話都會繼承它的次數。
+注意：超過 16384 token 的繼承使延續中的對話在「重用／從未重用」統計（`*_reused_*`／`*_never_*`）中也算「重用過」，即使該 entry 本身從未被還原；`hits` 用於排序，統計上的「還原」請看引擎的 `restored` 計數器（不另存每個 entry 的還原次數，因為會改動 SSD manifest 格式）。
 被取代／淘汰的淺 checkpoint 的 hits 隨之消失（只有最深者代表這段對話）。`superseded_flags` 用每 256 token 一塊的串接雜湊（每個 entry 只算一次並快取）比對前綴，
 約 740 筆（30–100K token）在 -O2 下約 1.5 ms；一次性的雜湊約 0.2 ms／entry。
+
+**superseded_durable（停止時的保護）**：`spill_meta` 每個 entry 多一欄 `superseded_durable`：與 `superseded` 相同，但「取代它的更深 entry」必須已在 SSD（有 manifest）；VRAM 池中的 checkpoint 與只在 RAM 的 entry 不算。`superseded` 只決定逐出**順序**；是否「直接丟棄而不寫入」（frontend 的 RAM→SSD 保留期、停止時的 `flush()`、引擎的 `spill_enforce_ram`）一律看 `superseded_durable`，所以停止時就算更深的那筆沒來得及寫，淺的也不會被略過而讓整段對話消失。`flush()` 另外在同一組內先寫較深的 entry。快取鍵為 `ret_gen_`（每次 entry／checkpoint 增減、owner／hits／manifest 寫入時遞增）。另外：RAM 不足（OOM）造成的讀檔失敗不計入 `io_fails`；成功讀取會把 `io_fails` 歸零（「連續 3 次」）。
 
 **資料流**：`Checkpoint`／`Spilled` 增加 `owner`、`hits`、`last_hit`。SSD manifest 升為版本 2：標頭後多 16 位元組（owner、hits），舊的版本 1 manifest 仍可讀取與還原
 （owner 0、hits 0）；新版寫出的 manifest 舊引擎讀不了（降級時會被當成「不是這個模型的檔案」而刪除）。引擎提供 `spill_meta`（每個 entry 的 owner／hits／superseded）、

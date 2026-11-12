@@ -50,6 +50,19 @@ int main() {
     const auto f = run({A, B, C}, {5, 5, 5});
     CHECK(f.size() == 3 && f[0] && f[1] && !f[2]);
   }
+  {  // durable_only: a shallow entry is superseded_durable only when the deeper extender is on the SSD (a pool checkpoint or a RAM-only
+     // entry does not count), so a stop that cannot write the deeper one never drops the shallow one as well
+    const auto A = extend(base, L + 100, 0, 0), B = extend(base, 2 * L, 0, 0);
+    std::vector<std::vector<uint64_t>> bh{block_hashes(A), block_hashes(B)};
+    std::vector<std::vector<int32_t>> ids{A, B};
+    std::vector<RetNode> nodes{{&ids[0], &bh[0], false, 5, false}, {&ids[1], &bh[1], false, 5, false}};
+    std::vector<char> f, d;
+    superseded_flags(nodes, 1, f), superseded_flags(nodes, 1, d, true);
+    CHECK(f[0] == 1 && d[0] == 0);  // deeper one not durable
+    nodes[1].durable = true;
+    superseded_flags(nodes, 1, d, true);
+    CHECK(d[0] == 1);
+  }
   {  // short prefixes (<= kKeepShort) are never superseded
     const auto S = extend(base, L, 0, 0), M = extend(base, L + 1, 0, 0), T = base;
     const auto f = run({S, M, T}, {5, 5, 5});

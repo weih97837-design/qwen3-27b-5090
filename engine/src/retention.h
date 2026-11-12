@@ -59,6 +59,7 @@ struct RetNode {
   const std::vector<uint64_t>* bh = nullptr;  // block_hashes(*ids)
   bool ring = false;
   uint64_t owner = 0;
+  bool durable = false;  // a manifest on the SSD exists (the node survives a restart); pool checkpoints and RAM-only entries are not
 };
 
 namespace ret_detail {
@@ -73,9 +74,10 @@ inline bool prefix_of(const RetNode& a, const RetNode& b) {
 }  // namespace ret_detail
 
 // flags[i] for i < n_check: whether nodes[i] is superseded by another node (see the top). Nodes past n_check only count as
-// extenders. Cost: a sort by the block hashes (short arrays), then for each node the nodes that share its full blocks (adjacent in
+// extenders. durable_only: the standing-in (deepest) extender must be durable (on the SSD); the branch / shared tests still look at
+// every extender (conservative). A flag set this way means the conversation's prefix survives a restart without this entry. Cost: a sort by the block hashes (short arrays), then for each node the nodes that share its full blocks (adjacent in
 // that order), each checked on the < kBlockTokens tokens past them.
-inline void superseded_flags(const std::vector<RetNode>& nodes, size_t n_check, std::vector<char>& flags) {
+inline void superseded_flags(const std::vector<RetNode>& nodes, size_t n_check, std::vector<char>& flags, bool durable_only = false) {
   flags.assign(n_check, 0);
   const size_t n = nodes.size();
   if (n < 2) return;
@@ -105,7 +107,7 @@ inline void superseded_flags(const std::vector<RetNode>& nodes, size_t n_check, 
       if (o.bh->size() < m || !std::equal(c.bh->begin(), c.bh->begin() + std::ptrdiff_t(m), o.bh->begin())) break;
       if (&o == &c || o.ids->size() <= c.ids->size() || !ret_detail::prefix_of(c, o)) continue;  // (an equal copy, e.g. a live backup next to its pool checkpoint, is no extender)
       ext.push_back(&o);
-      if (o.ring >= c.ring && (!deepest || o.ids->size() > deepest->ids->size())) deepest = &o;
+      if (o.ring >= c.ring && (!durable_only || o.durable) && (!deepest || o.ids->size() > deepest->ids->size())) deepest = &o;
     }
     if (!deepest) continue;
     bool ok = true;

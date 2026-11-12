@@ -22,7 +22,8 @@ Retention (value-based, engine/src/retention.h; docs/tiered-cache.md "Retention"
 (make_room, _pick_victim) and by the engine for RAM (spill_enforce_ram): the agent using the most bytes of the tier (SPILL_FAIR_AGENTS;
 elastic, no guaranteed share), then within it superseded entries (a deeper checkpoint of the same conversation exists), never-hit before
 hit entries, and the older / bigger (the pre-retention rule) last. Superseded entries are never written to the SSD: past the RAM
-retention they are dropped. The engine reports per entry "owner" (the agent's id, 0 unknown), "hits" and "superseded" (spill_list) and
+retention they are dropped. The engine reports per entry "owner" (the agent's id, 0 unknown), "hits", "superseded" and "superseded_durable" (spill_list; the latter counts only deeper entries already on the SSD and is what
+decides whether an entry is dropped instead of written) and
 per agent the bytes it holds in each tier (spill_agents); an engine without them gives the defaults (owner 0, no hits, nothing
 superseded) and the order is the old "oldest written first".
 
@@ -88,6 +89,12 @@ def _unlink(path):
 
 def _hit(e):
     return (e.get("hits") or 0) > 0
+
+
+def _sup_durable(e):
+    """Superseded by a deeper entry that is ON THE SSD (the engine's superseded_durable; an engine without it: the plain flag). Only
+    such an entry may be dropped instead of written: a deeper one that is in VRAM / RAM only may not survive a stop."""
+    return bool(e.get("superseded_durable", e.get("superseded")))
 
 
 def _owner(e):
@@ -282,9 +289,9 @@ class TierPolicy:
             age = now - self.ram_since.get(e["id"], now)
             if age < self.ram_retention_s or not (idle or age >= 2 * self.ram_retention_s):
                 continue
-            if e.get("superseded"):
+            if _sup_durable(e):
                 self.skipped_superseded += 1
-                self._drop(e["id"], f"superseded: a deeper checkpoint of its conversation exists ({e['pos']} tokens)")
+                self._drop(e["id"], f"superseded: a deeper checkpoint of its conversation is on the SSD ({e['pos']} tokens)")
                 continue
             if self._short(e):
                 self.skipped_short += 1
@@ -384,9 +391,9 @@ class TierPolicy:
             return result
         deadline = clock() + budget_s
         now = self.clock()
-        ram = sorted((e for e in self.engine.spill_list()  # (short ones stay in RAM, and so do the superseded: not worth a write)
-                      if e["ram_bytes"] > 0 and not e.get("busy") and not self._short(e) and not e.get("superseded")),
-                     key=lambda e: (not _hit(e), self.ram_since.get(e["id"], now)))
+        ram = sorted((e for e in self.engine.spill_list()  # (short ones stay in RAM, and so do those whose deeper checkpoint is already on the SSD; deeper ones first)
+                      if e["ram_bytes"] > 0 and not e.get("busy") and not self._short(e) and not _sup_durable(e)),
+                     key=lambda e: (not _hit(e), -(e.get("pos") or 0), self.ram_since.get(e["id"], now)))
         rate = self.write_bps or DEFAULT_WRITE_BPS
         skipped = 0
         for i, e in enumerate(ram):
