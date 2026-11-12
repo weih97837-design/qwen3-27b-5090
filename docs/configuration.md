@@ -298,6 +298,23 @@ The same from a script:
   load, and whether they fit is decided when it does. Example:
   `curl -s -X POST localhost:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
 
+## Agent identity
+
+The server tags each request with the AI agent it belongs to, so that the stats page can show the cache per agent and a
+later change can evict the tiered cache fairly between agents. Nothing changes for a client that sends nothing.
+
+- Send `X-Agent-Id: <id>` (preferred), or the OpenAI field `"user": "<id>"` in the body. The header wins when both are set.
+- An id is at most 128 characters of `A-Za-z0-9._/-`. Other characters become `_` and the rest is cut off; an empty id counts as none.
+- The agent is the part before the first `/`: `manager/task-123` and `manager/probe` are both agent `manager`. The full id
+  (session or sub-agent) is kept too.
+- Without an id the worker derives `auto:<8 hex digits>` from a hash of the prompt up to the end of the first user message
+  (the system prompt and that message). Limitation: agents that open with the same system prompt and first message share an
+  identity, and one that edits its system prompt gets a new one. Send an id when it matters.
+
+The stats page shows an **Agents** table (requests running and waiting, requests, prompt and cached tokens; RAM and SSD
+bytes are placeholders) and an Agent column in the Log. In `/ui/state` each request row has `agent` and `agent_id`, and the
+`agents` block lists the aggregates.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from
