@@ -21,6 +21,7 @@
 
 #include "chunk_store.h"
 #include "host_kv.h"
+#include "spill_files.h"
 
 namespace q27 {
 
@@ -130,7 +131,13 @@ struct Spilled {
   std::unique_ptr<char[]> state;      // (null once the entry is only on disk: this is what in_ram() means)
   size_t kv_bytes = 0, state_bytes = 0;
   bool ring = false;
-  std::string path;     // the file (empty: in memory only)
+  // SSD (spill_files.h, spill.cc (M)-(Q)): path = the entry's MANIFEST (empty: in memory only); dnames = the chunk files it lists,
+  // in order (each holds one reference of the disk index; only meaningful with a path); manifest_bytes = its size.
+  // cnames: the chain names of this entry's first chunks (derived from ids, cached: spill_list asks for them often).
+  std::string path;
+  std::vector<std::string> dnames;
+  uint64_t manifest_bytes = 0;
+  mutable std::vector<std::string> cnames;
   uint64_t last_use = 0;
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
   bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)

@@ -530,3 +530,284 @@ def test_from_env_reads_min_tokens(monkeypatch, tmp_path):
     monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "many")
     with pytest.raises(ValueError, match="SPILL_SSD_MIN_TOKENS"):
         TierPolicy.from_env(FakeEngine(), log=lambda _m: None)
+
+
+# ---------------------------------------------------------------- SSD dedup layout (an engine with spill_disk_usage)
+
+import json  # noqa: E402
+
+MANIFEST = 10  # bytes of a fake manifest
+
+
+class FakeDedupEngine:
+    """An engine with the SSD dedup API: entries are chunk lists ([(name, bytes)], tail bytes); a chunk file is shared by the
+    manifests that list it (refs) and exists while refs > 0, as the real engine's DiskIndex."""
+
+    def __init__(self):
+        self.entries, self.next_id = {}, 1
+        self.refs = {}   # chunk name -> manifests listing it
+        self.size = {}   # chunk name -> bytes
+        self.exports, self.drops, self.sweeps = [], [], 0
+        self.fail_drop = set()
+
+    def add_ram(self, chunks, tail=50, pos=10_000):
+        entry_id = self.next_id
+        self.next_id += 1
+        logical = sum(b for _, b in chunks) + tail + MANIFEST
+        self.entries[entry_id] = {"id": entry_id, "pos": pos, "ram_bytes": logical, "on_disk": False, "last_use": 0,
+                                  "path": "", "chunks": list(chunks), "tail": tail, "logical_bytes": logical}
+        return entry_id
+
+    def _unique(self, e):
+        if not e["on_disk"]:
+            return 0
+        return MANIFEST + e["tail"] + sum(b for n, b in e["chunks"] if self.refs.get(n) == 1)
+
+    def _new(self, e):
+        if e["on_disk"]:
+            return 0
+        return MANIFEST + e["tail"] + sum(b for n, b in e["chunks"] if not self.refs.get(n))
+
+    def spill_list(self):
+        return [{k: v for k, v in e.items() if k not in ("chunks", "tail")} | {
+            "backup": False, "busy": False, "unique_disk_bytes": self._unique(e), "new_disk_bytes": self._new(e)}
+                for _, e in sorted(self.entries.items())]
+
+    def spill_export(self, entry_id, path):
+        self.exports.append(entry_id)
+        e = self.entries[entry_id]
+        Path(path).write_text(json.dumps({"chunks": e["chunks"], "tail": e["tail"]}))
+        for n, b in e["chunks"]:
+            self.refs[n] = self.refs.get(n, 0) + 1
+            self.size[n] = b
+        e.update(ram_bytes=0, on_disk=True, path=path)
+
+    def _forget(self, e):
+        Path(e["path"]).unlink(missing_ok=True)
+        for n, _ in e["chunks"]:
+            self.refs[n] -= 1
+            if not self.refs[n]:
+                del self.refs[n]
+
+    def spill_drop(self, entry_id):
+        self.drops.append(entry_id)
+        if entry_id in self.fail_drop:
+            raise RuntimeError("entry is on the GPU")
+        e = self.entries.pop(entry_id)
+        if e["on_disk"]:
+            self._forget(e)
+
+    def spill_import(self, path):
+        try:
+            data = json.loads(Path(path).read_text())
+        except ValueError:
+            return 0
+        entry_id = self.next_id
+        self.next_id += 1
+        chunks = [tuple(c) for c in data["chunks"]]
+        logical = sum(b for _, b in chunks) + data["tail"] + MANIFEST
+        self.entries[entry_id] = {"id": entry_id, "pos": 20_000, "ram_bytes": 0, "on_disk": True, "last_use": 0,
+                                  "path": path, "chunks": chunks, "tail": data["tail"], "logical_bytes": logical}
+        for n, b in chunks:
+            self.refs[n] = self.refs.get(n, 0) + 1
+            self.size[n] = b
+        return entry_id
+
+    def spill_disk_usage(self):
+        disk = [e for e in self.entries.values() if e["on_disk"]]
+        physical = sum(self.size[n] for n in self.refs) + sum(MANIFEST + e["tail"] for e in disk)
+        return {"physical_bytes": physical, "logical_bytes": sum(e["logical_bytes"] for e in disk),
+                "chunk_files": len(self.refs), "manifests": len(disk)}
+
+    def spill_sweep(self):
+        self.sweeps += 1
+        return 2
+
+    def spill_stats(self):
+        return {"entries": len(self.entries), "in_ram": 0, "on_disk": 0, "ram_bytes": 0, "spilled": 0, "restored": 0,
+                "written": 0, "dropped": 0, "subsumed": 0, "failed": 0}
+
+
+@pytest.fixture
+def denv(tmp_path):
+    eng = FakeDedupEngine()
+    clock = Clock()
+    free = {"bytes": 10 ** 12}
+    logs = []
+    d = tmp_path / "spill"
+    # budget 1500 bytes
+    tier = TierPolicy(eng, str(d), ram_retention_s=0, ssd_gib=1500 * B, ssd_min_free_gib=100 * B, ttl_days=7, tick_s=0,
+                      clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append)
+    return types.SimpleNamespace(eng=eng, tier=tier, dir=d, clock=clock, free=free, logs=logs)
+
+
+def _shared(n, unique, size=400):
+    return [("P1", size), ("P2", size), (f"U{n}", unique)]
+
+
+def test_dedup_exports_into_entries_dir_and_counts_physical_bytes(denv):
+    denv.tier.start()
+    assert denv.tier.dedup is True and (denv.dir / "entries").is_dir()
+    ids = []
+    for t in range(3):  # each entry: 800 shared + 100 unique + 60 own = 960 logical; physical total 800 + 3 * 160 = 1280
+        denv.clock.t = t
+        ids.append(denv.eng.add_ram(_shared(t, 100)))
+        denv.tier.tick(idle=True)
+    assert denv.eng.exports == ids and denv.eng.drops == []  # logical 2880 > the 1500 budget, physical 1280 fits
+    assert all(Path(denv.eng.entries[i]["path"]).parent == denv.dir / "entries" for i in ids)
+    assert all(Path(denv.eng.entries[i]["path"]).suffix == ".q27m" for i in ids)
+    st = denv.tier.status()
+    assert st["ssd_physical_bytes"] == 1280 and st["ssd_bytes"] == 1280
+    assert st["ssd_logical_bytes"] == 3 * 960
+    assert st["ssd_dedup_ratio"] == pytest.approx(2880 / 1280)
+
+
+def test_dedup_make_room_frees_unique_bytes_and_redoes_the_incoming_size(denv):
+    denv.tier.start()
+    ids = []
+    for t in range(3):
+        denv.clock.t = t
+        ids.append(denv.eng.add_ram(_shared(t, 100)))
+        denv.tier.tick(idle=True)
+    # a 4th entry with 400 unique bytes: it writes 460 new bytes (the shared prefix is on the SSD already); physical 1280 + 460 > 1500,
+    # so victims must go. Each of the oldest frees only 160 (the prefix is shared): one is not enough (1120 + 460), two are (960 + 460).
+    new = denv.eng.add_ram(_shared(9, 400))
+    denv.clock.t = 100
+    entry = next(e for e in denv.eng.spill_list() if e["id"] == new)
+    assert entry["new_disk_bytes"] == 460
+    assert denv.tier.make_room(entry["new_disk_bytes"], new) is True
+    assert denv.eng.drops == [ids[0], ids[1]]  # the oldest first; no more than needed
+    assert denv.eng.spill_disk_usage()["physical_bytes"] == 800 + 160 and denv.tier.usage["physical_bytes"] == 960
+
+
+def test_dedup_make_room_asks_the_incoming_size_again_after_a_drop(denv):
+    denv.tier.start()
+    denv.tier.budget = 10 ** 6
+    a = denv.eng.add_ram([("X", 700)], tail=10)
+    denv.tier.tick(idle=True)
+    # b shares X with a, which is on the SSD: it writes 20 bytes now. Dropping a frees X, and b then has to write it (720).
+    b = denv.eng.add_ram([("X", 700)], tail=10)
+    assert denv.eng.spill_list()[1]["new_disk_bytes"] == 20
+    denv.tier.budget = 710  # a (720) + b's 20 do not fit, and after a is gone b must write X too: 720 > 710, still no room
+    assert denv.tier.make_room(20, b) is False  # (with the stale incoming size of 20 this would have said True)
+    assert denv.eng.drops == [a]
+    denv.tier.budget = 730
+    assert denv.tier.make_room(denv.eng.spill_list()[0]["new_disk_bytes"], b) is True
+
+
+def test_dedup_drops_entries_that_free_bytes_before_mostly_shared_ones(denv):
+    denv.tier.start()
+    denv.tier.budget = 10 ** 6
+    denv.clock.t = 0
+    a = denv.eng.add_ram(_shared(0, 0), tail=10)   # oldest: all shared with b / c, so it would free only 20 bytes
+    denv.tier.tick(idle=True)
+    denv.clock.t = 1
+    b = denv.eng.add_ram(_shared(1, 0), tail=10)
+    denv.tier.tick(idle=True)
+    denv.clock.t = 2
+    c = denv.eng.add_ram([("P1", 400), ("P2", 400), ("BIG", 900)], tail=10)  # youngest, but 900 unique bytes
+    denv.tier.tick(idle=True)
+    assert denv.eng.drops == []
+    denv.tier.budget = 1500  # physical now 800 + 900 + 3 * 20 = 1760 > 1500: someone must go
+    assert denv.tier.make_room(0) is True
+    assert denv.eng.drops == [c]  # the youngest frees 920 at once; dropping a, b (20 bytes each) would not have been enough
+
+
+def test_dedup_a_failed_drop_is_skipped(denv):
+    denv.tier.start()
+    denv.tier.budget = 10 ** 6
+    ids = []
+    for t in range(2):
+        denv.clock.t = t
+        ids.append(denv.eng.add_ram([(f"X{t}", 900)], tail=10))
+        denv.tier.tick(idle=True)
+    denv.eng.fail_drop.add(ids[0])
+    denv.tier.budget = 1000
+    assert denv.tier.make_room(0) is True
+    assert denv.eng.drops == [ids[0], ids[1]] and ids[0] in denv.eng.entries and ids[1] not in denv.eng.entries
+
+
+def test_dedup_incoming_bigger_than_budget_deletes_nothing(denv):
+    denv.tier.start()
+    denv.eng.add_ram(_shared(0, 100))
+    denv.tier.tick(idle=True)
+    assert denv.tier.make_room(2000) is False and denv.eng.drops == []
+
+
+def test_dedup_ttl_counts_from_the_manifest_write_time(denv):
+    denv.tier.start()
+    rid = denv.eng.add_ram(_shared(0, 100))
+    denv.clock.t = 0
+    denv.tier.tick(idle=True)
+    path = Path(denv.eng.entries[rid]["path"])
+    denv.clock.t = 7 * DAY - 1
+    denv.tier.tick(idle=True)
+    assert rid in denv.eng.entries
+    denv.clock.t = 7 * DAY
+    denv.tier.tick(idle=True)
+    assert rid not in denv.eng.entries and not path.exists()
+
+
+def test_dedup_start_deletes_legacy_files_imports_manifests_and_sweeps(denv):
+    denv.dir.mkdir()
+    (denv.dir / "entries").mkdir()
+    (denv.dir / "old1.q27kv").write_bytes(b"x")
+    (denv.dir / "old2.q27kv").write_bytes(b"x")
+    (denv.dir / "half.q27kv.tmp").write_bytes(b"x")
+    (denv.dir / "entries" / "half.q27m.tmp").write_bytes(b"x")
+    good = denv.dir / "entries" / "a.q27m"
+    good.write_text(json.dumps({"chunks": [["P1", 400]], "tail": 5}))
+    os.utime(good, (123.0, 123.0))
+    (denv.dir / "entries" / "bad.q27m").write_text("not json")
+    denv.tier.start()
+    assert sorted(p.name for p in denv.dir.iterdir()) == ["entries"]
+    assert [p.name for p in (denv.dir / "entries").iterdir()] == ["a.q27m"]  # (the damaged manifest and the .tmp went)
+    legacy_lines = [m for m in denv.logs if "legacy" in m]
+    assert len(legacy_lines) == 1 and "3" in legacy_lines[0]  # one line for all of them
+    (rid,) = denv.eng.entries
+    assert denv.tier.written[rid] == 123.0  # the write time is the manifest's mtime
+    assert denv.eng.sweeps == 1  # after the imports
+    assert denv.tier.usage["physical_bytes"] == 400 + MANIFEST + 5
+
+
+def test_dedup_stray_manifest_sweep_stays_in_entries(denv):
+    denv.tier.start()
+    chunks = denv.dir / "chunks"
+    chunks.mkdir()
+    old_chunk = chunks / "abc.kvc"
+    old_chunk.write_bytes(b"x")
+    os.utime(old_chunk, (0, 0))
+    stray = denv.dir / "entries" / "stray.q27m"
+    stray.write_bytes(b"x")
+    os.utime(stray, (0, 0))
+    denv.clock.t = 8 * DAY
+    denv.tier.tick(idle=True)
+    assert old_chunk.exists()  # chunks/ belongs to the engine: never touched from here
+    assert not stray.exists()
+
+
+def test_old_engine_without_the_api_keeps_the_flat_layout(env):
+    # (FakeEngine has no spill_disk_usage: the whole legacy suite above runs on it. Here the specifics.)
+    assert env.tier.dedup is False
+    (env.dir).mkdir(exist_ok=True)
+    flat = env.dir / "keep.q27kv"
+    flat.write_bytes(MAGIC + b"x" * 10)
+    env.tier.start()
+    assert flat.exists()  # not deleted as "legacy": it is this engine's own format
+    assert any(e["path"] == str(flat) for e in env.eng.entries.values())
+    rid = env.eng.add_ram(400)
+    env.tier.tick(idle=True)
+    env.clock.t = 3600
+    env.tier.tick(idle=True)
+    assert Path(env.eng.entries[rid]["path"]).parent == env.dir and not (env.dir / "entries").exists()
+    st = env.tier.status()
+    assert st["ssd_bytes"] == st["ssd_physical_bytes"] == st["ssd_logical_bytes"] and st["ssd_dedup_ratio"] is None
+
+
+def test_engine_whose_usage_call_fails_falls_back_to_flat(env):
+    def boom():
+        raise RuntimeError("no such symbol")
+    env.eng.spill_disk_usage = boom
+    env.tier.dedup = None
+    env.tier.start()
+    assert env.tier.dedup is False

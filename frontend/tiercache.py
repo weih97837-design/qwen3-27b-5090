@@ -11,6 +11,13 @@ RAM without removing them from VRAM (engine.spill_backup_one); their entries hav
 them to the SSD (tick skips them: the checkpoint is still in VRAM). flush() does write them on a stop
 (SPILL_FLUSH_ON_STOP_S), since VRAM is lost when the engine unloads.
 
+SSD layout. An engine with SSD dedup (engine.spill_disk_usage() is not None) writes each entry as a manifest in
+SPILL_DIR/entries (SUFFIX_MANIFEST) plus chunk files in SPILL_DIR/chunks that entries with the same prompt prefix share (the
+engine owns chunks/: this module never lists or deletes there). Budget, reserve and make_room count PHYSICAL bytes (each chunk
+once, engine.spill_disk_usage) and free space by an entry's unique_disk_bytes (what dropping it really frees). The first start with
+such an engine deletes the flat *.q27kv files an older build wrote (it is only a cache). An older engine, without the API, keeps the
+flat layout (one SUFFIX file per entry, sizes from the files).
+
 Everything runs on the caller's thread: the engine is not thread-safe.
 """
 
@@ -23,8 +30,11 @@ from pathlib import Path
 
 GiB = 1 << 30
 DAY = 86400.0
-SUFFIX = ".q27kv"
+SUFFIX = ".q27kv"                  # the flat layout (older engine); in the dedup layout: a legacy file, deleted at start
 TMP_SUFFIX = ".q27kv.tmp"
+SUFFIX_MANIFEST = ".q27m"          # SSD dedup layout: SPILL_DIR/entries/<id>.q27m (+ the engine's SPILL_DIR/chunks/*.kvc)
+ENTRIES_DIR = "entries"
+MOSTLY_SHARED = 0.25               # an entry whose unique bytes are under this fraction of its size frees little when dropped
 # The longest a stop may spend writing (SPILL_FLUSH_ON_STOP_S is cut to it). server.py gives the engine process
 # 15 s to exit on an unload or restart and 10 s on shutdown (EngineClient._stop, stop); a flush cut off by the
 # server's terminate would leave a file half written.
@@ -87,6 +97,8 @@ class TierPolicy:
         self.clock = clock
         self.disk_free = disk_free or (lambda d: shutil.disk_usage(d).free)
         self.log = log
+        self.dedup = None    # True: the engine has the SSD dedup layout (decided at start()); False: flat files; None: not known yet
+        self.usage = None    # the engine's last spill_disk_usage() (dedup layout), for status()
         self.written = {}    # id -> time the entry was written to a file (epoch s)
         self.ram_since = {}  # id -> time the entry was first seen in RAM
         self.listed = []     # the engine's list at the last look
@@ -118,6 +130,35 @@ class TierPolicy:
             opts["flush_on_stop_s"] = STOP_FLUSH_MAX_S
         return cls(engine, os.environ.get("SPILL_DIR", ""), log=log, **opts)
 
+    # ------------------------------------------------------------ SSD layout
+
+    def _read_usage(self):
+        """The engine's SSD usage {"physical_bytes", ...} or None (an engine without the dedup API, or the call failed)."""
+        fn = getattr(self.engine, "spill_disk_usage", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - treated as an engine without the API
+            self._error(f"spill_disk_usage: {e}")
+            return None
+
+    def _layout(self):
+        """True for the dedup layout. Decided once, by asking the engine."""
+        if self.dedup is None:
+            self.usage = self._read_usage()
+            self.dedup = self.usage is not None
+        return self.dedup
+
+    @property
+    def suffix(self):
+        return SUFFIX_MANIFEST if self._layout() else SUFFIX
+
+    @property
+    def files_dir(self):
+        """Where entry files go: SPILL_DIR/entries (dedup layout) or SPILL_DIR itself."""
+        return self.directory / ENTRIES_DIR if self._layout() else self.directory
+
     def _error(self, msg):
         self.last_error = msg
         self.log(f"tiered cache: {msg}")
@@ -138,9 +179,19 @@ class TierPolicy:
                 f"SPILL_DIR {self.directory} is not writable ({e}). If it is the kvcache volume, it was probably "
                 "created owned by root: remove the kvcache volume (docker volume rm) and recreate it, or fix the "
                 "directory's permissions.") from e
-        for p in self.directory.glob("*" + TMP_SUFFIX):  # left by a write that did not finish
+        files = self.files_dir
+        if self.dedup:
+            files.mkdir(parents=True, exist_ok=True)
+            # The flat files of an older build are not read by this layout: it is only a cache, so they go (one line).
+            legacy = [p for pat in ("*" + SUFFIX, "*" + TMP_SUFFIX) for p in self.directory.glob(pat)]
+            if legacy:
+                for p in legacy:
+                    _unlink(p)
+                self.log(f"tiered cache: deleted {len(legacy)} legacy {SUFFIX} file(s) (the SSD layout changed to "
+                         f"{ENTRIES_DIR}/ + chunks/; it is only a cache)")
+        for p in list(files.glob("*.tmp")):  # left by a write that did not finish
             _unlink(p)
-        for p in sorted(self.directory.glob("*" + SUFFIX)):
+        for p in sorted(files.glob("*" + self.suffix)):
             try:
                 try:
                     entry_id = self.engine.spill_import(str(p))
@@ -155,6 +206,15 @@ class TierPolicy:
                 self.written[entry_id] = _mtime(p, self.clock())
             except OSError as e:  # a file locked or removed mid-import must not stop the worker
                 self._error(f"start {p.name}: {e}")
+        if self.dedup:
+            # Every manifest is imported: the chunk files nobody lists (a crash between a chunk and its manifest) and any .tmp go.
+            try:
+                n = self.engine.spill_sweep()
+                if n:
+                    self.log(f"tiered cache: deleted {n} leftover chunk / temporary file(s)")
+            except Exception as e:  # noqa: BLE001
+                self._error(f"sweep: {e}")
+            self.usage = self._read_usage()
         self.listed = self.engine.spill_list()
 
     # ------------------------------------------------------------ periodic work
@@ -212,7 +272,7 @@ class TierPolicy:
             if now - self.written[entry_id] >= self.ttl_s:
                 self._drop(entry_id, "older than ttl_days")
         referenced = {Path(e["path"]).name for e in entries if e["path"]}
-        for p in self.directory.glob("*" + SUFFIX):
+        for p in self.files_dir.glob("*" + self.suffix):  # (dedup layout: entries/ only; chunks/ is the engine's)
             if p.name in referenced:
                 continue
             mtime = _mtime(p, None)
@@ -225,6 +285,8 @@ class TierPolicy:
             self.make_room(0)
         except RuntimeError as ex:
             self._error(f"SSD budget: {ex}")
+        if self.dedup:
+            self.usage = self._read_usage()
 
     def _short(self, e):
         return self.ssd_min_tokens > 0 and e.get("pos", 0) < self.ssd_min_tokens
@@ -243,8 +305,10 @@ class TierPolicy:
         """Writes one RAM entry to a file in the directory. Returns "written", "kept" (the SSD room could not be
         checked now: retried later) or "dropped" (no room on the SSD, or the export failed)."""
         entry_id = e["id"]
+        # (dedup layout: what the export WRITES now: its manifest + the chunk files that are not on the SSD yet)
+        incoming = e.get("new_disk_bytes", e["ram_bytes"]) if self._layout() else e["ram_bytes"]
         try:
-            room = self.make_room(e["ram_bytes"])
+            room = self.make_room(incoming, entry_id)
         except RuntimeError as ex:
             # Unknown whether there is room, so this is not "no room": keep the entry for a later tick.
             self._error(f"make room for {entry_id}: {ex}")
@@ -252,7 +316,7 @@ class TierPolicy:
         if not room:
             self._drop(entry_id, "no room on SSD")
             return "dropped"
-        path = self.directory / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}{SUFFIX}"
+        path = self.files_dir / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}{self.suffix}"
         try:
             self.engine.spill_export(entry_id, str(path))
         except RuntimeError as ex:
@@ -262,6 +326,8 @@ class TierPolicy:
             return "dropped"
         self.written[entry_id] = now
         self.ram_since.pop(entry_id, None)
+        if self.dedup:
+            self.usage = self._read_usage()
         self.log(f"tiered cache: entry {entry_id} ({e['ram_bytes']} bytes) written to {path.name}")
         return "written"
 
@@ -289,7 +355,7 @@ class TierPolicy:
                  f"({result['left']} left in RAM)")
         return result
 
-    def make_room(self, incoming):
+    def make_room(self, incoming, entry_id=None):
         """True when `incoming` bytes fit the SSD budget and reserve, after deleting the oldest files if needed.
         False when they do not: deleting nothing if `incoming` cannot fit even with every file deleted, otherwise
         after deleting what it could.
@@ -300,9 +366,15 @@ class TierPolicy:
         With incoming == 0 (the tick's cap pass) an infeasible reserve is not a refusal: the budget is still
         enforced, deleting the oldest files until used <= budget and no further. The cap only ever deletes this
         tier's own files down to the cap, so it is safe even when other files fill the disk; the reserve is only
-        pursued when it can actually be reached."""
+        pursued when it can actually be reached.
+
+        Dedup layout: `used` is the PHYSICAL size (each chunk file once, engine.spill_disk_usage), a drop frees the entry's
+        unique_disk_bytes (see _pick_victim), and the entry to be written (entry_id) may share chunk files with the
+        victims: its new_disk_bytes is read again after each drop."""
         if self.directory is None:
             return False
+        if self._layout():
+            return self._make_room_dedup(incoming, entry_id)
         entries = self.engine.spill_list()
         self.listed = entries
         disk = [e for e in entries if e["on_disk"]]
@@ -333,6 +405,63 @@ class TierPolicy:
             free += sizes[entry_id]
         return fits()
 
+
+    def _pick_victim(self, disk, need):
+        """The entry to delete next, among the SSD entries that can be dropped (a small function, so the policy can be swapped).
+        Oldest written first, except that an entry that is mostly shared (little of it would be freed, MOSTLY_SHARED) goes only
+        after the ones that free real bytes, and among those the oldest. `need`: bytes still to free."""
+        def key(e):
+            unique = e.get("unique_disk_bytes", 0)
+            size = e.get("logical_bytes") or unique
+            return (unique < MOSTLY_SHARED * size, self.written.get(e["id"], 0.0))
+        return min(disk, key=key) if disk else None
+
+    def _make_room_dedup(self, incoming, entry_id):
+        entries = self.engine.spill_list()
+        self.listed = entries
+        usage = self._read_usage()
+        if usage is None:  # (the engine stopped answering: no decision)
+            raise RuntimeError("spill_disk_usage failed")
+        used = usage["physical_bytes"]
+        free = self.disk_free(str(self.directory))
+        reserve_reachable = free + used - incoming >= self.reserve
+        if incoming > self.budget or (incoming > 0 and not reserve_reachable):
+            return False
+
+        def fits():
+            return used + incoming <= self.budget and (free - incoming >= self.reserve or not reserve_reachable)
+
+        skipped = set()  # entries whose drop failed or that are busy
+        while not fits():
+            disk = [e for e in entries if e["on_disk"] and not e.get("busy") and e["id"] not in skipped]
+            need = max(used + incoming - self.budget, self.reserve - (free - incoming) if reserve_reachable else 0)
+            e = self._pick_victim(disk, need)
+            if e is None:
+                break
+            victim = e["id"]
+            try:
+                self.engine.spill_drop(victim)
+            except RuntimeError as ex:
+                self._error(f"make room, drop {victim}: {ex}")
+                skipped.add(victim)  # its bytes are still on disk: not freed
+                continue
+            self.written.pop(victim, None)
+            # The siblings' unique bytes and the incoming entry's new bytes changed with this drop: ask again.
+            entries = self.engine.spill_list()
+            self.listed = entries
+            before, usage = used, self._read_usage()
+            if usage is None:
+                raise RuntimeError("spill_disk_usage failed")
+            used = usage["physical_bytes"]
+            free += before - used
+            if entry_id is not None:
+                now_e = next((x for x in entries if x["id"] == entry_id), None)
+                if now_e is not None and "new_disk_bytes" in now_e:
+                    incoming = now_e["new_disk_bytes"]
+            self.log(f"tiered cache: entry {victim} deleted to make room ({before - used} bytes freed)")
+        self.usage = usage
+        return fits()
+
     # ------------------------------------------------------------ metrics
 
     def status(self):
@@ -341,7 +470,16 @@ class TierPolicy:
         ram = [e for e in self.listed if e["ram_bytes"] > 0]
         # (ram_bytes here is the entries' LOGICAL size: what an entry takes in a file and what the SSD budget counts. The
         # engine's RAM tier holds less when entries share chunks: stats.tiers_block has the physical number.)
-        sizes = {id(e): _size(e["path"]) for e in disk}
+        # Dedup layout: an entry's "size" is its logical size (what its file set would take alone); the SSD's real use is the
+        # engine's physical figure (each shared chunk file once), taken at the last tick / write (self.usage).
+        dedup = bool(self.dedup) and self.usage is not None
+        if dedup:
+            sizes = {id(e): e.get("logical_bytes", 0) for e in disk}
+            ssd_physical = self.usage["physical_bytes"]
+            ssd_logical = sum(sizes.values())
+        else:
+            sizes = {id(e): _size(e["path"]) for e in disk}
+            ssd_physical = ssd_logical = sum(sizes.values())
         # Per tier: entries and bytes, and how many of them are live backups (copies of checkpoints the VRAM pool still
         # holds) rather than evicted ones (their only copy).
         split = {}
@@ -351,7 +489,9 @@ class TierPolicy:
                 split[f"{tier}_{kind}_entries"], split[f"{tier}_{kind}_bytes"] = len(part), sum(size(e) for e in part)
         return {"ram_entries": len(ram), "ram_bytes": sum(e["ram_bytes"] for e in ram),
                 "ram_logical_bytes": sum(e["ram_bytes"] for e in ram),
-                "disk_entries": len(disk), "ssd_bytes": sum(sizes.values()),
+                "disk_entries": len(disk), "ssd_bytes": ssd_physical, "ssd_logical_bytes": ssd_logical,
+                "ssd_physical_bytes": ssd_physical,
+                "ssd_dedup_ratio": ssd_logical / ssd_physical if dedup and ssd_logical and ssd_physical else None,
                 "backup_entries": sum(1 for e in self.listed if e.get("backup")), **split,
                 "ssd_budget_bytes": int(self.budget), "ssd_min_tokens": self.ssd_min_tokens,
                 "ssd_skipped_short": self.skipped_short, "last_error": self.last_error}

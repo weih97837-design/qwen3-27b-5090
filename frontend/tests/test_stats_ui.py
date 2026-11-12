@@ -398,3 +398,20 @@ def test_scheduler_stats_agents_block_and_row_agent():
     tick = hub.tick()
     assert tick["agents"] == snap["agents"] and tick["seqs"][0]["agent"] == "alpha"
     json.dumps(tick)
+
+
+class DedupTiers(FakeTiers):
+    def status(self):
+        d = super().status()
+        d.update(ssd_bytes=2 * GiB, ssd_physical_bytes=2 * GiB, ssd_logical_bytes=6 * GiB, ssd_dedup_ratio=3.0)
+        return d
+
+
+def test_tiers_block_ssd_dedup_fields(tmp_path):
+    out = stats.tiers_block(FakeEngine(), DedupTiers(tmp_path), environ={})
+    assert out["ssd_bytes"] == 2 * GiB and out["ssd_physical_bytes"] == 2 * GiB and out["ssd_logical_bytes"] == 6 * GiB
+    assert out["ssd_dedup_ratio"] == 3.0
+    json.dumps(out)
+    # an older policy / engine (flat files): the new figures are absent, not zero
+    old = stats.tiers_block(FakeEngine(), FakeTiers(tmp_path), environ={})
+    assert old["ssd_logical_bytes"] is None and old["ssd_physical_bytes"] is None and old["ssd_dedup_ratio"] is None

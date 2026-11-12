@@ -742,7 +742,9 @@ function drawTiers() {
   const split = (p) => t[p + "_evicted_entries"] == null ? "" :
     ` · 被逐出 ${n(t[p + "_evicted_entries"])} 筆 ${fmtGiB(t[p + "_evicted_bytes"])} · 備份 ${n(t[p + "_backup_entries"])} 筆 ${fmtGiB(t[p + "_backup_bytes"])}`;
   if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 筆在 RAM${dedup}` + split("ram")));
-  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
+  // SSD dedup: ssd_bytes is what the files physically take (each shared chunk once); logical is what the entries would take as separate files.
+  const ssdDedup = t.ssd_logical_bytes && t.ssd_dedup_ratio ? ` · 邏輯 ${fmtGiB(t.ssd_logical_bytes)}（去重 ${t.ssd_dedup_ratio.toFixed(2)}×）` : "";
+  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD${ssdDedup} · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
   if (cols.length) kids.push(el("div", { class: "tiers-grid" }, ...cols));
   kids.push(el("div", { class: "kv", style: "margin-top:12px" },
     ...TIER_COUNTERS.map(([label, key]) => el("div", {},

@@ -41,6 +41,9 @@ SIGNATURES = {
     "q27_cache_stats": ([P, P], I),
     "q27_cache_grow": ([P, I, P], I),
     "q27_spill_list": ([P, ctypes.c_char_p, I], I),
+    "q27_spill_list_ex": ([P, ctypes.c_char_p, I], I),
+    "q27_spill_disk_usage": ([P, P, I], I),
+    "q27_spill_sweep": ([P, P], I),
     "q27_spill_export": ([P, ctypes.c_uint64, ctypes.c_char_p], I),
     "q27_spill_drop": ([P, ctypes.c_uint64], I),
     "q27_spill_import": ([P, ctypes.c_char_p, P], I),
@@ -429,15 +432,26 @@ class Engine:
 
     # ---- tiered cache (SPILL_RAM_GIB > 0; frontend/tiercache.py)
 
+    @property
+    def has_spill_dedup(self):
+        """The library has the SSD dedup layout (manifests + chunk files): q27_spill_list_ex / q27_spill_disk_usage / q27_spill_sweep.
+        An older library keeps one flat file per entry."""
+        l = lib()
+        return all(hasattr(l, n) for n in ("q27_spill_list_ex", "q27_spill_disk_usage", "q27_spill_sweep"))
+
     def spill_list(self):
         """(ram_bytes is the entry's LOGICAL size: with RAM dedup its chunks may be shared, see spill_stats for the physical use.)
         [{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "busy", "path"}] of the checkpoints the KV pool gave
         up (backup: the entry is an idle backup of a checkpoint still in the pool; busy: it is being restored in the
-        background, SPILL_ASYNC_PROMOTE, and can be neither written out nor dropped)."""
+        background, SPILL_ASYNC_PROMOTE, and can be neither written out nor dropped). With the SSD dedup library each entry also has
+        "logical_bytes" (kv + state, wherever it is), "unique_disk_bytes" (what dropping it frees on the SSD: its manifest and the chunk
+        files only it lists) and "new_disk_bytes" (what exporting it writes now)."""
+        ex = self.has_spill_dedup
+        fn = lib().q27_spill_list_ex if ex else lib().q27_spill_list
         n = 1 << 16
         while True:
             buf = ctypes.create_string_buffer(n)
-            size = lib().q27_spill_list(self.h, buf, n)
+            size = fn(self.h, buf, n)
             if size < 0:
                 self._check(1, "q27_spill_list")
             if size < n:
@@ -447,11 +461,33 @@ class Engine:
         for line in buf.value.decode("utf-8", "replace").split("\n"):  # (not splitlines: a path may hold \r etc.)
             if not line:
                 continue
-            f = line.split("\t", 6)
-            out.append({"id": int(f[0]), "pos": int(f[1]), "ram_bytes": int(f[2]), "on_disk": f[3] == "1",
-                        "last_use": int(f[4]), "backup": f[5] == "1", "busy": f[5] == "2",  # (column 5: 0 / 1 backup / 2 busy)
-                        "path": f[6] if len(f) > 6 else ""})
+            f = line.split("\t", 9 if ex else 6)
+            e = {"id": int(f[0]), "pos": int(f[1]), "ram_bytes": int(f[2]), "on_disk": f[3] == "1",
+                 "last_use": int(f[4]), "backup": f[5] == "1", "busy": f[5] == "2"}  # (column 5: 0 / 1 backup / 2 busy)
+            if ex:
+                e.update(logical_bytes=int(f[6]), unique_disk_bytes=int(f[7]), new_disk_bytes=int(f[8]),
+                         path=f[9] if len(f) > 9 else "")
+            else:
+                e["path"] = f[6] if len(f) > 6 else ""
+            out.append(e)
         return out
+
+    def spill_disk_usage(self):
+        """{"physical_bytes", "logical_bytes", "chunk_files", "manifests"} of the SSD tier (each chunk file once), or None with a
+        library that has no SSD dedup (flat files: the caller sums the file sizes)."""
+        if not self.has_spill_dedup:
+            return None
+        out = (ctypes.c_int64 * 4)()
+        self._check(lib().q27_spill_disk_usage(self.h, out, 4), "q27_spill_disk_usage")
+        return {"physical_bytes": out[0], "logical_bytes": out[1], "chunk_files": out[2], "manifests": out[3]}
+
+    def spill_sweep(self):
+        """After every manifest was imported: deletes leftover .tmp files and chunk files no manifest lists. Returns how many."""
+        if not self.has_spill_dedup:
+            return 0
+        out = ctypes.c_int()
+        self._check(lib().q27_spill_sweep(self.h, ctypes.byref(out)), "q27_spill_sweep")
+        return out.value
 
     def spill_backup_one(self, victims=0):
         """Copies a checkpoint of the pool to host memory; it stays in the pool. victims > 0: one of the next `victims`

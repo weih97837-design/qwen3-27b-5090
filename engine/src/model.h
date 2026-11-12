@@ -173,6 +173,18 @@ class Model {
   // spill_list's ram_bytes stays the entry's LOGICAL size. spill_list's "live" column is 0 none, 1 an idle backup, 2 busy (being restored by
   // spill_restore_*: neither written out nor dropped meanwhile); the line format is unchanged.
   std::string spill_list() const;
+  // SSD dedup (spill_files.h, spill.cc (M)-(Q)): `path` of spill_export / spill_import is the entry's MANIFEST (.q27m); the chunk
+  // files it lists live in <spill_dir>/chunks (the manifest's grandparent when SPILL_DIR is not set). spill_list_ex: one line per
+  // entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tlive\tlogical_bytes\tunique_disk_bytes\tnew_disk_bytes\tpath" (the old columns
+  // unchanged; logical_bytes: kv + state whether in memory or on disk; unique_disk_bytes: what dropping the entry frees on the
+  // SSD (its manifest + the chunk files only it lists; 0 when it has no file); new_disk_bytes: what exporting it writes now
+  // (its manifest + the chunk files not on disk yet; 0 once it is on disk). spill_disk_usage writes min(n, 4) values: physical bytes
+  // on the SSD (each chunk file once + the manifests), logical bytes (the entries with a file, each as if written whole), chunk
+  // files, manifests. spill_sweep (after every manifest was imported): deletes leftover .tmp files and chunk files no manifest
+  // lists; returns how many.
+  std::string spill_list_ex() const;
+  void spill_disk_usage(int64_t* out, int n) const;
+  int spill_sweep();
   void spill_export(uint64_t id, const std::string& path);
   void spill_drop(uint64_t id);
   uint64_t spill_import(const std::string& path);
@@ -310,8 +322,17 @@ class Model {
   // each resident shared chunk once; adding the pool's free part makes it pageable + state + the whole pinned pool.
   size_t spill_phys() const { return spill_ram_ + spill_chunks_.bytes(); }
   size_t spill_host_use() const { return spill_phys() + (pin_pool_.total() - pin_pool_.used()); }
-  void spill_write(Spilled& s, const std::string& path);
-  bool spill_load(Spilled& s);                   // the file's pages and state into memory
+  void spill_write(Spilled& s, const std::string& path);  // chunk files first, the manifest last, then the memory goes
+  bool spill_load(Spilled& s);                   // the manifest's + chunk files' pages and state into memory (a private entry)
+  // SSD dedup (spill.cc (M)-(Q)).
+  Geom spill_geom() const;                       // the KV geometry the files are written with
+  bool spill_disk_dir(const std::string& manifest_path);  // fixes the chunk directory (once); false: none can be found
+  void spill_disk_forget(Spilled& s);            // unlinks the manifest, unrefs its chunk files (deleted at 0 refs); the entry has no file after
+  const std::vector<std::string>& spill_chain_names(const Spilled& s, size_t n) const;  // names of the entry's first n chunks
+  bool spill_disk_ready(const Spilled& s) const;  // every chunk file of its manifest is believed to exist
+  bool spill_read_plan(Spilled& s, DiskRead& d);  // s.kv (whole, private) + s.state are allocated: the reader's inputs
+  uint64_t spill_unique_disk(const Spilled& s) const;
+  uint64_t spill_new_disk(const Spilled& s) const;
   void spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file);
   // RAM dedup (spill.cc (H)-(K)).
   size_t spill_chunk_count(size_t ntokens) const;  // full chunks of an entry of ntokens (by tokens; 0 with SPILL_DEDUP=0)
@@ -504,6 +525,7 @@ class Model {
   uint64_t spill_next_ = 1;
   mutable uint64_t fingerprint_ = 0;   // spill_fingerprint(), once computed
   mutable bool fingerprint_set_ = false;
+  DiskIndex disk_;                     // the SSD's chunk files and their reference counts (engine thread only; never the reader's)
   size_t spill_ram_ = 0;               // host bytes the entries in memory own (tails + states); the shared chunks: spill_chunks_.bytes()
   SpillChunkStore spill_chunks_;       // RAM dedup (declared after pin_pool_ / retired_: its buffers release into the pool)
   bool defer_orphans_ = false;         // OrphanScope: a chunk reaching 0 refs stays resident

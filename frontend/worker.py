@@ -1345,6 +1345,9 @@ class Scheduler:
             for key in ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes"):
                 if key in sp:  # (RAM dedup: an older engine does not report them)
                     out[f"q27:tier_ram_{key}"] = sp[key]
+            for key in ("ssd_logical_bytes", "ssd_physical_bytes"):
+                if ts.get(key) is not None:  # (SSD dedup: an older engine keeps flat files and has no such figures)
+                    out[f"q27:tier_{key}"] = ts[key]
         return out
 
 

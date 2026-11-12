@@ -256,6 +256,10 @@ def tiers_block(engine, tiers, environ=None):
                 "ram_chunks": sp.get("chunks"), "chunk_hits": sp.get("chunk_hits"), "chunk_misses": sp.get("chunk_misses"),
                 "ram_cap_bytes": int(ram_gib * (1 << 30)) if ram_gib is not None else None,
                 "in_ram": sp["in_ram"], "on_disk": sp["on_disk"], "ssd_bytes": ts.get("ssd_bytes"),
+                # SSD dedup (an older engine / policy: None): ssd_bytes is the PHYSICAL use (each shared chunk file once, what the
+                # cap is about); logical is what the entries would take as separate files
+                "ssd_logical_bytes": ts.get("ssd_logical_bytes"), "ssd_physical_bytes": ts.get("ssd_physical_bytes"),
+                "ssd_dedup_ratio": ts.get("ssd_dedup_ratio"),
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
                 "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],

@@ -391,6 +391,31 @@ int q27_spill_list(void* m, char* buf, int cap) {
   return int(r.size());
 }
 
+// The SSD dedup calls (Model::spill_list_ex / spill_disk_usage / spill_sweep; a library without them is the old flat-file layout).
+// q27_spill_list_ex copies the extended list as q27_spill_list does: id, pos, ram_bytes, on_disk, last_use, live, logical_bytes,
+// unique_disk_bytes, new_disk_bytes, path (tab separated, one line per entry).
+int q27_spill_list_ex(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->spill_list_ex(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+// Writes min(n, 4) values: physical bytes on the SSD (each chunk file once + the manifests), logical bytes (the entries with a
+// file, each counted whole), chunk files, manifests.
+int q27_spill_disk_usage(void* m, int64_t* out, int n) {
+  return guard([&] { static_cast<Model*>(m)->spill_disk_usage(out, n); });
+}
+
+// *removed: leftover .tmp files and chunk files no imported manifest lists, deleted. Call once, after every manifest was imported.
+int q27_spill_sweep(void* m, int* removed) {
+  return guard([&] { *removed = static_cast<Model*>(m)->spill_sweep(); });
+}
+
 int q27_spill_export(void* m, uint64_t id, const char* path) {
   return guard([&] { static_cast<Model*>(m)->spill_export(id, path); });
 }
