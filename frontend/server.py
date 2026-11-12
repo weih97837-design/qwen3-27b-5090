@@ -1605,7 +1605,7 @@ def main():
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
     ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "none"])
-    ap.add_argument("--weights", default=env("WEIGHTS", "nvidia"),
+    ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
     ap.add_argument("--max-seqs", type=int, default=int(env("MAX_SEQS", 4)),

@@ -16,7 +16,7 @@ ROOT = HERE.parent  # the repository, or the package's app folder
 def apply():
     """Sets Q27_LIB (the engine's q27.dll, unless set) and, in the package, HF_HOME as the launcher does: settings.ini,
     else <package>\\huggingface (start_package.server_env). Returns the weight profile the server starts with in the
-    package (WEIGHTS, else nvidia), and nvidia elsewhere (the scripts' default)."""
+    package (WEIGHTS, else gdnfp4), and nvidia elsewhere (the scripts' default)."""
     dll = ROOT / "engine" / "build" / "q27.dll"
     if "Q27_LIB" not in os.environ and dll.is_file():
         os.environ["Q27_LIB"] = str(dll)
@@ -29,4 +29,4 @@ def apply():
 
     env, _ = start_package.server_env(os.environ, start_package.read_settings(pkg / "settings.ini"), pkg)
     os.environ["HF_HOME"] = env["HF_HOME"]
-    return env.get("WEIGHTS") or "nvidia"
+    return env.get("WEIGHTS") or "gdnfp4"

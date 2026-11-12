@@ -37,7 +37,7 @@ conversations exceed the usable pool, so B's prefill evicts A's checkpoint. It p
 Native Windows package (no Docker, no torch): test.cmd runs this with the package's Python; the weights are where
 start.cmd downloads them (settings.ini HF_HOME, else the package's huggingface folder), q27.dll is app\\engine\\build\\.
 Without a draft model (SPEC=none, or DFlash2 not downloaded) scenario e is skipped. The default --weights is WEIGHTS
-(settings.ini), else nvidia, in the package; nvidia elsewhere.
+(settings.ini), else gdnfp4, in the package; nvidia elsewhere.
 """
 
 import argparse

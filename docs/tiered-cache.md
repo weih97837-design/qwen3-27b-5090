@@ -69,7 +69,6 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 32 GiB RAM 約可保存 6 個代理。
 - 100 GiB SSD 約可保存 21 個代理。
 - 512K 的 KV 池約佔 9 GiB VRAM。
-- 預設權重為 `nvidia`（NVIDIA 的 checkpoint，GDN / attention 投影為 FP8）。不封頂的 KV 池比 `gdnfp4` 少約 55K tokens（gdnfp4 約 610K），預設的 512K 池仍然放得下。`WEIGHTS=gdnfp4` 時，上面的數字不變。
 
 ## 加速選項（預設關閉）
 
