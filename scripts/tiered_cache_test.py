@@ -618,7 +618,7 @@ def scen_j(R, spill_dir):
     else:  # read: a new process; its Engine has no history, only the files
         for k, p in zip(keys, prompts):
             R.ids[k] = p
-        ids = R.op("import every manifest", import_all, R.eng)
+        ids = R.op("import every manifest", import_all, R.eng, spill_dir)
         swept = R.op("spill_sweep", R.eng.spill_sweep)
         s = R.snap("read: after spill_import")
         R.check("the new engine imports the manifests of the earlier process", len(ids) >= J_N and all(ids) and s["on_disk"] >= J_N,

@@ -319,12 +319,147 @@ static void test_crash_leftovers_and_sweep() {
   fs::remove_all(dir);
 }
 
+
+// export_entry_files / validate_manifest are the functions Model::spill_write / spill_import call: their branches are exercised here.
+static void test_export_import_branches() {
+  std::mt19937 rng(6);
+  const std::string dir = tmpdir("spill_files");
+  DiskIndex idx;
+  idx.set_dir(dir + "/chunks");
+  const Entry a = make_entry(rng, {}, 3, 100, 321);
+  const uint64_t cb = chunk_file_bytes(a.g, a.chunk_tokens());
+  const auto chain = chunk_chain(a.fp, 4, a.ids.data(), 3, a.chunk_tokens());
+  auto names_of = [&] { std::vector<std::string> v; for (auto& c : chain) v.push_back(c.name); return v; };
+
+  // 1. a leftover chunk file from a crash (no manifest, not in the index) that is exactly the chunk is ADOPTED, not rewritten
+  {
+    fs::create_directories(idx.dir());
+    HostKv kv = chunk_kv(a, 0);
+    CPieces pieces;
+    all_pieces(kv, pieces);
+    CHECK(write_chunk_file(idx.path(chain[0].name), a.fp, chain[0], "", a.ids.data(), a.chunk_tokens(), a.g, pieces, nullptr));
+    const auto mtime = fs::last_write_time(idx.path(chain[0].name));
+    Exported ex;
+    CHECK(export_entry(a, idx, dir + "/entries/a.q27m", &ex));
+    CHECK(ex.written.size() == 3);  // (new to the index: chunk 0 is adopted from the leftover file, the other two are written)
+    CHECK(fs::last_write_time(idx.path(chain[0].name)) == mtime);
+    CHECK(idx.find(chain[0].name)->refs == 1 && idx.files() == 3);
+  }
+  // 2. replacing an entry's manifest (cur_path / cur_names): the new references come first, the old manifest file goes, nothing is lost
+  {
+    std::string cur = dir + "/entries/a.q27m";
+    std::vector<std::string> cur_names = names_of();
+    Exported ex;
+    CHECK(export_entry(a, idx, dir + "/entries/a2.q27m", &ex, nullptr, &cur, &cur_names));
+    CHECK(cur == dir + "/entries/a2.q27m" && !fs::exists(dir + "/entries/a.q27m") && fs::exists(cur));
+    CHECK(ex.written.empty());
+    for (const auto& n : cur_names) CHECK(idx.find(n)->refs == 1 && fs::exists(idx.path(n)));
+    // (rewriting to the same path: the old and the new are one file, refs stay 1)
+    Exported ex2;
+    CHECK(export_entry(a, idx, cur, &ex2, nullptr, &cur, &cur_names));
+    for (const auto& n : cur_names) CHECK(idx.find(n)->refs == 1);
+    CHECK(fs::exists(cur));
+  }
+  // 3. a file that another manifest lists but that is not this chunk (damaged): the export fails, and touches nothing
+  {
+    const std::string victim = idx.path(chain[1].name);
+    fs::copy_file(victim, victim + ".keep");
+    flip(victim, long(sizeof(ChunkHeader) + 4 * 5));  // a token id
+    Entry b = a;  // the same chunks, a new manifest
+    Exported ex;
+    std::string err;
+    CHECK(!export_entry(b, idx, dir + "/entries/b.q27m", &ex, &err));
+    CHECK(err.find("does not match") != std::string::npos);
+    CHECK(!fs::exists(dir + "/entries/b.q27m") && !fs::exists(dir + "/entries/b.q27m.tmp"));
+    for (const auto& n : names_of()) CHECK(idx.find(n)->refs == 1);
+    fs::rename(victim + ".keep", victim);
+    // ... and one nobody lists (refs 0, e.g. after a failed read's forget) is rewritten instead
+    idx.forget_file(chain[1].name);
+    idx.find(chain[1].name)->refs = 0;
+    CHECK(export_entry(b, idx, dir + "/entries/b.q27m", &ex, &err));
+    CHECK(ex.written == std::vector<std::string>{chain[1].name} && idx.find(chain[1].name)->present && idx.find(chain[1].name)->refs == 1);
+    idx.find(chain[1].name)->refs += 1;  // (the reference of a's manifest, zeroed by hand above)
+    fs::remove(dir + "/entries/b.q27m");
+    for (const auto& n : names_of()) (void)idx.unref(n);  // (b's references go: a's remain)
+  }
+  // 4. an export that fails on its manifest (after writing chunk files) removes the chunk files it created, and only those
+  {
+    DiskIndex idx2;
+    idx2.set_dir(dir + "/chunks2");
+    {
+      std::FILE* f = std::fopen((dir + "/blocker").c_str(), "wb");
+      std::fclose(f);
+    }
+    Exported ex;
+    CHECK(!export_entry(a, idx2, dir + "/blocker/x.q27m", &ex));
+    CHECK(idx2.files() == 0 && fs::is_empty(dir + "/chunks2"));
+    // manifest cannot be created (a directory in its place): chunk files were written first, then removed again
+    fs::create_directories(dir + "/entries2/m.q27m");
+    CHECK(!export_entry(a, idx2, dir + "/entries2/m.q27m", &ex));
+    CHECK(idx2.files() == 0 && fs::is_empty(dir + "/chunks2"));
+    // the same with chunk files that were already there (referenced by another manifest): they stay
+    Exported ok1;
+    CHECK(export_entry(a, idx2, dir + "/entries2/ok.q27m", &ok1));
+    CHECK(!export_entry(a, idx2, dir + "/entries2/m.q27m", &ex));
+    CHECK(idx2.files() == 3 && idx2.find(chain[0].name)->refs == 1);
+  }
+  // 5. validate_manifest: what spill_import rejects
+  {
+    DiskIndex fresh;
+    fresh.set_dir(idx.dir());
+    ManifestHead h;
+    std::vector<std::string> unknown;
+    const std::string man = dir + "/entries/a2.q27m";
+    CHECK(validate_manifest(fresh, man, a.fp, a.g, a.state.size(), 1 << 20, h, unknown) && unknown.size() == 3);
+    CHECK(!validate_manifest(fresh, man, a.fp + 1, a.g, a.state.size(), 1 << 20, h, unknown));       // another model
+    Geom g2 = a.g;
+    g2.page_bytes *= 2;
+    CHECK(!validate_manifest(fresh, man, a.fp, g2, a.state.size(), 1 << 20, h, unknown));            // another KV type
+    CHECK(!validate_manifest(fresh, man, a.fp, a.g, a.state.size() + 1, 1 << 20, h, unknown));       // another state size
+    CHECK(!validate_manifest(fresh, man, a.fp, a.g, a.state.size(), 100, h, unknown));               // longer than max_tokens
+    CHECK(!validate_manifest(fresh, dir + "/entries/none.q27m", a.fp, a.g, a.state.size(), 1 << 20, h, unknown));
+    // a chunk file that is gone (a manifest referencing a missing chunk: the crash / cleaner case)
+    fs::rename(idx.path(chain[2].name), idx.path(chain[2].name) + ".away");
+    CHECK(!validate_manifest(fresh, man, a.fp, a.g, a.state.size(), 1 << 20, h, unknown));
+    // ... or the wrong size
+    fs::rename(idx.path(chain[2].name) + ".away", idx.path(chain[2].name));
+    truncate_by(idx.path(chain[2].name), 8);
+    CHECK(!validate_manifest(fresh, man, a.fp, a.g, a.state.size(), 1 << 20, h, unknown));
+    // (the index trusts a chunk it already has: no stat)
+    fresh.add(chain[2].name, cb);
+    CHECK(validate_manifest(fresh, man, a.fp, a.g, a.state.size(), 1 << 20, h, unknown) && unknown.size() == 2);
+    // a manifest whose names are not the chain of its tokens: write one with swapped names
+    {
+      ManifestHead good;
+      CHECK(read_manifest_head(man, good));
+      auto swapped = good.names;
+      std::swap(swapped[0], swapped[1]);
+      HostKv tail = tail_kv(a);
+      CPieces tp;
+      all_pieces(tail, tp);
+      ManifestInfo mi;
+      mi.fingerprint = a.fp, mi.g = a.g, mi.state_bytes = a.state.size(), mi.tail_bytes = tail.total;
+      CHECK(write_manifest_file(dir + "/entries/swap.q27m", mi, a.ids, swapped, a.state.data(), tp, nullptr));
+      DiskIndex f2;
+      f2.set_dir(idx.dir());
+      f2.add(chain[0].name, cb), f2.add(chain[1].name, cb), f2.add(chain[2].name, cb);
+      CHECK(!validate_manifest(f2, dir + "/entries/swap.q27m", a.fp, a.g, a.state.size(), 1 << 20, h, unknown));
+      // a tail whose size does not fit the token count
+      mi.tail_bytes = 0;
+      CHECK(write_manifest_file(dir + "/entries/notail.q27m", mi, a.ids, good.names, a.state.data(), {}, nullptr));
+      CHECK(!validate_manifest(f2, dir + "/entries/notail.q27m", a.fp, a.g, a.state.size(), 1 << 20, h, unknown));
+    }
+  }
+  fs::remove_all(dir);
+}
+
 int main() {
   test_hash();
   test_names();
   test_roundtrip_and_damage();
   test_sharing_and_refcounts();
   test_crash_leftovers_and_sweep();
+  test_export_import_branches();
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
 }

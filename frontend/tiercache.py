@@ -424,14 +424,19 @@ class TierPolicy:
             raise RuntimeError("spill_disk_usage failed")
         used = usage["physical_bytes"]
         free = self.disk_free(str(self.directory))
-        reserve_reachable = free + used - incoming >= self.reserve
-        if incoming > self.budget or (incoming > 0 and not reserve_reachable):
+        # Whether it can EVER fit is judged by its full size: once exported its manifest and all its chunk files are on the SSD
+        # (new_disk_bytes is only what is missing now, and drops may make it grow). So nothing is deleted for an entry that
+        # cannot fit even when every other file is gone.
+        mine = next((x for x in entries if x["id"] == entry_id), None) if entry_id is not None else None
+        full = max(incoming, (mine or {}).get("logical_bytes", 0))
+        reserve_reachable = free + used - full >= self.reserve
+        if full > self.budget or (full > 0 and not reserve_reachable):
             return False
 
         def fits():
             return used + incoming <= self.budget and (free - incoming >= self.reserve or not reserve_reachable)
 
-        skipped = set()  # entries whose drop failed or that are busy
+        skipped = set()  # entries tried (a drop that failed stays on the SSD): the loop is bounded by the number of entries
         while not fits():
             disk = [e for e in entries if e["on_disk"] and not e.get("busy") and e["id"] not in skipped]
             need = max(used + incoming - self.budget, self.reserve - (free - incoming) if reserve_reachable else 0)
@@ -439,12 +444,12 @@ class TierPolicy:
             if e is None:
                 break
             victim = e["id"]
+            skipped.add(victim)
             try:
                 self.engine.spill_drop(victim)
             except RuntimeError as ex:
                 self._error(f"make room, drop {victim}: {ex}")
-                skipped.add(victim)  # its bytes are still on disk: not freed
-                continue
+                continue  # its bytes are still on disk: not freed
             self.written.pop(victim, None)
             # The siblings' unique bytes and the incoming entry's new bytes changed with this drop: ask again.
             entries = self.engine.spill_list()

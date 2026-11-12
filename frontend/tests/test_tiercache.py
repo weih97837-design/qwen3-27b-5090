@@ -685,14 +685,29 @@ def test_dedup_make_room_asks_the_incoming_size_again_after_a_drop(denv):
     denv.tier.budget = 10 ** 6
     a = denv.eng.add_ram([("X", 700)], tail=10)
     denv.tier.tick(idle=True)
-    # b shares X with a, which is on the SSD: it writes 20 bytes now. Dropping a frees X, and b then has to write it (720).
+    z = denv.eng.add_ram([("Z", 300)], tail=10)
+    denv.clock.t = 1
+    denv.tier.tick(idle=True)
+    # b shares X with a, which is on the SSD: it writes 20 bytes now. Once a is dropped X is gone and b must write it (720).
     b = denv.eng.add_ram([("X", 700)], tail=10)
-    assert denv.eng.spill_list()[1]["new_disk_bytes"] == 20
-    denv.tier.budget = 710  # a (720) + b's 20 do not fit, and after a is gone b must write X too: 720 > 710, still no room
-    assert denv.tier.make_room(20, b) is False  # (with the stale incoming size of 20 this would have said True)
-    assert denv.eng.drops == [a]
-    denv.tier.budget = 730
-    assert denv.tier.make_room(denv.eng.spill_list()[0]["new_disk_bytes"], b) is True
+    assert next(e for e in denv.eng.spill_list() if e["id"] == b)["new_disk_bytes"] == 20
+    denv.tier.budget = 800  # used 1040 + 20 > 800: a goes (used 320); the stale 20 would fit now, but b needs 720 + 320 > 800: z goes too
+    assert denv.tier.make_room(20, b) is True
+    assert denv.eng.drops == [a, z]
+    assert denv.tier.usage["physical_bytes"] == 0
+
+
+def test_dedup_an_entry_that_cannot_fit_even_alone_deletes_nothing(denv):
+    denv.tier.start()
+    denv.tier.budget = 10 ** 6
+    a = denv.eng.add_ram([("X", 700)], tail=10)
+    denv.tier.tick(idle=True)
+    big = denv.eng.add_ram([("X", 700), ("Y", 700)], tail=10)  # shares X: it writes 720 bytes now, but its full size is 1420
+    entry = next(e for e in denv.eng.spill_list() if e["id"] == big)
+    assert entry["new_disk_bytes"] == 720 and entry["logical_bytes"] == 1420
+    denv.tier.budget = 1000
+    assert denv.tier.make_room(entry["new_disk_bytes"], big) is False  # its 720 new bytes alone would need a drop, but 1420 (its full size) never fits, 1420 never does
+    assert denv.eng.drops == [] and a in denv.eng.entries
 
 
 def test_dedup_drops_entries_that_free_bytes_before_mostly_shared_ones(denv):

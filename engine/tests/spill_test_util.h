@@ -94,45 +94,32 @@ struct Exported {
   std::vector<std::string> written;  // chunk files this export wrote (the others were already there)
 };
 
-// What Model::spill_write does, in its order: every missing chunk (verified skip when present), then the manifest, then the refs.
-inline bool export_entry(const Entry& e, DiskIndex& idx, const std::string& manifest, Exported* out, std::string* err = nullptr) {
-  std::error_code ec;
-  fs::create_directories(idx.dir(), ec);
-  fs::create_directories(fs::path(manifest).parent_path(), ec);
-  if (ec) {
-    if (err) *err = "cannot create the directories";
-    return false;
-  }
+// Model::spill_write's file sequence (the real function: spill_files.h export_entry_files). cur_path / cur_names: the entry's existing
+// manifest when it is being replaced. false: it threw (err), the index and the files are as the function leaves them.
+inline bool export_entry(const Entry& e, DiskIndex& idx, const std::string& manifest, Exported* out, std::string* err = nullptr,
+                         std::string* cur_path = nullptr, std::vector<std::string>* cur_names = nullptr) {
+  std::string own_path;
+  std::vector<std::string> own_names;
+  std::string& cp = cur_path ? *cur_path : own_path;
+  std::vector<std::string>& cn = cur_names ? *cur_names : own_names;
   const auto chain = chunk_chain(e.fp, int(e.g.chunk_pages), e.ids.data(), e.n_chunks, e.chunk_tokens());
+  std::vector<bool> had;
+  for (const auto& c : chain) had.push_back(idx.find(c.name) && idx.find(c.name)->present);
+  std::vector<HostKv> kvs;
+  for (size_t c = 0; c < e.n_chunks; c++) kvs.push_back(chunk_kv(e, c));
+  HostKv tail = tail_kv(e);
   out->manifest = manifest;
   out->names.clear(), out->written.clear();
-  idx.reserve(e.n_chunks);
-  for (size_t c = 0; c < e.n_chunks; c++) {
-    const std::string& name = chain[c].name;
-    const std::string parent = c ? chain[c - 1].name : "";
-    const int32_t* ids = e.ids.data() + c * e.chunk_tokens();
-    out->names.push_back(name);
-    const DiskIndex::Chunk* have = idx.find(name);
-    if (have && have->present && chunk_file_matches(idx.path(name), e.fp, chain[c], parent, ids, e.chunk_tokens(), e.g)) continue;
-    HostKv kv = chunk_kv(e, c);
-    CPieces pieces;
-    all_pieces(kv, pieces);
-    if (!write_chunk_file(idx.path(name), e.fp, chain[c], parent, ids, e.chunk_tokens(), e.g, pieces, err)) return false;
-    idx.add(name, chunk_file_bytes(e.g, e.chunk_tokens()));
-    out->written.push_back(name);
-  }
-  sync_dir(idx.dir());
-  HostKv tail = tail_kv(e);
-  CPieces tp;
-  all_pieces(tail, tp);
-  ManifestInfo mi;
-  mi.fingerprint = e.fp, mi.g = e.g, mi.ring = e.ring, mi.state_bytes = e.state.size(), mi.tail_bytes = tail.total;
-  if (!write_manifest_file(manifest, mi, e.ids, out->names, e.state.data(), tp, err)) {
-    for (const auto& n : out->written) idx.drop_unreferenced(n);
+  try {
+    export_entry_files(idx, e.fp, e.g, manifest, e.ring, e.ids, e.state.data(), e.state.size(), tail, e.n_chunks,
+                       [&](size_t i) -> const HostKv& { return kvs[i]; }, cp, cn);
+  } catch (const std::exception& ex) {
+    if (err) *err = ex.what();
     return false;
   }
-  sync_dir(fs::path(manifest).parent_path().string());
-  for (const auto& n : out->names) idx.ref(n);
+  out->names = cn;
+  for (size_t i = 0; i < chain.size(); i++)
+    if (!had[i]) out->written.push_back(chain[i].name);
   return true;
 }
 

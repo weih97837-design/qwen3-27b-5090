@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -695,5 +696,113 @@ class DiskIndex {
   std::string dir_;
   std::unordered_map<std::string, Chunk> m_;
 };
+
+// ---------------------------------------------------------------- export / import of an entry (spill.cc's spill_write / spill_import)
+
+// The whole file sequence of Model::spill_write, in the order of spill.cc (N): every missing chunk file (an existing one is VERIFIED
+// before it is skipped; a leftover file nobody lists, e.g. from a crash, is adopted when it is exactly the chunk; a file another manifest
+// lists that is NOT the chunk is never overwritten: it throws), fsync of the chunk directory, THEN the manifest, then the commit: the
+// new disk references first, then the old manifest's (`cur_path` / `cur_names`: the entry's existing manifest, if any; replaced here).
+// kv_of(i) -> const HostKv& (chunk i's bytes). tail: the entry's own KV past its n_chunks full chunks. Throws std::runtime_error with
+// every file this call created that nobody lists removed again; nothing is committed then. After the commit nothing throws.
+template <class KvOf>
+uint64_t export_entry_files(DiskIndex& idx, uint64_t fp, const Geom& g, const std::string& path, bool ring,
+                            const std::vector<int32_t>& ids, const char* state, uint64_t state_bytes, const HostKv& tail,
+                            size_t n_chunks, KvOf&& kv_of, std::string& cur_path, std::vector<std::string>& cur_names) {
+  const size_t ct = size_t(g.chunk_pages) * g.page_tokens;
+  if (n_chunks * ct > ids.size()) throw std::runtime_error("more chunks than tokens");
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(idx.dir(), ec);
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    if (ec) throw std::runtime_error("could not create the cache directories: " + ec.message());
+  }
+  const std::vector<ChunkId> chain = chunk_chain(fp, int(g.chunk_pages), ids.data(), n_chunks, ct);
+  std::vector<std::string> names, fresh;
+  names.reserve(n_chunks), fresh.reserve(n_chunks);
+  idx.reserve(n_chunks);          // (before any file is written)
+  std::string new_path = path;    // (copied now: the commit below must not throw)
+  struct Cleanup {                // a failure removes the chunk files this call wrote that no manifest lists
+    DiskIndex& idx;
+    std::vector<std::string>& fresh;
+    bool armed = true;
+    ~Cleanup() {
+      if (armed)
+        for (const std::string& n : fresh) idx.drop_unreferenced(n);
+    }
+  } cleanup{idx, fresh};
+  for (size_t i = 0; i < n_chunks; i++) {
+    const std::string& name = chain[i].name;
+    const std::string parent = i ? chain[i - 1].name : std::string();
+    const int32_t* cid = ids.data() + i * ct;
+    names.push_back(name);
+    const DiskIndex::Chunk* have = idx.find(name);
+    if ((!have || have->present) && chunk_file_matches(idx.path(name), fp, chain[i], parent, cid, ct, g)) {
+      if (!have) {  // (a file a crash left, with no manifest: adopted)
+        idx.add(name, chunk_file_bytes(g, ct));
+        fresh.push_back(name);
+      }
+      continue;
+    }
+    if (have && have->present && have->refs > 0)  // another entry's manifest lists a file that is not this chunk: never overwritten
+      throw std::runtime_error("a chunk file on the SSD does not match its name: " + name);
+    CPieces pieces;
+    all_pieces(kv_of(i), pieces);
+    std::string err;
+    if (!write_chunk_file(idx.path(name), fp, chain[i], parent, cid, ct, g, pieces, &err)) throw std::runtime_error(err);
+    idx.add(name, chunk_file_bytes(g, ct));
+    fresh.push_back(name);
+  }
+  if (!fresh.empty()) sync_dir(idx.dir());
+  CPieces tp;
+  all_pieces(tail, tp);
+  ManifestInfo mi;
+  mi.fingerprint = fp, mi.g = g, mi.ring = ring, mi.state_bytes = state_bytes, mi.tail_bytes = tail.total;
+  std::string err;
+  if (!write_manifest_file(path, mi, ids, names, state, tp, &err)) throw std::runtime_error(err);
+  sync_dir(std::filesystem::path(path).parent_path().string());
+  std::error_code ec;
+  uint64_t mbytes = std::filesystem::file_size(path, ec);
+  if (ec) mbytes = manifest_file_bytes(state_bytes, tail.total, ids.size(), n_chunks);
+  cleanup.armed = false;
+  // Commit: nothing below throws.
+  for (const std::string& n : names) idx.ref(n);
+  const std::string old_path = std::move(cur_path);
+  const std::vector<std::string> old_names = std::move(cur_names);
+  for (const std::string& n : old_names) idx.unref(n);
+  if (!old_path.empty() && old_path != new_path) std::filesystem::remove(old_path, ec);
+  cur_path = std::move(new_path);
+  cur_names = std::move(names);
+  return mbytes;
+}
+
+// spill_import's checks: the manifest at `path` is structurally sound, was written for this model / KV type (fingerprint, geometry, state
+// size), its tail size fits its token count, its chunk names are the chain of its OWN tokens, and every chunk file it lists is
+// there with exactly the size it must have. `unknown`: the listed files that are not in the index yet (the caller adds them, then
+// refs every name). false: not importable (the caller deletes the manifest).
+inline bool validate_manifest(DiskIndex& idx, const std::string& path, uint64_t fp, const Geom& g, uint64_t state_bytes,
+                              size_t max_ids, ManifestHead& h, std::vector<std::string>& unknown) {
+  if (!read_manifest_head(path, h)) return false;
+  const size_t n_ids = h.ids.size(), nch = h.names.size(), ct = size_t(g.chunk_pages) * g.page_tokens;
+  if (h.info.fingerprint != fp || !(h.info.g == g) || h.info.state_bytes != state_bytes || n_ids > max_ids || nch * ct > n_ids ||
+      g.page_tokens == 0)
+    return false;
+  const size_t npages = (n_ids + g.page_tokens - 1) / g.page_tokens;
+  if (h.info.tail_bytes != uint64_t(npages - nch * g.chunk_pages) * g.slices * g.page_bytes) return false;
+  const std::vector<ChunkId> chain = chunk_chain(fp, int(g.chunk_pages), h.ids.data(), nch, ct);
+  const uint64_t cb = chunk_file_bytes(g, ct);
+  idx.reserve(nch);
+  unknown.clear();
+  for (size_t i = 0; i < nch; i++) {
+    if (chain[i].name != h.names[i]) return false;
+    const DiskIndex::Chunk* c = idx.find(h.names[i]);
+    if (c && c->present) continue;
+    std::error_code ec;
+    const uintmax_t size = std::filesystem::file_size(idx.path(h.names[i]), ec);
+    if (ec || size != cb) return false;
+    unknown.push_back(h.names[i]);
+  }
+  return true;
+}
 
 }  // namespace q27

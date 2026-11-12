@@ -1343,73 +1343,22 @@ void Model::spill_write(Spilled& s, const std::string& path) {
   Q27_CHECK(s.in_ram(), "tiered cache: the entry is not in memory");
   Q27_CHECK(spill_disk_dir(path), "tiered cache: no directory for the chunk files");
   spill_wait(s);  // (3) its D2H copy (and its chunks') must be complete before the bytes are written
-  const Geom g = spill_geom();
-  const uint64_t fp = spill_fingerprint();
-  const size_t nch = s.chunks.size(), ct = size_t(kChunkPages) * kPageTokens;
+  const size_t nch = s.chunks.size();
   const size_t npages = size_t(ceil_div(s.pos(), kPageTokens));
-  Q27_CHECK(nch * kChunkPages <= npages && nch * ct <= s.ids.size() &&
+  Q27_CHECK(nch * kChunkPages <= npages && nch * size_t(kChunkPages) * kPageTokens <= s.ids.size() &&
                 s.kv.total == (npages - nch * kChunkPages) * size_t(kKvSlices) * kv_page_bytes_,
             "tiered cache: the entry's parts do not add up");
-  {
-    std::error_code ec;
-    std::filesystem::create_directories(disk_.dir(), ec);
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    if (ec) throw std::runtime_error("could not create the cache directories: " + ec.message());
+  {  // (M) each RAM chunk is the chunk its position in the entry's token chain names
+    const std::vector<ChunkId> chain =
+        chunk_chain(spill_fingerprint(), kChunkPages, s.ids.data(), nch, size_t(kChunkPages) * kPageTokens);
+    for (size_t i = 0; i < nch; i++)
+      Q27_CHECK(s.chunks[i]->key == chain[i].key, "tiered cache: a chunk's key does not match the entry's tokens");
   }
-  const std::vector<ChunkId> chain = chunk_chain(fp, kChunkPages, s.ids.data(), nch, ct);
-  std::vector<std::string> names, fresh;
-  names.reserve(nch), fresh.reserve(nch);
-  disk_.reserve(nch);                    // (before any file is written: the index nodes below are the only other allocation)
-  std::string new_path = path;           // (copied now: the commit below must not throw)
-  // (N) a failure from here on removes the chunk files this call wrote that no manifest lists.
-  Undo undo_chunks([&] {
-    for (const std::string& n : fresh) disk_.drop_unreferenced(n);
-  });
-  for (size_t i = 0; i < nch; i++) {
-    Q27_CHECK(s.chunks[i]->key == chain[i].key, "tiered cache: a chunk's key does not match the entry's tokens");
-    const std::string& name = chain[i].name;
-    const std::string parent = i ? chain[i - 1].name : std::string();
-    const int32_t* cid = s.ids.data() + i * ct;
-    names.push_back(name);
-    const DiskIndex::Chunk* have = disk_.find(name);
-    const bool matches = (!have || have->present) &&
-                         chunk_file_matches(disk_.path(name), fp, chain[i], parent, cid, ct, g);
-    if (matches) {  // (M) verified, not trusted
-      if (!have) {  // (a file a crash left, with no manifest: adopted)
-        disk_.add(name, chunk_file_bytes(g, ct));
-        fresh.push_back(name);
-      }
-      continue;
-    }
-    if (have && have->present && have->refs > 0)  // another entry's manifest lists a file that is not this chunk: never overwritten
-      throw std::runtime_error("a chunk file on the SSD does not match its name: " + name);
-    CPieces pieces;
-    all_pieces(s.chunks[i]->kv, pieces);
-    std::string err;
-    if (!write_chunk_file(disk_.path(name), fp, chain[i], parent, cid, ct, g, pieces, &err)) throw std::runtime_error(err);
-    disk_.add(name, chunk_file_bytes(g, ct));
-    fresh.push_back(name);
-  }
-  if (!fresh.empty()) sync_dir(disk_.dir());
-  CPieces tail;
-  all_pieces(s.kv, tail);
-  ManifestInfo mi;
-  mi.fingerprint = fp, mi.g = g, mi.ring = s.ring, mi.state_bytes = s.state_bytes, mi.tail_bytes = s.kv.total;
-  std::string err;
-  if (!write_manifest_file(path, mi, s.ids, names, s.state.get(), tail, &err)) throw std::runtime_error(err);
-  sync_dir(std::filesystem::path(path).parent_path().string());
-  std::error_code ec;
-  uint64_t mbytes = std::filesystem::file_size(path, ec);
-  if (ec) mbytes = manifest_file_bytes(s.state_bytes, s.kv.total, s.ids.size(), nch);
-  undo_chunks.dismiss();
-  // Commit: nothing below throws. The new references first, then the old manifest's (a shared chunk never reaches 0 in between).
-  for (const std::string& n : names) disk_.ref(n);
-  const std::string old_path = std::move(s.path);
-  const std::vector<std::string> old_names = std::move(s.dnames);
-  for (const std::string& n : old_names) disk_.unref(n);
-  if (!old_path.empty() && old_path != new_path) std::filesystem::remove(old_path, ec);
-  s.path = std::move(new_path);
-  s.dnames = std::move(names);
+  // (N) the chunk files, the manifest, the references: spill_files.h export_entry_files (tested on the host, tests/test_spill_files.cc).
+  // A throw leaves the entry as it was (its memory, its old manifest) and removes the chunk files it wrote that nobody lists.
+  const uint64_t mbytes = export_entry_files(
+      disk_, spill_fingerprint(), spill_geom(), path, s.ring, s.ids, s.state.get(), s.state_bytes, s.kv, nch,
+      [&](size_t i) -> const HostKv& { return s.chunks[i]->kv; }, s.path, s.dnames);
   s.manifest_bytes = mbytes;
   spill_release_mem(s, false);  // (its chunk references too: a chunk nobody else lists is freed)
   sstats_.written++;
@@ -1509,37 +1458,20 @@ uint64_t Model::spill_import(const std::string& path) {
     if (kv.second.path == path) return 0;  // (already indexed)
   if (!spill_disk_dir(path)) return 0;
   ManifestHead h;
-  if (!read_manifest_head(path, h)) return 0;
-  const Geom g = spill_geom();
-  const size_t n_ids = h.ids.size(), nch = h.names.size(), ct = size_t(kChunkPages) * kPageTokens;
-  if (h.info.fingerprint != spill_fingerprint() || !(h.info.g == g) || h.info.state_bytes != ckpt_bytes_ ||
-      n_ids > size_t(opt_.max_tokens) + 64 || nch * ct > n_ids)
-    return 0;
-  const size_t npages = size_t(ceil_div(n_ids, kPageTokens));
-  if (h.info.tail_bytes != (npages - nch * kChunkPages) * size_t(kKvSlices) * kv_page_bytes_) return 0;
-  // The names must be the chain of its own tokens (M), and each chunk file must be there with exactly the size it should have.
-  const std::vector<ChunkId> chain = chunk_chain(spill_fingerprint(), kChunkPages, h.ids.data(), nch, ct);
-  const uint64_t cb = chunk_file_bytes(g, ct);
-  disk_.reserve(nch);
   std::vector<std::string> unknown;  // (listed, present on disk, not in the index yet)
-  for (size_t i = 0; i < nch; i++) {
-    if (chain[i].name != h.names[i]) return 0;
-    const DiskIndex::Chunk* c = disk_.find(h.names[i]);
-    if (c && c->present) continue;
-    std::error_code ec;
-    const uintmax_t size = std::filesystem::file_size(disk_.path(h.names[i]), ec);
-    if (ec || size != cb) return 0;
-    unknown.push_back(h.names[i]);
-  }
+  if (!validate_manifest(disk_, path, spill_fingerprint(), spill_geom(), ckpt_bytes_, size_t(opt_.max_tokens) + 64, h, unknown))
+    return 0;
+  const size_t npages = size_t(ceil_div(h.ids.size(), kPageTokens));
   Spilled s;
   s.ids = std::move(h.ids);
-  s.kv_bytes = size_t(npages) * kKvSlices * kv_page_bytes_;
+  s.kv_bytes = npages * kKvSlices * kv_page_bytes_;
   s.state_bytes = h.info.state_bytes;
   s.ring = h.info.ring;
   s.path = path;
   s.dnames = h.names;
   s.manifest_bytes = h.file_bytes;
   s.last_use = 0;  // (older than anything this run used)
+  const uint64_t cb = chunk_file_bytes(spill_geom(), size_t(kChunkPages) * kPageTokens);
   for (const std::string& n : unknown) disk_.add(n, cb);  // (may throw: nothing references them yet, the sweep deletes strays)
   const uint64_t id = spill_next_;
   spill_.emplace(id, std::move(s));  // (the last step that can throw)
