@@ -288,7 +288,7 @@ convolution, the draft's context ring: 189.6 MiB).
   holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
   one, every `CHECKPOINT_INTERVAL` (4,096) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
-- **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 8 GiB = 43 checkpoints). Saving copies the
+- **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 8 GiB = about 42 checkpoints). Saving copies the
   state to one staging buffer on the GPU and then to the host on a copy stream; restoring copies from the host
   (4 to 6 ms). Eviction is LRU, and the KV pool also reclaims pages from the least recently used checkpoints.
 - **Lookup** is a linear scan with `memcmp` over the token sequences; there are at most a few dozen checkpoints.

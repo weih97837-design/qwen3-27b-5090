@@ -45,6 +45,7 @@ SIGNATURES = {
     "q27_spill_import": ([P, ctypes.c_char_p, P], I),
     "q27_spill_stats": ([P, P, I], I),
     "q27_spill_backup_one": ([P, P], I),
+    "q27_spill_backup_next": ([P, I, P], I),
     "q27_spill_grow_pinned": ([P, I, P], I),
     "q27_spill_match": ([P, P, I, I, P, P], I),
     "q27_spill_restore_begin": ([P, ctypes.c_uint64, P], I),
@@ -377,6 +378,8 @@ class Engine:
         """Plans one more checkpoint at pos (rounded down to 64) in a sequence that is already prefilling: the running one
         (area -1) or the one parked in `area`. False when the engine cannot (too near its position or another
         checkpoint, no prefix cache): nothing is saved there then."""
+        if not hasattr(lib(), "q27_add_checkpoint_at"):  # (an older library)
+            return False
         ok = ctypes.c_int()
         self._check(lib().q27_add_checkpoint_at(self.h, area, pos, ctypes.byref(ok)), "q27_add_checkpoint_at")
         return bool(ok.value)
@@ -442,11 +445,16 @@ class Engine:
                         "path": f[6] if len(f) > 6 else ""})
         return out
 
-    def spill_backup_one(self):
-        """Copies the least recently used checkpoint of the pool to host memory; it stays in the pool. True when one was
+    def spill_backup_one(self, victims=0):
+        """Copies a checkpoint of the pool to host memory; it stays in the pool. victims > 0: one of the next `victims`
+        the pool would evict (the idle backup; its copies also stay within half the RAM cap; an older library copies the
+        least recently used one), 0: the least recently used one without a copy (the stop flush). True when one was
         copied, False when none needed it (call again until False while idle)."""
         out = ctypes.c_int()
-        self._check(lib().q27_spill_backup_one(self.h, ctypes.byref(out)), "q27_spill_backup_one")
+        if victims > 0 and hasattr(lib(), "q27_spill_backup_next"):
+            self._check(lib().q27_spill_backup_next(self.h, victims, ctypes.byref(out)), "q27_spill_backup_next")
+        else:
+            self._check(lib().q27_spill_backup_one(self.h, ctypes.byref(out)), "q27_spill_backup_one")
         return bool(out.value)
 
     def spill_grow_pinned(self, n=1):

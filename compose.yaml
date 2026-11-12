@@ -95,6 +95,7 @@ services:
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # files not reused for this many days are deleted
       SPILL_TICK_S: ${SPILL_TICK_S:-30}            # seconds between the tier maintenance passes
       VRAM_BACKUP_IDLE_S: ${VRAM_BACKUP_IDLE_S:-60}  # idle seconds before VRAM checkpoints are copied to RAM, kept in VRAM (0: off)
+      VRAM_BACKUP_VICTIMS: ${VRAM_BACKUP_VICTIMS:-8}  # the idle backup copies only the next N checkpoints the pool would evict (0: any)
       SPILL_FLUSH_ON_STOP_S: ${SPILL_FLUSH_ON_STOP_S:-8}  # seconds a stop may spend backing up and writing RAM entries to SSD (0: off; at most 8)
       VISION: ${VISION:-host}                      # off | host | fp8 | bf16: image input (P4-12)
       IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-4194304}  # images are resized to at most this many pixels

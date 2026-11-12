@@ -426,6 +426,7 @@ function tile(label, value, note, meter, meterColor) {
   t.append(el("div", { class: "note" }, note || " "));
   return t;
 }
+const n0 = (v) => v == null ? "–" : Number(v).toLocaleString();
 function drawTiles() {
   const s = state.history[state.history.length - 1] || {}, tk = state.tick, v = tk?.vram, c = tk?.cache, sch = tk?.sched;
   const fresh = s.t && Date.now() / 1000 - s.t < 5;
@@ -445,6 +446,14 @@ function drawTiles() {
     tile("Requests", sch ? `${sch.running} running` : "–", sch ? `${sch.waiting} waiting · target ${sch.target_seqs}${sch.blocked ? " · blocked: " + sch.blocked : ""}` : ""),
     tile("Prefix cache hit", fmtPct(hit), c ? `${fmtTok(c.cached_tokens)} of ${fmtTok(c.prompt_tokens)} tokens` : "", hit),
   ];
+  // Turn 2+: only requests that had something to reuse (cached / reusable); diverged: they left their best earlier sequence
+  // before its end (the worker log has the text around that token).
+  const px = tk?.prefix;
+  if (px) tiles.push(
+    tile("Turn 2+ hit", fmtPct(px.turn2_hit), `${n0(px.turn2_requests)} requests · ${n0(px.diverged)} diverged`, px.turn2_hit),
+    tile("Checkpoint slots", px.slots != null ? `${n0(px.checkpoints)} / ${n0(px.slots)}` : n0(px.checkpoints),
+      `${n0(px.evicted)} evictions` + (px.slots_allocated != null ? ` · ${n0(px.slots_allocated)} allocated` : ""),
+      px.slots ? (px.checkpoints || 0) / px.slots : null));
   $("tiles").replaceChildren(...tiles);
 }
 
@@ -587,7 +596,8 @@ function logRow(e) {
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
   const cells = r ? [
     el("td", { class: "r" }, fmtTok(r.prompt_tokens)),
-    el("td", { class: "r" }, `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})`),
+    el("td", { class: "r", title: r.diverged_at != null ? `diverges from an earlier sequence at token ${r.diverged_at}` : "" },
+      `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})` + (r.diverged_at != null ? " ≠" : "")),
     el("td", { class: "r" }, fmtTok(r.completion_tokens)),
     el("td", { class: "r" }, fmtS(r.ttft)),
     el("td", { class: "r" }, r.prefill_tps ? fmtRate(r.prefill_tps) : "–"),
@@ -619,7 +629,8 @@ function drawLog() {
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
   const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);
-  $("log-sum").textContent = done.length ? `${done.length} requests · cache hit ${fmtPct(p ? c / p : null)} of prompt tokens` : "";
+  const div = done.filter((e) => e.rec.diverged_at != null).length;
+  $("log-sum").textContent = done.length ? `${done.length} requests · cache hit ${fmtPct(p ? c / p : null)} of prompt tokens` + (div ? ` · ${div} diverged from an earlier sequence` : "") : "";
 }
 for (const id of ["f-req", "f-sub", "f-ev"]) $(id).addEventListener("change", drawLog);
 
@@ -716,8 +727,11 @@ function drawTiers() {
   sum.textContent = `RAM ${t.in_ram ?? "–"} 筆 · SSD ${t.on_disk ?? "–"} 筆`;
   const n = (v) => v == null ? "–" : Number(v).toLocaleString();
   const cols = [];  // a bar only when its used bytes are known; a null cap shows as "X / –"
-  if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 筆在 RAM`));
-  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}`));
+  // entries and bytes per tier, of which live backups (copies of checkpoints the VRAM pool still holds) and evicted ones
+  const split = (p) => t[p + "_evicted_entries"] == null ? "" :
+    ` · 被逐出 ${n(t[p + "_evicted_entries"])} 筆 ${fmtGiB(t[p + "_evicted_bytes"])} · 備份 ${n(t[p + "_backup_entries"])} 筆 ${fmtGiB(t[p + "_backup_bytes"])}`;
+  if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 筆在 RAM` + split("ram")));
+  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
   if (cols.length) kids.push(el("div", { class: "tiers-grid" }, ...cols));
   kids.push(el("div", { class: "kv", style: "margin-top:12px" },
     ...TIER_COUNTERS.map(([label, key]) => el("div", {},

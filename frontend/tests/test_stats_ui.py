@@ -272,3 +272,76 @@ def test_hub_tick_without_snapshot():
     tick = stats.Hub().tick()
     assert tick["slots"] == [] and tick["tiers"] is None
     json.dumps(tick)
+
+
+# ------------------------------------------------------------ prefix cache block, hit rates, divergence
+
+def test_prefix_block_rates_slots_and_evictions():
+    snap = {"cache": {"checkpoints": 7, "evicted": 3, "slots_allocated": 9},
+            "hits": {"requests": 10, "prompt_tokens": 1000, "cached_tokens": 600, "turn2_requests": 4,
+                     "turn2_reusable_tokens": 500, "turn2_cached_tokens": 400, "diverged": 2}}
+    out = stats.prefix_block(snap, {"slots": 43})
+    assert out == {"checkpoints": 7, "slots": 43, "slots_allocated": 9, "evicted": 3, "requests": 10, "hit": 0.6,
+                   "turn2_requests": 4, "turn2_hit": 0.8, "diverged": 2}
+    empty = stats.prefix_block({"cache": {}, "hits": {}}, None)
+    assert empty["hit"] is None and empty["turn2_hit"] is None and empty["slots"] is None
+    assert stats.prefix_block(None, None) is None
+
+
+def test_tiers_block_has_the_split_keys(tmp_path):
+    class Tiers(FakeTiers):
+        def status(self):
+            return dict(super().status(), ram_backup_entries=1, ram_backup_bytes=10, ram_evicted_entries=2,
+                        ram_evicted_bytes=20)
+
+    out = stats.tiers_block(FakeEngine(), Tiers(tmp_path), environ={})
+    assert out["ram_backup_entries"] == 1 and out["ram_evicted_bytes"] == 20 and out["disk_evicted_entries"] == 0
+
+
+def test_scheduler_hit_counters_and_divergence_reach_the_tick():
+    now = time.time()
+    sched = make_sched(StubEngine(), FakeTiers(None), [], [], cur=None)
+    sched.m.update({"q27:requests_total": 3, "q27:prompt_tokens_total": 300, "q27:cached_tokens_total": 150,
+                    "q27:turn2_requests_total": 2, "q27:turn2_reusable_tokens_total": 200,
+                    "q27:turn2_cached_tokens_total": 100, "q27:prefix_diverged_total": 1})
+    snap = sched.stats()
+    assert snap["hits"]["turn2_requests"] == 2 and snap["hits"]["diverged"] == 1
+    px = stats.prefix_block(snap, {"slots": 43})
+    assert px["hit"] == 0.5 and px["turn2_hit"] == 0.5 and px["diverged"] == 1 and px["slots"] == 43
+    hub = stats.Hub()
+    hub.set_snapshot(snap)
+    assert hub.tick()["prefix"]["hit"] == 0.5 and hub.tick()["prefix"]["slots"] is None  # (no memory report yet)
+    json.dumps(snap)
+
+
+def test_divergence_finds_where_the_prompt_leaves_the_best_history():
+    import array
+    sched = make_sched(StubEngine(), None, [], [], cur=None)
+    sched.history = collections.deque(maxlen=64)
+    sched.history.append(array.array("i", [1, 2, 3, 4, 5, 6]).tobytes())
+    sched.history.append(array.array("i", [1, 2, 3, 9, 9, 9, 9]).tobytes())
+    n, h = sched.best_history([1, 2, 3, 4, 7, 8, 9])
+    assert n == 4 and len(h) // 4 == 6  # (the longer common prefix wins)
+    s = seq("x", 0)
+    s.prompt = [1, 2, 3, 4, 7, 8, 9]
+    s.best = (n, h)
+    assert sched.divergence(s) == (4, h)
+    s.prompt = [1, 2, 3, 4, 5, 6, 7, 8]  # extends the history: no divergence
+    s.best = sched.best_history(s.prompt)
+    assert sched.divergence(s) is None
+    assert sched.reusable([1, 2, 3, 4, 5, 6]) == 5  # (the last token always runs)
+    assert sched.best_history([42]) == (0, None)
+
+
+def test_text_around_decodes_a_window_escapes_newlines_and_never_raises():
+    class Tok:
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(65 + i % 26) if i != 10 else "\n" for i in ids)
+
+    sched = make_sched(StubEngine(), None, [], [], cur=None)
+    sched.dec_tok = Tok()
+    before, after = sched.text_around(list(range(100)), 50)
+    assert len(before) == 16 and len(after) == 16
+    assert "\\n" in sched.text_around(list(range(100)), 12)[0] and "\n" not in sched.text_around(list(range(100)), 12)[0]
+    sched.dec_tok = None  # (no cfg: the tokenizer cannot be made)
+    assert sched.text_around([1, 2, 3], 1)[0].startswith("?(")

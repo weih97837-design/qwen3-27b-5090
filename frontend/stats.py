@@ -179,6 +179,28 @@ def _gbps(nbytes, ms):
     return nbytes / (ms / 1000.0) / 1e9 if nbytes and ms and ms > 0 else None
 
 
+TIER_SPLIT_KEYS = tuple(f"{t}_{k}_{u}" for t in ("ram", "disk") for k in ("backup", "evicted") for u in ("entries", "bytes"))
+
+
+def prefix_block(snap, memory):
+    """The prefix cache for the UI: state checkpoint slots, evictions, and the hit rates: overall (cached / prompt tokens
+    of all requests) and turn 2+ (requests with something reusable: cached / reusable), with the number of requests that
+    left their best earlier sequence before its end (worker.Scheduler.divergence). None before the first snapshot."""
+    if not snap:
+        return None
+    c, h = snap.get("cache") or {}, snap.get("hits") or {}
+
+    def rate(a, b):
+        return a / b if b else None
+
+    return {"checkpoints": c.get("checkpoints"), "slots": memory["slots"] if memory else None,
+            "slots_allocated": c.get("slots_allocated"), "evicted": c.get("evicted"),
+            "requests": h.get("requests", 0), "hit": rate(h.get("cached_tokens", 0), h.get("prompt_tokens", 0)),
+            "turn2_requests": h.get("turn2_requests", 0),
+            "turn2_hit": rate(h.get("turn2_cached_tokens", 0), h.get("turn2_reusable_tokens", 0)),
+            "diverged": h.get("diverged", 0)}
+
+
 def tiers_block(engine, tiers, environ=None):
     """The tiered cache for the UI (None without a tier policy): the engine's spill counters, the policy's SSD use and
     the disk. Never raises: a failure is {"error": text}."""
@@ -206,6 +228,8 @@ def tiers_block(engine, tiers, environ=None):
                 "restore_gbps": _gbps(sp.get("restore_bytes_total", 0), sp.get("restore_ms_total", 0)),
                 "pinned_bytes": sp.get("pinned_bytes", 0),
                 "pinned_used": sp.get("pinned_used", 0), "backup_entries": ts.get("backup_entries", 0),
+                # per tier: entries and bytes, split into live backups (copies of checkpoints still in VRAM) and evicted ones
+                **{k: ts.get(k, 0) for k in TIER_SPLIT_KEYS},
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
                 "dir": str(directory) if directory else None}
@@ -517,6 +541,7 @@ class Hub:
                     "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None,
                     "slots": snap.get("slots", []) if snap else [],
                     "tiers": snap.get("tiers") if snap else None,
+                    "prefix": prefix_block(snap, self.memory),
                     "host": host_info(self.started),
                     "deploy": deploy_info(self.started, self.engine_state, self.deploy_environ())}
 

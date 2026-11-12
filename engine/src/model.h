@@ -179,7 +179,7 @@ class Model {
   // Idle backup: copies the least recently used pool checkpoint that has no valid backup to host memory and keeps it
   // in the pool too. Its eviction then only marks the copy as the sole one (no copy stall). 1: one was copied, 0: none
   // needed it (or no tiered cache). Called by the frontend while the engine is idle, repeatedly until 0.
-  int spill_backup_one();
+  int spill_backup_one(int victims = 0);
   // SPILL_ASYNC_PROMOTE (Options::spill_async_promote; delay-hit scheduling: the frontend admits other requests while
   // an entry loads). All three run on the engine thread between steps and never block on the GPU or the disk.
   // spill_match: the best spilled entry (not an idle backup) deeper than the pool's best visible match, by spill_lookup's
@@ -277,7 +277,7 @@ class Model {
   void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
-  bool evict_checkpoint();           // the least recently used one; false when there is none
+  bool evict_checkpoint(bool for_slot = false);           // the least recently used one (for_slot: a covered one first); false when there is none
   // Tiered cache (spill.cc).
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
@@ -388,6 +388,7 @@ class Model {
   std::vector<int32_t> seq_ids_;     // tokens fed so far (== pos_ once nothing is pending)
   int32_t spec_last_ = -1;           // last token returned by spec_begin / spec_step (fed by the next step)
   bool ring_valid_ = false;          // the draft's context ring holds the last 2,048 positions
+  int ring_from_ = 0;                // prefill with a draft: the context rows from this position on were all appended (earlier chunks skip those a window before the next checkpoint)
   size_t kv_page_bytes_ = 0;         // one page of one layer's K (or V)
   // The KV pool is block-major (P7-13): pages come in blocks of kv_block_; a block holds the K and V slices
   // (kKvSlices: layer l's K is slice 2 l, its V 2 l + 1) of its pages, slice by slice, each slice the block's
@@ -484,6 +485,7 @@ class Model {
     std::vector<MmSpan> mm;
     int32_t spec_last = -1;
     bool ring_valid = false;
+    int ring_from = 0;
     SpecSampling smp{};
     int32_t scalars[kSeqScalars] = {};
   };

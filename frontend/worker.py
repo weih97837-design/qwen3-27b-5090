@@ -140,6 +140,8 @@ class Seq:
         self.at = []             # checkpoint positions of the prompt
         self.cached = None       # tokens restored by the first prefix_begin
         self.reusable = 0
+        self.best = (0, None)    # (longest common prefix with a recent prompt + output, that history entry)
+        self.diverged_at = None  # where the prompt left that entry although both go on (Scheduler.divergence)
         self.last_run = 0.0
         self.first_token = None
         self.preempted = 0
@@ -175,6 +177,7 @@ class Seq:
 class Scheduler:
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
+    dec_tok = None  # the plain tokenizer of the divergence log (made with the first divergence)
     last_active = 0.0
     backup_done = False
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
@@ -302,12 +305,14 @@ class Scheduler:
         return min(STATS_IDLE, max(0.0, self.tiers.backup_idle_s - (time.monotonic() - self.last_active)))
 
     def backup_one(self):
-        """One idle backup: the least recently used VRAM checkpoint without a RAM copy is copied to RAM, and stays in
-        VRAM. False when there is nothing left or it failed; the backup then waits for the next activity."""
+        """One idle backup: one of the next VRAM_BACKUP_VICTIMS checkpoints the pool would evict, if it has no RAM copy, is
+        copied to RAM, and stays in VRAM (the checkpoints that are not about to leave are not copied: the RAM tier
+        keeps its room for what the pool really gives up). False when there is nothing left or it failed; the backup
+        then waits for the next activity."""
         try:
-            if self.engine.spill_backup_one():
+            if self.engine.spill_backup_one(self.tiers.backup_victims):
                 return True
-            log("idle backup: every checkpoint is backed up")
+            log("idle backup: the checkpoints next to be evicted are backed up")
         except Exception as e:  # noqa: BLE001 - the backup must not stop the engine
             log(f"idle backup: {e}")
         self.backup_done = True
@@ -342,7 +347,8 @@ class Scheduler:
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
-        s.reusable = self.reusable(s.prompt)
+        s.best = self.best_history(s.prompt)  # (and where it diverges: the log in begin)
+        s.reusable = max(0, min(s.best[0], len(s.prompt) - 1))
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
@@ -729,11 +735,11 @@ class Scheduler:
 
     # ------------------------------------------------------------ prefix cache helpers
 
-    def reusable(self, prompt):
-        """Tokens of the prompt an ideal prefix cache could reuse: the longest common prefix with a recent
-        prompt + output (the rest is new to the server). cached / reusable measures the cache itself."""
+    def best_history(self, prompt):
+        """(n, h): the longest common prefix n (tokens, not capped) of the prompt with a recent prompt + output, and
+        that history entry h (int32 bytes); (0, None) when none shares a token."""
         p = array.array("i", prompt).tobytes()
-        best = 0
+        best, best_h = 0, None
         for h in self.history:
             lo, hi = best, min(len(p), len(h)) // 4  # binary search on memcmp'd slices
             if p[:4 * lo] != h[:4 * lo]:
@@ -741,8 +747,36 @@ class Scheduler:
             while lo < hi:
                 mid = (lo + hi + 1) // 2
                 lo, hi = (mid, hi) if p[4 * lo:4 * mid] == h[4 * lo:4 * mid] else (lo, mid - 1)
-            best = lo
-        return max(0, min(best, len(prompt) - 1))  # (the engine always runs the last prompt token)
+            if lo > best or best_h is None:
+                best, best_h = lo, h
+        return (best, best_h) if best > 0 else (0, None)
+
+    def reusable(self, prompt):
+        """Tokens of the prompt an ideal prefix cache could reuse: the longest common prefix with a recent
+        prompt + output (the rest is new to the server). cached / reusable measures the cache itself."""
+        return max(0, min(self.best_history(prompt)[0], len(prompt) - 1))  # (the engine always runs the last prompt token)
+
+    def divergence(self, s):
+        """Where s's prompt leaves the best earlier prompt + output although both go on (a re-rendered answer, an edited
+        message, a changed system prompt: the cache cannot reuse past it): (index, history entry), else None. A
+        prompt that only extends the history is no divergence."""
+        n, h = s.best
+        if h is None or n >= min(len(s.prompt), len(h) // 4):
+            return None
+        return n, h
+
+    def text_around(self, ids, i):
+        """The decoded text of the ~16 tokens before and after index i of ids (newlines escaped, truncated), for the
+        divergence log; the tokenizer loads with the first use. Never raises."""
+        try:
+            if self.dec_tok is None:
+                from tokenizers import Tokenizer
+
+                self.dec_tok = Tokenizer.from_file(self.cfg["tokenizer"])
+            f = lambda part: self.dec_tok.decode(list(part), skip_special_tokens=False)[:160].replace("\n", "\\n")  # noqa: E731
+            return f(ids[max(0, i - 16):i]), f(ids[i:i + 16])
+        except Exception as e:  # noqa: BLE001 - a diagnostic must not stop a request
+            return f"?({type(e).__name__})", ""
 
     def checkpoints(self, prompt, reusable):
         """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
@@ -927,8 +961,23 @@ class Scheduler:
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.m["q27:reusable_tokens_total"] += s.reusable
+            if s.reusable > 0:  # (a continuing conversation: what the cache itself can be judged by)
+                self.m["q27:turn2_requests_total"] += 1
+                self.m["q27:turn2_reusable_tokens_total"] += s.reusable
+                self.m["q27:turn2_cached_tokens_total"] += min(cached, s.reusable)
             log(f"{s.rid}: prompt {len(s.prompt)} tokens, cached {cached} of {s.reusable} reusable, "
                 f"waited {time.time() - s.arrival:.2f} s, checkpoints at {s.at}")
+            if (div := self.divergence(s)) is not None:
+                # Why a continuing conversation missed the cache: the first token that differs from the best earlier
+                # prompt + output, with the text around it (usually a re-rendered answer or an edited message).
+                s.diverged_at = i = div[0]
+                self.m["q27:prefix_diverged_total"] += 1
+                old_ids = array.array("i")
+                old_ids.frombytes(div[1][4 * max(0, i - 16):4 * (i + 16)])
+                before, new_after = self.text_around(s.prompt, i)
+                _, old_after = self.text_around(list(old_ids), min(i, 16))
+                log(f"{s.rid}: diverges from its best earlier sequence at token {i} (prompt {len(s.prompt)}, history "
+                    f"{len(div[1]) // 4}); before: {before!r}; history after: {old_after!r}; prompt after: {new_after!r}")
             self.send("start", s.rid, {"cached": cached})
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
@@ -1202,7 +1251,8 @@ class Scheduler:
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
                 "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
-                "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted}
+                "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
+                "diverged_at": s.diverged_at}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -1270,7 +1320,13 @@ class Scheduler:
                 "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
                 "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
                 "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
-                "tiers": tiers_block(self.engine, getattr(self, "tiers", None))}
+                "tiers": tiers_block(self.engine, getattr(self, "tiers", None)),
+                "hits": {"requests": self.m["q27:requests_total"], "prompt_tokens": self.m["q27:prompt_tokens_total"],
+                         "cached_tokens": self.m["q27:cached_tokens_total"],
+                         "turn2_requests": self.m["q27:turn2_requests_total"],
+                         "turn2_reusable_tokens": self.m["q27:turn2_reusable_tokens_total"],
+                         "turn2_cached_tokens": self.m["q27:turn2_cached_tokens_total"],
+                         "diverged": self.m["q27:prefix_diverged_total"]}}
 
 
 def allows(m, t, eos):

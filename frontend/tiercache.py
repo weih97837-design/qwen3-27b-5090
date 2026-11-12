@@ -68,7 +68,8 @@ def _unlink(path):
 
 class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=100, ssd_min_free_gib=10, ttl_days=7,
-                 tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8):
+                 tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
+                 backup_victims=8):
         self.engine = engine
         self.directory = Path(directory) if directory else None  # None: no SSD tier
         self.ram_retention_s = float(ram_retention_s)
@@ -78,6 +79,7 @@ class TierPolicy:
         self.tick_s = float(tick_s)
         self.backup_idle_s = float(backup_idle_s)      # idle seconds before a VRAM checkpoint is backed up (0: off)
         self.flush_on_stop_s = float(flush_on_stop_s)  # the time a stop may spend writing (0: off)
+        self.backup_victims = int(backup_victims)      # the idle backup copies only one of the next N checkpoints the pool would evict (0: any)
         self.clock = clock
         self.disk_free = disk_free or (lambda d: shutil.disk_usage(d).free)
         self.log = log
@@ -101,7 +103,8 @@ class TierPolicy:
                                   ("SPILL_TTL_DAYS", "ttl_days", 7),
                                   ("SPILL_TICK_S", "tick_s", 30),
                                   ("VRAM_BACKUP_IDLE_S", "backup_idle_s", 60),
-                                  ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8)):
+                                  ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8),
+                                  ("VRAM_BACKUP_VICTIMS", "backup_victims", 8)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
@@ -323,7 +326,15 @@ class TierPolicy:
         """For the metrics, from the last look at the engine's list (no engine call)."""
         disk = [e for e in self.listed if e["on_disk"]]
         ram = [e for e in self.listed if e["ram_bytes"] > 0]
+        sizes = {id(e): _size(e["path"]) for e in disk}
+        # Per tier: entries and bytes, and how many of them are live backups (copies of checkpoints the VRAM pool still
+        # holds) rather than evicted ones (their only copy).
+        split = {}
+        for tier, entries, size in (("ram", ram, lambda e: e["ram_bytes"]), ("disk", disk, lambda e: sizes[id(e)])):
+            for kind, sel in (("backup", True), ("evicted", False)):
+                part = [e for e in entries if bool(e.get("backup")) == sel]
+                split[f"{tier}_{kind}_entries"], split[f"{tier}_{kind}_bytes"] = len(part), sum(size(e) for e in part)
         return {"ram_entries": len(ram), "ram_bytes": sum(e["ram_bytes"] for e in ram),
-                "disk_entries": len(disk), "ssd_bytes": sum(_size(e["path"]) for e in disk),
-                "backup_entries": sum(1 for e in self.listed if e.get("backup")),
+                "disk_entries": len(disk), "ssd_bytes": sum(sizes.values()),
+                "backup_entries": sum(1 for e in self.listed if e.get("backup")), **split,
                 "ssd_budget_bytes": int(self.budget), "last_error": self.last_error}

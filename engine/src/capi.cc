@@ -439,7 +439,12 @@ int q27_spill_grow_pinned(void* m, int n, int* added) {
 
 // *done: 1 when a checkpoint was copied to host memory (it stays in the pool), 0 when none needed a copy.
 int q27_spill_backup_one(void* m, int* done) {
-  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(); });
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(0); });
+}
+// The idle backup: only one of the next `victims` checkpoints the pool would evict (and within half the RAM cap).
+// (A new export, so that the frontend can tell an older library, which has only q27_spill_backup_one.)
+int q27_spill_backup_next(void* m, int victims, int* done) {
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(victims); });
 }
 
 // out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.
