@@ -202,7 +202,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   int pool_tokens = opt.kv_pool_tokens;
   if (opt.fit_max_tokens && pool_tokens > 0) {
     const int room = left_pages - park_all - kv_block_;
-    if (ceil_div(pool_tokens, kPageTokens) > room) {
+    if (std::max<int64_t>(max_pages_, ceil_div(pool_tokens, kPageTokens)) > room) {  // (the pool holds max_tokens at least)
       const int fit = std::max(0, room) * kPageTokens / 1024 * 1024;
       if (fit < opt.prefill_chunk) fail("not enough VRAM: the VRAM budget leaves no room for KV_POOL_TOKENS (MAX_TOKENS_FIT)");
       log("KV_POOL_TOKENS %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.kv_pool_tokens, fit);
