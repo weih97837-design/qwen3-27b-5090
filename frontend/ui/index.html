@@ -749,7 +749,7 @@ function drawTiers() {
 
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
-  "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
+  "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
   "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
@@ -843,6 +843,7 @@ const TIER_OPTS = [
   { key: "spill_ram_retention_s", label: "RAM retention", note: "SPILL_RAM_RETENTION_S", help: "Idle seconds before a checkpoint in RAM is written to SSD.", kind: "num", unit: "s", step: "60" },
   { key: "spill_ssd_gib", label: "SSD cap", note: "SPILL_SSD_GIB", help: "Most the SSD tier holds; the oldest files go first.", kind: "num", unit: "GiB", step: "10" },
   { key: "spill_ssd_min_free_gib", label: "SSD min free", note: "SPILL_SSD_MIN_FREE_GIB", help: "Never fill the disk below this much free space.", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_ssd_min_tokens", label: "SSD min tokens", note: "SPILL_SSD_MIN_TOKENS", help: "Checkpoints shorter than this are dropped, not written to SSD (they recompute as fast as they read). 0 writes all.", kind: "num", unit: "tokens", step: "1024" },
   { key: "spill_ttl_days", label: "File TTL", note: "SPILL_TTL_DAYS", help: "Files not reused for this many days are deleted.", kind: "num", unit: "days", step: "1" },
   { key: "vram_backup_idle_s", label: "VRAM backup idle", note: "VRAM_BACKUP_IDLE_S", help: "Idle seconds before VRAM checkpoints are also copied to RAM (they stay in VRAM). 0 is off.", kind: "num", unit: "s", step: "10" },
   { key: "spill_pinned_gib", label: "Pinned RAM", note: "SPILL_PINNED_GIB", help: "Pinned host memory for faster copies; counts against shared GPU memory on Windows. 0 is off.", kind: "num", unit: "GiB", step: "1" },

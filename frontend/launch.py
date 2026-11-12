@@ -47,6 +47,7 @@ TIER_SETTINGS = {
     "spill_ram_retention_s": ("SPILL_RAM_RETENTION_S", 3600, "num"),
     "spill_ssd_gib": ("SPILL_SSD_GIB", 100, "num"),
     "spill_ssd_min_free_gib": ("SPILL_SSD_MIN_FREE_GIB", 10, "num"),
+    "spill_ssd_min_tokens": ("SPILL_SSD_MIN_TOKENS", 8192, "num"),  # shorter spilled entries are never written to the SSD
     "spill_ttl_days": ("SPILL_TTL_DAYS", 7, "num"),
     "vram_backup_idle_s": ("VRAM_BACKUP_IDLE_S", 60, "num"),
     "spill_pinned_gib": ("SPILL_PINNED_GIB", 0, "num"),
@@ -54,6 +55,7 @@ TIER_SETTINGS = {
     "spill_async_promote": ("SPILL_ASYNC_PROMOTE", False, "flag"),
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
 }
+TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down
 TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
@@ -113,7 +115,7 @@ def parse_tier(key, text, warn=None):
     try:
         v = float(text)
         if math.isfinite(v) and v >= 0:
-            return tier_number(v)
+            return int(v) if key in TIER_INTEGER else tier_number(v)
     except ValueError:
         pass
     (warn or (lambda m: print(m, file=sys.stderr, flush=True)))(f"{var}={text!r} is not a number of 0 or more: using {default}")
@@ -231,6 +233,8 @@ class Launch:
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                     raise ValueError(f"{k}: a number, 0 or more")
                 s[k] = tier_number(v)
+                if k in TIER_INTEGER:
+                    s[k] = int(s[k])  # (a count: a fraction is rounded down)
             elif kind == "flag":
                 if not isinstance(v, bool):
                     raise ValueError(f"{k}: true or false")

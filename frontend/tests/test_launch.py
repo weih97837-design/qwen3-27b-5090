@@ -294,6 +294,21 @@ def test_tier_validate():
             lc.validate(bad)
 
 
+def test_ssd_min_tokens_setting():
+    lc = settings()
+    assert launch.TIER_SETTINGS["spill_ssd_min_tokens"][:2] == ("SPILL_SSD_MIN_TOKENS", 8192)
+    assert lc.validate({})["spill_ssd_min_tokens"] == 8192
+    assert lc.validate({"spill_ssd_min_tokens": 0})["spill_ssd_min_tokens"] == 0
+    v = lc.validate({"spill_ssd_min_tokens": 4096.7})["spill_ssd_min_tokens"]
+    assert v == 4096 and isinstance(v, int)  # (a count: rounded down)
+    for bad in (-1, "8192", True, float("nan"), None):
+        with pytest.raises(ValueError):
+            lc.validate({"spill_ssd_min_tokens": bad})
+    assert launch.parse_tier("spill_ssd_min_tokens", "1000.5") == 1000
+    assert launch.parse_tier("spill_ssd_min_tokens", None) == 8192
+    assert launch.parse_tier("spill_ssd_min_tokens", "-3", warn=lambda m: None) == 8192
+
+
 def test_tier_validate_dir_is_a_folder(tmp_path):
     lc = settings()
     f = tmp_path / "file"
@@ -338,10 +353,10 @@ def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path
     (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
     s = lc.validate({"spec": "none", "spill_ram_gib": 16, "spill_ram_retention_s": 120, "spill_ssd_gib": 50, "spill_ssd_min_free_gib": 2.5,
                      "spill_ttl_days": 3, "vram_backup_idle_s": 0, "spill_pinned_gib": 4, "spill_async_io": True,
-                     "spill_dir": str(tmp_path / "kv")})
+                     "spill_ssd_min_tokens": 2048, "spill_dir": str(tmp_path / "kv")})
     env = lc.config(s)["env"]
     assert env["SPILL_RAM_GIB"] == "16" and env["SPILL_PINNED_GIB"] == "4" and env["SPILL_ASYNC_IO"] == "1"
-    assert env["SPILL_ASYNC_PROMOTE"] == "0" and env["SPILL_DIR"] == str(tmp_path / "kv")
+    assert env["SPILL_SSD_MIN_TOKENS"] == "2048" and env["SPILL_ASYNC_PROMOTE"] == "0" and env["SPILL_DIR"] == str(tmp_path / "kv")
     for var in launch.TIER_ENV:
         monkeypatch.delenv(var, raising=False)
     for k, v in env.items():  # (what the worker does)
@@ -350,7 +365,7 @@ def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path
     from tiercache import TierPolicy
     policy = TierPolicy.from_env(object())
     assert policy.ram_retention_s == 120 and policy.budget == 50 * GiB and policy.reserve == 2.5 * GiB
-    assert policy.ttl_s == 3 * 86400 and policy.backup_idle_s == 0 and str(policy.directory) == str(tmp_path / "kv")
+    assert policy.ssd_min_tokens == 2048 and policy.ttl_s == 3 * 86400 and policy.backup_idle_s == 0 and str(policy.directory) == str(tmp_path / "kv")
     monkeypatch.setenv("SPILL_RAM_GIB", lc.config(dict(s, spill_ram_gib=0))["env"]["SPILL_RAM_GIB"])
     assert TierPolicy.from_env(object()) is None  # (0: off)
 

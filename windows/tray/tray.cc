@@ -1004,7 +1004,7 @@ struct Row {
 enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
 enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
 
-constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 22;
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 23;
 
 struct SettingsWindow {
     HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
@@ -1054,6 +1054,7 @@ std::vector<Row> make_rows() {
         {L"RAM retention (seconds)", L"SPILL_RAM_RETENTION_S", "spill_ram_retention_s", K::edit, T::engine, L"Idle time before it goes to SSD"},
         {L"SSD cap (GiB)", L"SPILL_SSD_GIB", "spill_ssd_gib", K::edit, T::engine, L"Oldest files go first"},
         {L"SSD minimum free (GiB)", L"SPILL_SSD_MIN_FREE_GIB", "spill_ssd_min_free_gib", K::edit, T::engine, L"Never fill the disk below this"},
+        {L"SSD minimum entry (tokens)", L"SPILL_SSD_MIN_TOKENS", "spill_ssd_min_tokens", K::edit, T::engine, L"Shorter ones are not written. 0: all"},
         {L"File lifetime (days)", L"SPILL_TTL_DAYS", "spill_ttl_days", K::edit, T::engine, L"Files not reused are deleted"},
         {L"VRAM backup idle (seconds)", L"VRAM_BACKUP_IDLE_S", "vram_backup_idle_s", K::edit, T::engine, L"0: off"},
         {L"Pinned RAM (GiB)", L"SPILL_PINNED_GIB", "spill_pinned_gib", K::edit, T::engine, L"0: off. Faster copies"},
@@ -1073,6 +1074,7 @@ Row* row_of(const std::wstring& var) {
 // come from the server's plans (nothing in a plan depends on them).
 bool tier_number_row(const Row& row) {
     static const char* const keys[] = {"spill_ram_gib", "spill_ram_retention_s", "spill_ssd_gib", "spill_ssd_min_free_gib",
+                                       "spill_ssd_min_tokens",
                                        "spill_ttl_days", "vram_backup_idle_s", "spill_pinned_gib"};
     if (!row.key) return false;
     for (const char* key : keys)

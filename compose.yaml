@@ -92,6 +92,7 @@ services:
       SPILL_RAM_RETENTION_S: ${SPILL_RAM_RETENTION_S:-3600}  # seconds a checkpoint stays in RAM before it is written to SSD (idle time)
       SPILL_SSD_GIB: ${SPILL_SSD_GIB:-100}         # SSD tier cap; the oldest files are deleted first
       SPILL_SSD_MIN_FREE_GIB: ${SPILL_SSD_MIN_FREE_GIB:-10}  # never fill the disk below this much free space
+      SPILL_SSD_MIN_TOKENS: ${SPILL_SSD_MIN_TOKENS:-8192}  # spilled checkpoints shorter than this many tokens are never written to SSD (dropped instead; 0: no minimum)
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # files not reused for this many days are deleted
       SPILL_TICK_S: ${SPILL_TICK_S:-30}            # seconds between the tier maintenance passes
       VRAM_BACKUP_IDLE_S: ${VRAM_BACKUP_IDLE_S:-60}  # idle seconds before VRAM checkpoints are copied to RAM, kept in VRAM (0: off)

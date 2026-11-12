@@ -47,7 +47,7 @@ class Base:
     def add_ram(self, size=100, backup=False):
         i = self.next_id
         self.next_id += 1
-        self.entries[i] = {"id": i, "pos": 0, "ram_bytes": size, "on_disk": False, "path": "", "last_use": 0,
+        self.entries[i] = {"id": i, "pos": 10_000, "ram_bytes": size, "on_disk": False, "path": "", "last_use": 0,
                            "backup": backup}
         return i
 

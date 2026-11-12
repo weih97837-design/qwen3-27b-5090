@@ -121,6 +121,7 @@ everywhere above.
 | `SPILL_RAM_RETENTION_S` | 3600 | Seconds a checkpoint stays in RAM before `frontend/tiercache.py` writes it to SSD (only when idle) |
 | `SPILL_SSD_GIB` | 100 | Cap of the SSD tier in GiB; the oldest files are deleted first |
 | `SPILL_SSD_MIN_FREE_GIB` | 10 | The SSD tier never fills the disk below this much free space |
+| `SPILL_SSD_MIN_TOKENS` | 8192 | Spilled checkpoints shorter than this many tokens are never written to the SSD: past `SPILL_RAM_RETENTION_S` they are dropped from RAM instead. Every entry carries a ~190 MiB recurrent state whatever its length, and a short prefix recomputes in about 0.2-0.4 s, about the time a read takes. 0: no minimum (every entry is written). Entries already on disk are unaffected |
 | `SPILL_TTL_DAYS` | 7 | Files not reused for this many days are deleted |
 | `SPILL_TICK_S` | 30 | Seconds between the tier maintenance passes |
 | `VRAM_BACKUP_VICTIMS` | 8 | The idle backup copies only one of the next N checkpoints the pool would evict (0: any); the copies also stay within half of `SPILL_RAM_GIB`. Environment only |
@@ -258,6 +259,7 @@ variables:
 | `spill_ram_retention_s` | `SPILL_RAM_RETENTION_S` | Seconds, 0 or more (3600) |
 | `spill_ssd_gib` | `SPILL_SSD_GIB` | GiB, 0 or more (100) |
 | `spill_ssd_min_free_gib` | `SPILL_SSD_MIN_FREE_GIB` | GiB, 0 or more (10) |
+| `spill_ssd_min_tokens` | `SPILL_SSD_MIN_TOKENS` | Tokens, 0 or more (8192; 0: no minimum; a fraction is rounded down) |
 | `spill_ttl_days` | `SPILL_TTL_DAYS` | Days, 0 or more (7) |
 | `vram_backup_idle_s` | `VRAM_BACKUP_IDLE_S` | Seconds, 0 or more (60; 0: off) |
 | `spill_pinned_gib` | `SPILL_PINNED_GIB` | GiB, 0 or more (0: off; the engine clamps it below `SPILL_RAM_GIB`) |
@@ -392,7 +394,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
-| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
+| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_SSD_MIN_TOKENS`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |
