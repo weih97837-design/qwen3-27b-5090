@@ -20,6 +20,28 @@
 請求到達時，`prefix_begin` 會找出對話前綴最深的命中點，並從 RAM 或 SSD 把該 checkpoint 還原回 VRAM。引擎端的 RAM
 上限是最後一道防線，即使 `frontend/tiercache.py` 沒有執行，RAM 也不會無限制成長。
 
+## 閒置時預先備份（VRAM 保留）
+
+引擎完全閒置達 `VRAM_BACKUP_IDLE_S`（預設 60 秒）後，會把 VRAM 中尚未備份的 checkpoint **複製一份到 RAM，原本的
+checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一個（大型 checkpoint 約需 0.3–1 秒）；每複製完一個，
+都會先檢查是否有新請求，有就先處理請求。沒有可備份的項目後停止，直到下一次活動（請求進出、推理回合）才重新開始。
+
+效果：
+
+- 代理回來時，仍在 VRAM 的 checkpoint 立即命中，與沒有備份時相同。
+- 負載上來需要逐出時，被逐出的 checkpoint 已有 RAM 副本，不必在請求等待中複製，逐出沒有複製停頓。
+- 備份的 RAM 項目與其他項目相同：計入 `SPILL_RAM_GIB`，保留 `SPILL_RAM_RETENTION_S` 後寫入 SSD，並受 TTL 約束。
+- 只在分層啟用（`SPILL_RAM_GIB` 大於 0）時運作。引擎若沒有 `spill_backup_one` 則不執行。`VRAM_BACKUP_IDLE_S=0` 關閉。
+
+### 停止時的寫出（SPILL_FLUSH_ON_STOP_S）
+
+引擎程序停止時（閒置卸載 `ENGINE_IDLE_UNLOAD_S`、重新啟動、或伺服器關閉），若設定了 `SPILL_DIR`，會在
+`SPILL_FLUSH_ON_STOP_S` 秒內完成：先備份剩餘的 VRAM checkpoint（最多用一半時間），再把 RAM 中的項目寫入 SSD。
+沒有這一步，閒置卸載會連 VRAM 與 RAM 的快取一起丟失。
+
+預算上限為 8 秒。`frontend/server.py` 在卸載或重新啟動時等待引擎程序結束 15 秒、關閉時等待 10 秒，之後會強制終止。
+超過的設定值會被截為 8 秒（記錄於日誌）。若要更長的寫出時間，須先調高 `server.py` 的等待時間。
+
 ## 參數表
 
 以下全部是 `compose.yaml` 中 `serve` 服務的環境變數，可在 `.env` 或 shell 中覆寫，於容器啟動時生效。
@@ -35,6 +57,8 @@
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | 磁碟可用空間目標。只在能靠刪除本層自己的檔案達成時才追求，不會刪除其他檔案 |
 | `SPILL_TTL_DAYS` | `7` | 自寫入 SSD 起算（重用後會重新計時），超過此天數的檔案會被刪除 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
+| `VRAM_BACKUP_IDLE_S` | `60` | 引擎閒置多久後開始把 VRAM checkpoint 複製到 RAM（保留在 VRAM）。`0` 關閉，見上文 |
+| `SPILL_FLUSH_ON_STOP_S` | `8` | 停止時備份與寫出的時間預算（秒），上限 8。`0` 關閉，見上文 |
 
 `KV_DTYPE` 維持 `nvfp4`，每個請求的上限 `MAX_TOKENS` 維持 `262144`。
 
@@ -77,3 +101,49 @@ python3 tools/recommend_config.py --json             # 機器可讀的輸出
 - 偵測不到的值使用 `compose.yaml` 預設值，並在報告中註明。
 - 計算 VRAM 前請先停止正在執行的 serve，否則其用量會被當成「其他程式」。
 - 若報告提示 WSL VM 記憶體不足，依提示在 `%UserProfile%\.wslconfig` 設定 `memory=`，再於 Windows 執行 `wsl --shutdown`。
+
+## 真機測試
+
+在 RTX 5090 上以開發容器執行（與 `scripts/prefix_cache_test.py` 相同的方式，需要權重與 `bench/golden/`）：
+
+```
+# 精確性：各情境的輸出 token 必須與關閉快取的參考完全相同
+docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py
+docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py --scenarios a,c
+
+# 把 SSD 層放在 kvcache 具名磁碟區（dev 服務預設沒有掛載，需要用 -v 加上）
+docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
+    python scripts/tiered_cache_test.py --keep-dir /cache/kv/test
+
+# 耗時：32K / 128K / 256K 的 checkpoint
+docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
+    python scripts/tiered_cache_bench.py --spill-dir /cache/kv/bench
+
+# 前後比較（每個引數是一組 NAME=VALUE）
+docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
+    python scripts/tiered_cache_bench.py --spill-dir /cache/kv/bench \
+    --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
+```
+
+`tiered_cache_test.py` 有五個情境，各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
+
+| 情境 | 強制走的路徑 | 檢查的計數器 |
+| --- | --- | --- |
+| a 從 RAM 還原 | 小的 `KV_POOL_TOKENS`：第二段對話的 prefill 逐出第一段的 checkpoint | `spilled` 增加；後續回合 `restored` 增加 |
+| b 從 SSD 還原 | 同 a，再把 RAM 中的項目 `spill_export` 到 `SPILL_DIR` | 後續回合從檔案還原（`restored` 增加，且還原前該項目 `on_disk`） |
+| c 重啟後匯入 | 第一個行程寫出檔案後結束；第二個行程 `spill_import` 後續談 | 匯入的檔案數；後續回合 `restored` 增加 |
+| d 閒置備份重用 | `spill_backup_one` 直到 False；之後的逐出不再複製 | `backed_up` 增加；逐出時 `spilled` 不變；後續回合 `restored` 增加 |
+| e 推測解碼 | 同 a，使用草稿模型（環形 checkpoint）；沒有草稿模型時跳過 | 同 a |
+
+每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。若情境失敗，先確認 `--pool-tokens`：池太大時不會逐出，
+檢查會失敗而不是通過，此時把池調小（預設為一段對話加其 checkpoint 再加 1K tokens）。
+
+**PASS 的意義**：該情境的每一段輸出 token（貪婪解碼，每回合 `--tokens` 個）與關閉快取的參考完全相同，而且所有檢查都通過，
+表示確實走了該情境的路徑。任何一個 FAIL 則 exit code 為 1。
+
+`tiered_cache_bench.py` 的計時不含引擎建立與 checkpoint 的 prefill。「逐出並複製」的時間是 prefill 時間減去同一段
+prefill（沒有東西可逐出）的時間，是估計值。bench 的提示由 golden 文件重複拼接而成，只用於計時，不檢查輸出。
+
+**新的加速旗標只能在 `tiered_cache_test.py` 全部 PASS 之後才預設開啟。** 例如 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`
+這類選用旗標，先用 `tiered_cache_bench.py --compare` 量測，再以 `tiered_cache_test.py` 驗證精確性；測試未通過前不要寫進
+`compose.yaml` 或 `tools/recommend_config.py` 的預設值。
