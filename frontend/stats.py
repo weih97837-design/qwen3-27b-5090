@@ -179,6 +179,11 @@ def _gbps(nbytes, ms):
     return nbytes / (ms / 1000.0) / 1e9 if nbytes and ms and ms > 0 else None
 
 
+def _ratio(logical, physical):
+    """logical / physical (> 1: sharing saves RAM), None when either is unknown or there is nothing in RAM."""
+    return logical / physical if logical and physical else None
+
+
 def tiers_block(engine, tiers, environ=None):
     """The tiered cache for the UI (None without a tier policy): the engine's spill counters, the policy's SSD use and
     the disk. Never raises: a failure is {"error": text}."""
@@ -196,7 +201,14 @@ def tiers_block(engine, tiers, environ=None):
                 disk_free = None
         ram_gib = _env_float(env, "SPILL_RAM_GIB")
         ttl_s = getattr(tiers, "ttl_s", None)
-        return {"ram_bytes": sp["ram_bytes"], "ram_cap_bytes": int(ram_gib * (1 << 30)) if ram_gib is not None else None,
+        # RAM dedup (engine built with it; an older engine has no such keys: None). ram_bytes is the PHYSICAL use (what the
+        # cap is about); logical is what the entries would take without sharing.
+        logical, physical = sp.get("logical_bytes"), sp.get("physical_bytes")
+        return {"ram_bytes": sp["ram_bytes"], "ram_logical_bytes": logical,
+                "ram_physical_bytes": physical,
+                "ram_dedup_ratio": _ratio(logical, physical), "ram_dedup_saved_bytes": sp.get("dedup_saved_bytes"),
+                "ram_chunks": sp.get("chunks"), "chunk_hits": sp.get("chunk_hits"), "chunk_misses": sp.get("chunk_misses"),
+                "ram_cap_bytes": int(ram_gib * (1 << 30)) if ram_gib is not None else None,
                 "in_ram": sp["in_ram"], "on_disk": sp["on_disk"], "ssd_bytes": ts.get("ssd_bytes"),
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],

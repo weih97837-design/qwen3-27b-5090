@@ -462,7 +462,11 @@ Model::~Model() {
     if (kv.second.done) cudaEventDestroy(kv.second.done);
   for (Retired& r : retired_)
     if (r.done) cudaEventDestroy(r.done);
+  spill_chunks_.for_each([](SpillChunk& c) {
+    if (c.done) cudaEventDestroy(c.done);
+  });
   spill_.clear();
+  spill_chunks_.clear();  // (before the pinned slabs go: chunk buffers release into the pool)
   retired_.clear();
   for (char* slab : pin_pool_.slab_bases()) cudaFreeHost(slab);
   pin_pool_.forget_slabs();

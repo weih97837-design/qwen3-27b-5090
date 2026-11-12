@@ -323,7 +323,10 @@ class TierPolicy:
         """For the metrics, from the last look at the engine's list (no engine call)."""
         disk = [e for e in self.listed if e["on_disk"]]
         ram = [e for e in self.listed if e["ram_bytes"] > 0]
+        # (ram_bytes here is the entries' LOGICAL size: what an entry takes in a file and what the SSD budget counts. The
+        # engine's RAM tier holds less when entries share chunks: stats.tiers_block has the physical number.)
         return {"ram_entries": len(ram), "ram_bytes": sum(e["ram_bytes"] for e in ram),
+                "ram_logical_bytes": sum(e["ram_bytes"] for e in ram),
                 "disk_entries": len(disk), "ssd_bytes": sum(_size(e["path"]) for e in disk),
                 "backup_entries": sum(1 for e in self.listed if e.get("backup")),
                 "ssd_budget_bytes": int(self.budget), "last_error": self.last_error}
