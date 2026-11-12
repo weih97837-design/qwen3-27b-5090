@@ -44,6 +44,9 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 預算上限為 8 秒。`frontend/server.py` 在卸載或重新啟動時等待引擎程序結束 15 秒、關閉時等待 10 秒，之後會強制終止。
 超過的設定值會被截為 8 秒（記錄於日誌）。若要更長的寫出時間，須先調高 `server.py` 的等待時間。
 
+寫出一個項目前會先估計所需時間：`new_disk_bytes`（沒有時用 `ram_bytes`）除以寫入速度（以最近一次 ≥ 64 MiB 的寫出量測；尚未量測時保守地假設 1 GB/s）。
+估計時間超過剩餘預算的項目不會開始寫（寫到一半被 `server.py` 強制終止的檔案會作廢，停止也會超時），較小的項目仍會嘗試；略過的項目計入回報的 `left`。
+
 ## 參數表
 
 以下全部是 `compose.yaml` 中 `serve` 服務的環境變數，可在 `.env` 或 shell 中覆寫，於容器啟動時生效。
@@ -129,9 +132,18 @@ $SPILL_DIR/
   frontend 不會列舉或刪除 `chunks/`，只管 `entries/`。
 - **舊檔案**：舊版的 `SPILL_DIR/*.q27kv`（整檔格式）不再被讀取，第一次以新引擎啟動時會全部刪除，並記錄一行 log（它只是快取）。
   舊引擎（沒有 `q27_spill_disk_usage`）仍用舊的平面檔案配置，檔案不會被當成舊檔刪除。
+- **降級到舊版引擎**：舊引擎不認得 `entries/` 與 `chunks/`：這兩個目錄裡的檔案不會被計入 SSD 容量、不會被 TTL 或容量逐出清理，也不會被刪除，
+  會一直佔用磁碟。降級後請手動刪除 `SPILL_DIR/entries/` 與 `SPILL_DIR/chunks/`（它們只是快取）。
+- **匯入失敗與已索引**：`spill_import` 回傳 0 才表示引擎明確拒絕（別的模型／KV 型別、損毀、缺 chunk 檔），frontend 才刪該 manifest；呼叫本身拋出例外時
+  檔案保留。已經索引過的路徑回傳既有的 id（不是 0），所以重複呼叫 `start()` 不會刪掉正在使用的 manifest。
 - **還原**：讀 manifest 與它列出的所有 chunk 檔到一個私有緩衝區（`DiskRead`，每次還原一條執行緒，只碰自己的緩衝區）；每個檔案驗證標頭、
   token id、大小與 Hash64。缺少或損毀的 chunk 檔會讓這次還原乾淨地失敗：entry（及其 manifest）被丟棄，該 chunk 檔從索引移除並刪除，
-  之後的寫出會重新寫它。尚未在 RAM 中的 chunk 不會先登記進 RAM 層（避免讀到一半的資料被別的 spill 找到）；也沒有重用 RAM 中已常駐的 chunk 來省略讀取。
+  之後的寫出會重新寫它。**I/O 錯誤不是損毀**：開檔失敗（檔案存在但被鎖，例如 Windows 防毒／索引程式）、`fread` 出錯（EIO）只讓這一次還原失敗，
+  **不刪** chunk 檔、manifest 與 entry（chunk 0 幾乎被所有 manifest 共用，誤刪會讓整個 SSD 層失效）；同一個 entry 連續 3 次 I/O 失敗才丟棄它。
+  只有「檔案不存在」、標頭／token id／Hash64 不符、截斷（讀到 EOF）才算損毀。刪檔失敗（Windows：另一個 `DiskRead` 開著該檔、沒有 `FILE_SHARE_DELETE`）
+  時，檔案移到「待刪清單」：仍計入 `spill_disk_usage` 的實體位元組（第 5 個欄位 `pending_files` 為其數量），在下一次刪檔或 `spill_sweep` 時重試；frontend 在
+  tick 發現 `pending_files > 0` 時會呼叫 `spill_sweep`。寫 chunk 檔最後的 rename 失敗時，若目標檔已存在且驗證相符（chunk 內容由名稱決定）則視為成功。
+  尚未在 RAM 中的 chunk 不會先登記進 RAM 層（避免讀到一半的資料被別的 spill 找到）；也沒有重用 RAM 中已常駐的 chunk 來省略讀取。
 - **容量與統計**。`SPILL_SSD_GIB`、`SPILL_SSD_MIN_FREE_GIB` 與 `make_room` 以實體位元組計（`q27_spill_disk_usage`：每個 chunk 檔一次 ＋ manifest）。
   要放入一個 entry 時，需要的空間是它「現在會寫出的位元組」（`spill_list_ex` 的 `new_disk_bytes`：manifest ＋ 還不在 SSD 的 chunk）；
   逐出 entry 釋放的是 `unique_disk_bytes`（它的 manifest ＋ 只有它參照的 chunk 檔）。每次逐出後重新讀清單，因為兄弟 entry 的 unique 與新 entry 的

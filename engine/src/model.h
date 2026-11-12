@@ -178,10 +178,10 @@ class Model {
   // entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tlive\tlogical_bytes\tunique_disk_bytes\tnew_disk_bytes\tpath" (the old columns
   // unchanged; logical_bytes: kv + state whether in memory or on disk; unique_disk_bytes: what dropping the entry frees on the
   // SSD (its manifest + the chunk files only it lists; 0 when it has no file); new_disk_bytes: what exporting it writes now
-  // (its manifest + the chunk files not on disk yet; 0 once it is on disk). spill_disk_usage writes min(n, 4) values: physical bytes
+  // (its manifest + the chunk files not on disk yet; 0 once it is on disk). spill_disk_usage writes min(n, 5) values: physical bytes
   // on the SSD (each chunk file once + the manifests), logical bytes (the entries with a file, each as if written whole), chunk
   // files, manifests. spill_sweep (after every manifest was imported): deletes leftover .tmp files and chunk files no manifest
-  // lists; returns how many.
+  // lists, and retries the chunk file deletions that failed earlier (Windows locks); returns how many.
   std::string spill_list_ex() const;
   void spill_disk_usage(int64_t* out, int n) const;
   int spill_sweep();
@@ -323,7 +323,9 @@ class Model {
   size_t spill_phys() const { return spill_ram_ + spill_chunks_.bytes(); }
   size_t spill_host_use() const { return spill_phys() + (pin_pool_.total() - pin_pool_.used()); }
   void spill_write(Spilled& s, const std::string& path);  // chunk files first, the manifest last, then the memory goes
-  bool spill_load(Spilled& s);                   // the manifest's + chunk files' pages and state into memory (a private entry)
+  int spill_load(Spilled& s);                    // the manifest's + chunk files' pages and state into memory (a private entry): 1 ok, 0 damaged, -1 I/O error
+  bool spill_io_failed(Spilled& s);              // counts an I/O error of a restore; true: drop the entry (kMaxIoFails in a row)
+  static constexpr int kMaxIoFails = 3;
   // SSD dedup (spill.cc (M)-(Q)).
   Geom spill_geom() const;                       // the KV geometry the files are written with
   bool spill_disk_dir(const std::string& manifest_path);  // fixes the chunk directory (once); false: none can be found

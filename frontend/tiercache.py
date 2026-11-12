@@ -39,6 +39,8 @@ MOSTLY_SHARED = 0.25               # an entry whose unique bytes are under this 
 # 15 s to exit on an unload or restart and 10 s on shutdown (EngineClient._stop, stop); a flush cut off by the
 # server's terminate would leave a file half written.
 STOP_FLUSH_MAX_S = 8.0
+DEFAULT_WRITE_BPS = 1e9            # flush() assumes this write speed until an export has been timed (conservative: an NVMe SSD does more)
+WRITE_RATE_MIN_BYTES = 64 << 20    # an export smaller than this does not update the measured speed
 
 
 def _float(name, raw):
@@ -79,7 +81,7 @@ def _unlink(path):
 class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=100, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
-                 backup_victims=8, ssd_min_tokens=8192):
+                 backup_victims=8, ssd_min_tokens=32768):
         self.engine = engine
         self.directory = Path(directory) if directory else None  # None: no SSD tier
         self.ram_retention_s = float(ram_retention_s)
@@ -94,6 +96,7 @@ class TierPolicy:
         # carries the same ~190 MiB recurrent state, and a short prefix recomputes in about the time a read takes (0: off).
         self.ssd_min_tokens = max(0, int(ssd_min_tokens))
         self.skipped_short = 0                         # short entries dropped instead of written
+        self.write_bps = None                          # measured throughput of the last exports (bytes / s; None: none yet), for flush()
         self.clock = clock
         self.disk_free = disk_free or (lambda d: shutil.disk_usage(d).free)
         self.log = log
@@ -195,10 +198,10 @@ class TierPolicy:
             try:
                 try:
                     entry_id = self.engine.spill_import(str(p))
-                except Exception as e:  # noqa: BLE001 - an unreadable file is just not ours
+                except Exception as e:  # noqa: BLE001 - the call failed: nothing says the file is not ours, so it stays
                     self._error(f"import {p.name}: {e}")
-                    entry_id = 0
-                if not entry_id:
+                    continue
+                if not entry_id:  # (0: the engine rejected it: another model / KV type, damaged, a chunk file missing)
                     self.log(f"tiered cache: deleting {p.name} (not a checkpoint of this model)")
                     _unlink(p)
                     continue
@@ -287,6 +290,12 @@ class TierPolicy:
             self._error(f"SSD budget: {ex}")
         if self.dedup:
             self.usage = self._read_usage()
+            if self.usage and self.usage.get("pending_files"):  # chunk files whose deletion failed (a lock): the engine retries
+                try:
+                    self.engine.spill_sweep()
+                except Exception as e:  # noqa: BLE001
+                    self._error(f"sweep: {e}")
+                self.usage = self._read_usage()
 
     def _short(self, e):
         return self.ssd_min_tokens > 0 and e.get("pos", 0) < self.ssd_min_tokens
@@ -317,6 +326,7 @@ class TierPolicy:
             self._drop(entry_id, "no room on SSD")
             return "dropped"
         path = self.files_dir / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}{self.suffix}"
+        t0 = time.monotonic()
         try:
             self.engine.spill_export(entry_id, str(path))
         except RuntimeError as ex:
@@ -324,6 +334,9 @@ class TierPolicy:
             _unlink(path)
             self._drop(entry_id, "export failed")
             return "dropped"
+        dt = time.monotonic() - t0
+        if incoming >= WRITE_RATE_MIN_BYTES and dt > 0:  # (small writes measure the latency, not the throughput)
+            self.write_bps = incoming / dt
         self.written[entry_id] = now
         self.ram_since.pop(entry_id, None)
         if self.dedup:
@@ -345,12 +358,23 @@ class TierPolicy:
         ram = sorted((e for e in self.engine.spill_list()
                       if e["ram_bytes"] > 0 and not e.get("busy") and not self._short(e)),  # (short ones stay in RAM)
                      key=lambda e: self.ram_since.get(e["id"], now))
+        rate = self.write_bps or DEFAULT_WRITE_BPS
+        skipped = 0
         for i, e in enumerate(ram):
-            if clock() >= deadline:
-                result["left"] = len(ram) - i
+            remaining = deadline - clock()
+            if remaining <= 0:
+                result["left"] = len(ram) - i + skipped
                 break
+            # An export that would not finish in the time left is not started (a file cut off by the server's terminate is lost,
+            # and the stop would overrun): a smaller one later in the list may still fit.
+            incoming = e.get("new_disk_bytes", e["ram_bytes"]) if self._layout() else e["ram_bytes"]
+            if incoming / rate > remaining:
+                skipped += 1
+                continue
             if self._to_disk(e, now) == "written":
                 result["written"] += 1
+        else:
+            result["left"] = skipped
         self.log(f"tiered cache: stop flush wrote {result['written']} of {len(ram)} RAM entries "
                  f"({result['left']} left in RAM)")
         return result

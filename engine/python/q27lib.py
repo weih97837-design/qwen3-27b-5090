@@ -473,16 +473,19 @@ class Engine:
         return out
 
     def spill_disk_usage(self):
-        """{"physical_bytes", "logical_bytes", "chunk_files", "manifests"} of the SSD tier (each chunk file once), or None with a
+        """{"physical_bytes", "logical_bytes", "chunk_files", "manifests", "pending_files"} of the SSD tier (each chunk file once;
+        pending_files: chunk files whose deletion failed and is retried, their bytes are in physical_bytes), or None with a
         library that has no SSD dedup (flat files: the caller sums the file sizes)."""
         if not self.has_spill_dedup:
             return None
-        out = (ctypes.c_int64 * 4)()
-        self._check(lib().q27_spill_disk_usage(self.h, out, 4), "q27_spill_disk_usage")
-        return {"physical_bytes": out[0], "logical_bytes": out[1], "chunk_files": out[2], "manifests": out[3]}
+        out = (ctypes.c_int64 * 5)()  # (an older library fills the first 4: pending_files stays 0)
+        self._check(lib().q27_spill_disk_usage(self.h, out, 5), "q27_spill_disk_usage")
+        return {"physical_bytes": out[0], "logical_bytes": out[1], "chunk_files": out[2], "manifests": out[3],
+                "pending_files": out[4]}
 
     def spill_sweep(self):
-        """After every manifest was imported: deletes leftover .tmp files and chunk files no manifest lists. Returns how many."""
+        """Deletes leftover .tmp files and chunk files no manifest lists (call it after every manifest was imported), and retries the
+        deletions that failed earlier (pending_files). Returns how many files went."""
         if not self.has_spill_dedup:
             return 0
         out = ctypes.c_int()

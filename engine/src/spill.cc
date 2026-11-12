@@ -824,7 +824,11 @@ bool Model::spill_promote(uint64_t id) {
     }
     return false;
   };
-  if (from_disk && !spill_load(s)) return give_up(true);
+  if (from_disk) {
+    const int l = spill_load(s);
+    if (l == 0) return give_up(true);
+    if (l < 0) return give_up(spill_io_failed(s));  // an I/O error: this restore only (the file and the entry stay) until it repeats
+  }
   const int npages = int(ceil_div(s.pos(), kPageTokens));
   if (size_t(npages) * kKvSlices * kv_page_bytes_ != s.kv_bytes || s.state_bytes != ckpt_bytes_ || !spill_parts_ok(s))
     return give_up(true);
@@ -1124,9 +1128,22 @@ int Model::spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap) {
     Restore& r = rit->second;
     r.disk->join();
     const bool ok = r.disk->state_now() > 0;
-    const int bad = r.disk->bad.load();  // (the chunk file that failed verification or could not be read; -1: the manifest)
+    const int bad = r.disk->bad.load();  // (the chunk file that failed verification or is missing; -1: the manifest, or an I/O error)
+    const bool io_error = r.disk->io_error.load();
     r.disk.reset();
     auto it = spill_.find(id);
+    if (!ok && io_error && it != spill_.end() && !spill_io_failed(it->second)) {
+      // An I/O error (a lock, EIO ...) says nothing about the files: only this restore fails; the entry, its manifest and the chunk
+      // files (which other entries share) stay, and the next prefix_begin / restore may try again.
+      log("tiered cache: a file of a spilled checkpoint could not be read (I/O error; kept, its prompt is computed again)");
+      Spilled& s = it->second;
+      spill_release_mem(s, false);
+      s.busy = false;
+      restoring_.erase(id);
+      sstats_.restore_failed++;
+      restore_results_.emplace_back(id, false);
+      continue;
+    }
     if (!ok) {
       log("tiered cache: the file of a spilled checkpoint could not be read (its prompt is computed again)");
       if (bad >= 0 && it != spill_.end() && size_t(bad) < it->second.dnames.size())
@@ -1364,9 +1381,11 @@ void Model::spill_write(Spilled& s, const std::string& path) {
   sstats_.written++;
 }
 
-bool Model::spill_load(Spilled& s) {
+// 1: loaded. 0: the files are damaged / missing / do not fit (the caller drops the entry; a damaged chunk file is forgotten).
+// -1: an I/O error (the files may be fine: the caller keeps the entry, spill_io_failed counts it).
+int Model::spill_load(Spilled& s) {
   const size_t npages = size_t(ceil_div(s.pos(), kPageTokens));
-  if (s.state_bytes != ckpt_bytes_ || s.kv_bytes != npages * kKvSlices * kv_page_bytes_ || !spill_disk_ready(s)) return false;
+  if (s.state_bytes != ckpt_bytes_ || s.kv_bytes != npages * kKvSlices * kv_page_bytes_ || !spill_disk_ready(s)) return 0;
   DiskRead d;
   try {
     spill_reap();
@@ -1375,16 +1394,24 @@ bool Model::spill_load(Spilled& s) {
     if (!spill_read_plan(s, d)) throw std::bad_alloc();
   } catch (const std::bad_alloc&) {
     s.kv.reset(), s.state.reset();
-    return false;
+    return -1;  // (out of host memory: nothing is known about the files)
   }
   if (!d.run_sync()) {
+    s.kv.reset(), s.state.reset();
+    if (d.io_error.load()) return -1;
     const int bad = d.bad.load();
     if (bad >= 0 && size_t(bad) < s.dnames.size()) disk_.forget_file(s.dnames[size_t(bad)]);  // (O)
-    s.kv.reset(), s.state.reset();
-    return false;
+    return 0;
   }
   spill_ram_ += s.own_bytes();  // (a private entry: all its pages in kv)
-  return true;
+  return 1;
+}
+
+// A restore of the entry failed on an I/O error: counts it; true (drop the entry) once kMaxIoFails in a row failed (a persistent
+// error is as good as a damaged file, and the entry would otherwise be retried for ever).
+bool Model::spill_io_failed(Spilled& s) {
+  log("tiered cache: reading the files of a spilled checkpoint failed with an I/O error (%d in a row)", s.io_fails + 1);
+  return ++s.io_fails >= kMaxIoFails;
 }
 
 // remove_file == false is not used: an erase always gives the entry's disk references back (a leaked one would keep a chunk file for good).
@@ -1422,13 +1449,14 @@ std::string Model::spill_list_ex() const {
 }
 
 void Model::spill_disk_usage(int64_t* out, int n) const {
-  int64_t v[4] = {int64_t(disk_.physical_bytes()), 0, int64_t(disk_.files()), 0};
+  // [4]: chunk files whose removal failed and is retried (their bytes are in [0]).
+  int64_t v[5] = {int64_t(disk_.physical_bytes()), 0, int64_t(disk_.files()), 0, int64_t(disk_.pending_files())};
   for (const auto& kv : spill_) {
     const Spilled& s = kv.second;
     if (s.path.empty()) continue;
     v[0] += int64_t(s.manifest_bytes), v[1] += int64_t(s.kv_bytes + s.state_bytes), v[3]++;
   }
-  for (int i = 0; i < n && i < 4; i++) out[i] = v[i];
+  for (int i = 0; i < n && i < 5; i++) out[i] = v[i];
 }
 
 int Model::spill_sweep() {
@@ -1455,7 +1483,7 @@ void Model::spill_drop(uint64_t id) {
 uint64_t Model::spill_import(const std::string& path) {
   if (!spill_on()) return 0;
   for (const auto& kv : spill_)
-    if (kv.second.path == path) return 0;  // (already indexed)
+    if (kv.second.path == path) return kv.first;  // (already indexed: its id, so a second start() does not take it for a rejected file)
   if (!spill_disk_dir(path)) return 0;
   ManifestHead h;
   std::vector<std::string> unknown;  // (listed, present on disk, not in the index yet)

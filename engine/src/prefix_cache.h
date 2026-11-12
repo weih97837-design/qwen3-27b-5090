@@ -139,6 +139,7 @@ struct Spilled {
   uint64_t manifest_bytes = 0;
   mutable std::vector<std::string> cnames;
   uint64_t last_use = 0;
+  int io_fails = 0;     // restores of its files that failed on an I/O error in a row (Model::spill_io_failed)
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
   bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
   // SPILL_ASYNC_IO: the device -> host copy that fills kv (or the host -> device copy that reads it) is queued on the

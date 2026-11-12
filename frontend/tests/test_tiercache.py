@@ -60,6 +60,9 @@ class FakeEngine:
     def spill_import(self, path):
         if Path(path).name.startswith("boom"):
             raise RuntimeError("unreadable")
+        for e in self.entries.values():  # (as the engine: an already indexed path answers its id)
+            if e["path"] == path:
+                return e["id"]
         if not Path(path).read_bytes().startswith(MAGIC):
             return 0
         entry_id = self.next_id
@@ -92,7 +95,8 @@ def env(tmp_path):
     logs = []
     d = tmp_path / "spill"
     tier = TierPolicy(eng, str(d), ram_retention_s=3600, ssd_gib=1000 * B, ssd_min_free_gib=100 * B,
-                      ttl_days=7, tick_s=0, clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append)
+                      ttl_days=7, tick_s=0, clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append,
+                      ssd_min_tokens=8192)
     tier.start()  # (the worker does this first: it makes the directory)
     eng.lists = 0
     return types.SimpleNamespace(eng=eng, tier=tier, dir=d, clock=clock, free=free, logs=logs)
@@ -261,10 +265,50 @@ def test_start_imports_valid_files_and_deletes_the_rest(env):
 
     env.tier.start()
 
-    assert good.exists() and not bad.exists() and not boom.exists() and not tmp.exists()
+    # (a file whose import RAISED stays: nothing says it is not ours; only an explicit rejection deletes)
+    assert good.exists() and not bad.exists() and boom.exists() and not tmp.exists()
     assert len(env.eng.entries) == 1
     (entry_id,) = env.eng.entries
     assert env.tier.written[entry_id] == 12345
+
+
+def test_second_start_keeps_the_manifests_the_engine_already_indexed(env):
+    good = env.dir / "good.q27kv"
+    good.write_bytes(MAGIC + b"x" * 100)
+    env.tier.start()
+    env.tier.start()  # the engine answers an already indexed path with its id (the real one used to answer 0)
+    assert good.exists() and len(env.eng.entries) == 1
+
+
+def test_default_ssd_min_tokens_matches_the_environment_default():
+    assert TierPolicy(FakeEngine(), None).ssd_min_tokens == 32768
+
+
+def _sparse_export(env):
+    """An export that writes nothing (the entries here are gigabytes in size)."""
+    def export(entry_id, path):
+        env.eng.exports.append(entry_id)
+        env.eng.entries[entry_id].update(ram_bytes=0, on_disk=True, path=path)
+    env.eng.spill_export = export
+    env.tier.budget = 10 ** 12
+
+
+def test_flush_skips_an_export_that_cannot_finish_in_the_time_left(env):
+    big, small = env.eng.add_ram(5 * 10 ** 9, pos=9000), env.eng.add_ram(400, pos=9000)
+    env.tier.write_bps = 1e9  # 5 s for the big one
+    _sparse_export(env)
+    t = {"now": 0.0}
+    res = env.tier.flush(2.0, clock=lambda: t["now"])
+    assert env.eng.exports == [small]  # the big one is not started, the small one still fits
+    assert res == {"written": 1, "left": 1} and big in env.eng.entries and env.eng.entries[big]["ram_bytes"] > 0
+
+
+def test_flush_assumes_one_gb_per_second_until_a_write_was_timed(env):
+    big = env.eng.add_ram(3 * 10 ** 9, pos=9000)
+    assert env.tier.write_bps is None
+    _sparse_export(env)
+    assert env.tier.flush(2.0, clock=lambda: 0.0)["left"] == 1 and env.eng.exports == []
+    assert env.tier.flush(4.0, clock=lambda: 0.0)["written"] == 1 and env.eng.exports == [big]
 
 
 def _to_disk(env, size, t):
@@ -637,7 +681,7 @@ def denv(tmp_path):
     d = tmp_path / "spill"
     # budget 1500 bytes
     tier = TierPolicy(eng, str(d), ram_retention_s=0, ssd_gib=1500 * B, ssd_min_free_gib=100 * B, ttl_days=7, tick_s=0,
-                      clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append)
+                      clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append, ssd_min_tokens=8192)
     return types.SimpleNamespace(eng=eng, tier=tier, dir=d, clock=clock, free=free, logs=logs)
 
 
@@ -826,3 +870,17 @@ def test_engine_whose_usage_call_fails_falls_back_to_flat(env):
     env.tier.dedup = None
     env.tier.start()
     assert env.tier.dedup is False
+
+
+def test_dedup_tick_asks_the_engine_to_retry_deletions_that_failed(denv):
+    denv.tier.start()
+    real = denv.eng.spill_disk_usage
+    denv.eng.spill_disk_usage = lambda: {**real(), "pending_files": 2}  # (a chunk file a lock kept)
+    before = denv.eng.sweeps
+    denv.clock.t = 10
+    denv.tier.tick(idle=True)
+    assert denv.eng.sweeps == before + 1
+    denv.eng.spill_disk_usage = real
+    denv.clock.t = 20
+    denv.tier.tick(idle=True)
+    assert denv.eng.sweeps == before + 1

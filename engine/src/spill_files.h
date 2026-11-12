@@ -30,10 +30,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -249,8 +251,11 @@ inline bool read_hashed(std::FILE* f, void* p, size_t n, Hash64& h, const std::a
 }
 
 // tmp -> rename: the shared tail of both writers. `fill(f, hash)` writes the content; the hash is appended.
+// A rename that fails (Windows: the target is open in a reader without FILE_SHARE_DELETE, or locked by an antivirus / indexer) is
+// not a failure when `existing_ok` says the file already there is exactly what was to be written (a chunk file is content addressed).
 template <class Fill>
-bool write_file_atomic(const std::string& path, std::string* err, Fill&& fill) {
+bool write_file_atomic(const std::string& path, std::string* err, Fill&& fill,
+                       const std::function<bool()>& existing_ok = nullptr) {
   const std::string tmp = path + ".tmp";
   bool ok;
   {
@@ -276,6 +281,7 @@ bool write_file_atomic(const std::string& path, std::string* err, Fill&& fill) {
   std::filesystem::rename(tmp, path, ec);
   if (ec) {
     std::remove(tmp.c_str());
+    if (existing_ok && existing_ok()) return true;
     if (err) *err = "could not rename " + tmp + ": " + ec.message();
     return false;
   }
@@ -328,6 +334,9 @@ inline bool chunk_header_ok(const ChunkHeader& h, const ChunkHeader& want) {
 }
 
 // payload: the chunk's bytes, exactly g.chunk_payload() in all. Written to <path>.tmp, synced, renamed.
+inline bool chunk_file_matches(const std::string& path, uint64_t fp, const ChunkId& id, const std::string& parent,
+                               const int32_t* ids, size_t n_ids, const Geom& g);
+
 inline bool write_chunk_file(const std::string& path, uint64_t fp, const ChunkId& id, const std::string& parent,
                              const int32_t* ids, size_t n_ids, const Geom& g, const CPieces& payload, std::string* err) {
   if (pieces_bytes(payload) != g.chunk_payload() || parent.size() >= kNameField || n_ids == 0) {
@@ -335,11 +344,14 @@ inline bool write_chunk_file(const std::string& path, uint64_t fp, const ChunkId
     return false;
   }
   const ChunkHeader h = make_chunk_header(fp, id, parent, n_ids, g);
-  return write_file_atomic(path, err, [&](std::FILE* f, Hash64& hh) {
-    bool ok = write_hashed(f, &h, sizeof h, hh) && write_hashed(f, ids, n_ids * sizeof(int32_t), hh);
-    for (const auto& [p, n] : payload) ok = ok && write_hashed(f, p, n, hh);
-    return ok;
-  });
+  return write_file_atomic(
+      path, err,
+      [&](std::FILE* f, Hash64& hh) {
+        bool ok = write_hashed(f, &h, sizeof h, hh) && write_hashed(f, ids, n_ids * sizeof(int32_t), hh);
+        for (const auto& [p, n] : payload) ok = ok && write_hashed(f, p, n, hh);
+        return ok;
+      },
+      [&] { return chunk_file_matches(path, fp, id, parent, ids, n_ids, g); });
 }
 
 // The cheap check before an export skips an existing chunk file: size, header and token ids (the payload's hash is only
@@ -477,7 +489,10 @@ inline bool read_manifest_head(const std::string& path, ManifestHead& out) {
 // bytes. The destructor sets `cancel` (the thread stops between blocks) and joins, so a Model can be destroyed while one
 // runs. Not movable (the thread holds `this`): keep it in a unique_ptr.
 // Every file is verified: magic, version, geometry, fingerprint, the tokens (and for a chunk its key and parent's name), sizes
-// and the Hash64 trailer. `bad`: the index of the chunk file that failed (-1: the manifest, or a cancel).
+// and the Hash64 trailer. `bad`: the index of the chunk file that FAILED VERIFICATION or is missing (-1: the manifest, a cancel,
+// or an I/O error). `io_error`: the read stopped on an I/O error (a fopen that failed for another reason than "no such file", a
+// fread that set ferror: a Windows antivirus / indexer lock, EIO, a flaky disk): that says nothing about the file's contents, so
+// `bad` is NOT set, and the caller must fail this restore only and keep the file, the manifest and the entry.
 struct DiskRead {
   static constexpr size_t kBlock = size_t(32) << 20;
   // inputs, set before start() and read-only afterwards
@@ -494,6 +509,7 @@ struct DiskRead {
   std::atomic<bool> cancel{false};
   std::atomic<int64_t> ns{0};                     // wall time of the read
   std::atomic<int> bad{-1};
+  std::atomic<bool> io_error{false};
   std::thread th;
 
   DiskRead() = default;
@@ -534,30 +550,44 @@ struct DiskRead {
              std::memory_order_relaxed);
     return ok;
   }
+  // A failed open: a missing file is a verdict (the file is gone), anything else (EACCES, a sharing violation, EMFILE ...) is not.
+  bool open_failed(int err) {
+    if (err != ENOENT && err != ENOTDIR) io_error.store(true, std::memory_order_relaxed);
+    return false;
+  }
+  // A read that returned less than asked: ferror is an I/O error, plain EOF is a truncated file (a verdict).
+  bool short_read(std::FILE* f) {
+    if (std::ferror(f) && !cancel.load(std::memory_order_relaxed)) io_error.store(true, std::memory_order_relaxed);
+    return false;
+  }
+  bool rh(std::FILE* f, void* p, size_t n, Hash64& hh) { return read_hashed(f, p, n, hh, &cancel, kBlock) || short_read(f); }
   bool read_trailer(std::FILE* f, const Hash64& h) {
     uint64_t want = 0;
-    if (!read_all(f, &want, 8, &cancel, kBlock) || want != h.digest()) return false;
-    return std::fgetc(f) == EOF;  // (nothing after the hash)
+    if (!read_all(f, &want, 8, &cancel, kBlock)) return short_read(f);
+    if (want != h.digest()) return false;
+    if (std::fgetc(f) == EOF) return !std::ferror(f) || short_read(f);  // (nothing after the hash)
+    return false;
   }
   bool read_manifest() {
     if (names.size() != chunk_paths.size() || names.size() != chunk.size() || pieces_bytes(tail) != info.tail_bytes) return false;
+    errno = 0;
     std::FILE* f = std::fopen(manifest.c_str(), "rb");
-    if (!f) return false;
+    if (!f) return open_failed(errno);
     FileCloser guard{f};
     Hash64 hh;
     ManifestHeader h{};
     const ManifestHeader want = make_manifest_header(info, ids.size(), names.size());
-    if (!read_hashed(f, &h, sizeof h, hh, &cancel, kBlock) || std::memcmp(&h, &want, sizeof h) != 0) return false;
+    if (!rh(f, &h, sizeof h, hh) || std::memcmp(&h, &want, sizeof h) != 0) return false;
     std::vector<int32_t> got(ids.size());
-    if (!read_hashed(f, got.data(), got.size() * sizeof(int32_t), hh, &cancel, kBlock) || got != ids) return false;
+    if (!rh(f, got.data(), got.size() * sizeof(int32_t), hh) || got != ids) return false;
     for (const auto& n : names) {
       char field[kNameField], want[kNameField];
       put_name(want, n);
-      if (!read_hashed(f, field, sizeof field, hh, &cancel, kBlock) || std::memcmp(field, want, kNameField) != 0) return false;
+      if (!rh(f, field, sizeof field, hh) || std::memcmp(field, want, kNameField) != 0) return false;
     }
-    if (!read_hashed(f, state, info.state_bytes, hh, &cancel, kBlock)) return false;
+    if (!rh(f, state, info.state_bytes, hh)) return false;
     for (const auto& [p, n] : tail)
-      if (!read_hashed(f, p, n, hh, &cancel, kBlock)) return false;
+      if (!rh(f, p, n, hh)) return false;
     return read_trailer(f, hh);
   }
   bool read_chunks() {
@@ -570,27 +600,27 @@ struct DiskRead {
         return false;
       }
       if (!read_chunk(i, chain[i], ct)) {
-        if (!cancel.load(std::memory_order_relaxed)) bad.store(int(i));
+        if (!cancel.load(std::memory_order_relaxed) && !io_error.load(std::memory_order_relaxed)) bad.store(int(i));
         return false;
       }
     }
     return true;
   }
   bool read_chunk(size_t i, const ChunkId& id, size_t ct) {
+    errno = 0;
     std::FILE* f = std::fopen(chunk_paths[i].c_str(), "rb");
-    if (!f) return false;
+    if (!f) return open_failed(errno);
     FileCloser guard{f};
     Hash64 hh;
     ChunkHeader h{};
     const std::string parent = i ? names[i - 1] : std::string();
-    if (!read_hashed(f, &h, sizeof h, hh, &cancel, kBlock) ||
-        !chunk_header_ok(h, make_chunk_header(info.fingerprint, id, parent, ct, info.g)))
+    if (!rh(f, &h, sizeof h, hh) || !chunk_header_ok(h, make_chunk_header(info.fingerprint, id, parent, ct, info.g)))
       return false;
     std::vector<int32_t> got(ct);
-    if (!read_hashed(f, got.data(), ct * sizeof(int32_t), hh, &cancel, kBlock) || !std::equal(got.begin(), got.end(), ids.begin() + std::ptrdiff_t(i * ct)))
+    if (!rh(f, got.data(), ct * sizeof(int32_t), hh) || !std::equal(got.begin(), got.end(), ids.begin() + std::ptrdiff_t(i * ct)))
       return false;
     for (const auto& [p, n] : chunk[i])
-      if (!read_hashed(f, p, n, hh, &cancel, kBlock)) return false;
+      if (!rh(f, p, n, hh)) return false;
     return read_trailer(f, hh);
   }
 };
@@ -621,6 +651,7 @@ class DiskIndex {
   Chunk& add(const std::string& name, uint64_t bytes) {
     Chunk& c = m_[name];
     c.bytes = bytes, c.present = true;
+    pending_.erase(name);  // (the file is registered again: it exists and was adopted / rewritten)
     return c;
   }
   void ref(const std::string& name) {
@@ -641,20 +672,36 @@ class DiskIndex {
   }
   // A read found the file damaged or missing: it is deleted and not served again; the entries that list it still hold their
   // reference (their restore fails and drops them), a later export writes it afresh.
+  // A removal that FAILS (Windows: another reader has the file open without FILE_SHARE_DELETE, an antivirus / indexer holds it) is
+  // not "gone": the name goes to a pending-delete set, retried by retry_pending() (the next forget / erase, sweep), and its bytes
+  // stay in physical_bytes() while it exists. A forgotten file is not served in the meantime (present = false).
   void forget_file(const std::string& name) {
     Chunk* c = find(name);
     if (!c || !c->present) return;
-    std::error_code ec;
-    std::filesystem::remove(path(name), ec);
+    const uint64_t bytes = c->bytes;
     c->present = false;
+    if (!remove_path(path(name))) pending_[name] = bytes;
+    retry_pending();
   }
+  // Retries the removals that failed; returns how many files went.
+  size_t retry_pending() {
+    size_t n = 0;
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      if (remove_path(path(it->first))) it = pending_.erase(it), n++;
+      else ++it;
+    }
+    return n;
+  }
+  size_t pending_files() const { return pending_.size(); }
+  // Bytes on the SSD in chunk files: the believed-present ones and the ones whose removal is still pending.
   uint64_t physical_bytes() const {
     uint64_t n = 0;
     for (const auto& kv : m_) n += kv.second.present ? kv.second.bytes : 0;
+    for (const auto& kv : pending_) n += kv.second;
     return n;
   }
   size_t files() const {
-    size_t n = 0;
+    size_t n = pending_.size();
     for (const auto& kv : m_) n += kv.second.present;
     return n;
   }
@@ -677,24 +724,39 @@ class DiskIndex {
     }
     for (const auto& p : gone) {
       std::error_code e3;
-      if (std::filesystem::remove(p, e3)) n++;
-      if (p.extension() == ".kvc") m_.erase(p.stem().string());
+      const bool removed = std::filesystem::remove(p, e3);
+      if (removed) n++;
+      if (p.extension() == ".kvc") {
+        const std::string name = p.stem().string();
+        m_.erase(name);
+        if (e3) {  // (could not be deleted: still on the disk, counted, retried)
+          std::error_code e4;
+          const auto sz = std::filesystem::file_size(p, e4);
+          pending_[name] = e4 ? 0 : uint64_t(sz);
+        }
+      }
     }
+    n += retry_pending();
     return n;
   }
 
  private:
+  // True when the file is gone afterwards (removed, or it did not exist).
+  static bool remove_path(const std::string& p) {
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+    return !ec;
+  }
   uint64_t erase(std::unordered_map<std::string, Chunk>::iterator it) {
     const uint64_t freed = it->second.present ? it->second.bytes : 0;
-    if (it->second.present) {
-      std::error_code ec;
-      std::filesystem::remove(path(it->first), ec);
-    }
+    if (it->second.present && !remove_path(path(it->first))) pending_[it->first] = it->second.bytes;
     m_.erase(it);
+    retry_pending();
     return freed;
   }
   std::string dir_;
   std::unordered_map<std::string, Chunk> m_;
+  std::unordered_map<std::string, uint64_t> pending_;  // chunk files whose removal failed: name -> bytes
 };
 
 // ---------------------------------------------------------------- export / import of an entry (spill.cc's spill_write / spill_import)

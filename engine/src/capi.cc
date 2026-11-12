@@ -405,13 +405,14 @@ int q27_spill_list_ex(void* m, char* buf, int cap) {
   return int(r.size());
 }
 
-// Writes min(n, 4) values: physical bytes on the SSD (each chunk file once + the manifests), logical bytes (the entries with a
-// file, each counted whole), chunk files, manifests.
+// Writes min(n, 5) values: physical bytes on the SSD (each chunk file once + the manifests + chunk files whose deletion failed and
+// is retried), logical bytes (the entries with a file, each counted whole), chunk files, manifests, pending-delete chunk files.
 int q27_spill_disk_usage(void* m, int64_t* out, int n) {
   return guard([&] { static_cast<Model*>(m)->spill_disk_usage(out, n); });
 }
 
-// *removed: leftover .tmp files and chunk files no imported manifest lists, deleted. Call once, after every manifest was imported.
+// *removed: leftover .tmp files and chunk files no imported manifest lists, deleted (and earlier failed deletions retried). Call
+// after every manifest was imported.
 int q27_spill_sweep(void* m, int* removed) {
   return guard([&] { *removed = static_cast<Model*>(m)->spill_sweep(); });
 }

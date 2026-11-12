@@ -453,6 +453,93 @@ static void test_export_import_branches() {
   fs::remove_all(dir);
 }
 
+// I/O errors are not verdicts on a file (review of the SSD dedup commits): a read that fails for another reason than "the file is not
+// there" / "its contents are wrong" sets io_error and NOT `bad`, so the engine fails that restore only and never deletes the chunk
+// file (chunk 0 is in nearly every manifest). A directory in place of the file opens fine on Linux and fails on the first fread
+// (EISDIR) -- the same shape as an EIO or a lock that appears after the open. A removal that fails (Windows: a reader holds the file
+// without FILE_SHARE_DELETE) goes to the pending-delete set: counted, retried, the file is not served meanwhile.
+static void test_io_errors_and_pending_deletes() {
+  std::mt19937 rng(11);
+  const std::string dir = tmpdir("spill_files_io");
+  DiskIndex idx;
+  idx.set_dir(dir + "/chunks");
+  const Entry a = make_entry(rng, {}, 2, 64, 100);
+  Exported ea;
+  CHECK(export_entry(a, idx, dir + "/entries/a.q27m", &ea));
+  auto read = [&](const std::string& manifest, DiskRead& d, HostKv& dst, std::vector<char>& state) {
+    dst = empty_kv(a.linear.size());
+    plan_read(d, a, idx, manifest, ea.names, &state, &dst);
+    return d.run_sync();
+  };
+  {  // a chunk file that cannot be read (I/O error): not `bad`, the file is untouched
+    const std::string c1 = idx.path(ea.names[1]);
+    fs::rename(c1, c1 + ".real");
+    fs::create_directory(c1);
+    HostKv dst;
+    std::vector<char> state;
+    DiskRead d;
+    CHECK(!read(ea.manifest, d, dst, state));
+    CHECK(d.io_error.load() && d.bad.load() == -1);
+    fs::remove(c1);
+    fs::rename(c1 + ".real", c1);
+    DiskRead d2;
+    CHECK(read(ea.manifest, d2, dst, state) && !d2.io_error.load() && same(a, state, dst));  // (nothing was lost)
+  }
+  {  // a manifest that cannot be read: io_error, bad stays -1; a missing / damaged chunk is still `bad` and not an I/O error
+    fs::rename(ea.manifest, ea.manifest + ".real");
+    fs::create_directory(ea.manifest);
+    HostKv dst;
+    std::vector<char> state;
+    DiskRead d;
+    CHECK(!read(ea.manifest, d, dst, state) && d.io_error.load() && d.bad.load() == -1);
+    fs::remove(ea.manifest);
+    fs::rename(ea.manifest + ".real", ea.manifest);
+    const std::string c0 = idx.path(ea.names[0]);
+    fs::rename(c0, c0 + ".away");
+    DiskRead d2;
+    CHECK(!read(ea.manifest, d2, dst, state) && !d2.io_error.load() && d2.bad.load() == 0);
+    fs::rename(c0 + ".away", c0);
+    truncate_by(c0, 1);
+    DiskRead d3;
+    CHECK(!read(ea.manifest, d3, dst, state) && !d3.io_error.load() && d3.bad.load() == 0);  // (a short read at EOF is damage)
+    fs::copy_file(idx.path(ea.names[1]), c0, fs::copy_options::overwrite_existing);  // (restore something readable)
+  }
+  {  // a removal that fails: pending, counted, retried
+    DiskIndex x;
+    x.set_dir(dir + "/chunks2");
+    fs::create_directories(x.dir());
+    x.add("aa-bb", 1000);
+    x.add("cc-dd", 500);
+    x.ref("aa-bb");
+    x.ref("cc-dd");
+    // (a non-empty directory cannot be remove()d: stands for a file another process holds open)
+    fs::create_directories(x.path("aa-bb") + "/held");
+    x.forget_file("aa-bb");
+    CHECK(x.find("aa-bb") && !x.find("aa-bb")->present);  // (not served)
+    CHECK(x.pending_files() == 1 && x.physical_bytes() == 1500 && x.files() == 2);  // (still on the disk: still counted)
+    CHECK(x.retry_pending() == 0 && x.pending_files() == 1);
+    fs::remove_all(x.path("aa-bb"));
+    CHECK(x.retry_pending() == 1 && x.pending_files() == 0 && x.physical_bytes() == 500);
+    // the last reference goes while the file is held: the entry leaves the index, the file stays counted until it can be removed
+    fs::create_directories(x.path("cc-dd") + "/held");
+    CHECK(x.unref("cc-dd") == 500 && !x.find("cc-dd") && x.pending_files() == 1 && x.physical_bytes() == 500);
+    CHECK(x.sweep() == 0 && x.pending_files() == 1);  // (the sweep retries too: still held)
+    fs::remove_all(x.path("cc-dd"));
+    CHECK(x.sweep() == 1 && x.pending_files() == 0 && x.physical_bytes() == 0);
+    x.add("ee-ff", 10);  // (re-registered: no longer pending)
+  }
+  {  // a rename that fails is no failure when the file already there is exactly what was to be written
+    const std::string target = dir + "/target.kvc";
+    fs::create_directories(target + "/held");
+    std::string err;
+    auto fill = [&](std::FILE* f, Hash64& hh) { return write_hashed(f, "abc", 3, hh); };
+    CHECK(!write_file_atomic(target, &err, fill) && !fs::exists(target + ".tmp"));
+    CHECK(write_file_atomic(target, &err, fill, [] { return true; }) && !fs::exists(target + ".tmp"));
+    CHECK(!write_file_atomic(target, &err, fill, [] { return false; }));
+  }
+  fs::remove_all(dir);
+}
+
 int main() {
   test_hash();
   test_names();
@@ -460,6 +547,7 @@ int main() {
   test_sharing_and_refcounts();
   test_crash_leftovers_and_sweep();
   test_export_import_branches();
+  test_io_errors_and_pending_deletes();
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
 }
