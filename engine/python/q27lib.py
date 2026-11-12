@@ -45,6 +45,11 @@ SIGNATURES = {
     "q27_spill_stats": ([P, P, I], I),
     "q27_spill_backup_one": ([P, P], I),
     "q27_spill_grow_pinned": ([P, I, P], I),
+    "q27_spill_match": ([P, P, I, I, P, P], I),
+    "q27_spill_restore_begin": ([P, ctypes.c_uint64, P], I),
+    "q27_spill_restore_poll": ([P, P, P, I, P], I),
+    "q27_spill_release": ([P, ctypes.c_uint64, P], I),
+    "q27_spill_sync_lookup": ([P, I], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
@@ -406,8 +411,9 @@ class Engine:
     # ---- tiered cache (SPILL_RAM_GIB > 0; frontend/tiercache.py)
 
     def spill_list(self):
-        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "path"}] of the checkpoints the KV pool gave up
-        (backup: the entry is an idle backup of a checkpoint still in the pool)."""
+        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "busy", "path"}] of the checkpoints the KV pool gave
+        up (backup: the entry is an idle backup of a checkpoint still in the pool; busy: it is being restored in the
+        background, SPILL_ASYNC_PROMOTE, and can be neither written out nor dropped)."""
         n = 1 << 16
         while True:
             buf = ctypes.create_string_buffer(n)
@@ -423,7 +429,8 @@ class Engine:
                 continue
             f = line.split("\t", 6)
             out.append({"id": int(f[0]), "pos": int(f[1]), "ram_bytes": int(f[2]), "on_disk": f[3] == "1",
-                        "last_use": int(f[4]), "backup": f[5] == "1", "path": f[6] if len(f) > 6 else ""})
+                        "last_use": int(f[4]), "backup": f[5] == "1", "busy": f[5] == "2",  # (column 5: 0 / 1 backup / 2 busy)
+                        "path": f[6] if len(f) > 6 else ""})
         return out
 
     def spill_backup_one(self):
@@ -455,11 +462,56 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 15)()
+        out = (ctypes.c_int64 * 20)()
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
-                "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses")
+                "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
+                # SPILL_ASYNC_PROMOTE: restores in progress, finished / failed async restores, their total ms and bytes
+                "restoring", "restored_async", "restore_failed", "restore_ms_total", "restore_bytes_total")
         return dict(zip(keys, out))
+
+    # ---- SPILL_ASYNC_PROMOTE (delay-hit scheduling, docs/tiered-cache.md): engine thread only, never block
+
+    @property
+    def has_spill_async(self):
+        """The library has the background-restore calls (an older build does not). They do nothing unless the engine was
+        created with SPILL_ASYNC_PROMOTE=1."""
+        return hasattr(lib(), "q27_spill_restore_begin")
+
+    def spill_match(self, ids, spec=False):
+        """The best spilled entry deeper than the pool's own match for the prompt `ids`, or None:
+        {"id", "pos", "bytes" (kv + state), "on_disk" (only on disk)}. Read-only. A restoring entry is returned too."""
+        src, out, found = array.array("i", ids), (ctypes.c_int64 * 4)(), ctypes.c_int()
+        self._check(lib().q27_spill_match(self.h, src.buffer_info()[0], len(ids), int(spec), out, ctypes.byref(found)),
+                    "q27_spill_match")
+        if not found.value:
+            return None
+        return {"id": out[0], "pos": out[1], "bytes": out[2], "on_disk": bool(out[3])}
+
+    def spill_restore_begin(self, entry_id):
+        """Starts restoring a spilled entry into the KV pool without blocking: 1 = its host -> device copy is queued (entry in
+        RAM), 2 = a thread is reading its file, 0 = not started (the request then takes prefix_begin's own path)."""
+        out = ctypes.c_int()
+        self._check(lib().q27_spill_restore_begin(self.h, entry_id, ctypes.byref(out)), "q27_spill_restore_begin")
+        return out.value
+
+    def spill_restore_poll(self, cap=64):
+        """Advances the restores; returns [(entry_id, ok)] for those that ended: ok True = restored and visible to
+        prefix_begin (and held for its request until that runs or spill_release), False = failed (computed instead)."""
+        ids, oks, n = (ctypes.c_int64 * cap)(), (ctypes.c_int32 * cap)(), ctypes.c_int()
+        self._check(lib().q27_spill_restore_poll(self.h, ids, oks, cap, ctypes.byref(n)), "q27_spill_restore_poll")
+        return [(ids[i], bool(oks[i])) for i in range(n.value)]
+
+    def spill_release(self, entry_id):
+        """The request that waited for restore `entry_id` gave up (timeout, cancel): its checkpoint is no longer held for it
+        (the engine may evict it like any other). True if something was released."""
+        out = ctypes.c_int()
+        self._check(lib().q27_spill_release(self.h, entry_id, ctypes.byref(out)), "q27_spill_release")
+        return bool(out.value)
+
+    def spill_sync_lookup(self, on):
+        """False: prefix_begin does not promote a spilled match synchronously (the scheduler chose to compute it)."""
+        self._check(lib().q27_spill_sync_lookup(self.h, int(bool(on))), "q27_spill_sync_lookup")
 
     def memory_report(self):
         """The memory pools: {"pools": [{"name", "host", "bytes", "items": [(what, bytes)]}], "slots": state cache

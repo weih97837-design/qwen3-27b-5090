@@ -19,6 +19,12 @@ checks the spill counters to show that the intended path was taken.
   f  Pinned + async   as a (then the SSD round trip of b), with SPILL_PINNED_GIB=2, SPILL_PINNED_SLAB_MIB=16 (every entry
                       is several pinned segments) and SPILL_ASYNC_IO=1; the tokens must be identical and the entries
                       must have been given pinned memory (pin_hits).
+  g  Async promote    SPILL_ASYNC_PROMOTE=1 with the pinned pool and async I/O, driving the engine API directly: as a, then as
+                      b (C's checkpoint through the SSD tier). Before the follow-up: spill_match finds the entry, spill_restore_begin
+                      starts it (1 from RAM, 2 from the file), the entry is still matched and a prefix_begin at that moment
+                      does NOT see it (a loading checkpoint is invisible), spill_restore_poll is called until it reports the
+                      id as restored, another request runs before the owner (the restored checkpoint is held), and the follow-up's
+                      prefix_begin must report the restored length; the tokens must be identical.
 
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens.
@@ -35,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -48,13 +55,15 @@ SCENARIOS = {
     "d": ("idle backup reuse", ["full"]),
     "e": ("speculative decoding (ring checkpoints)", ["full"]),
     "f": ("pinned segments + async I/O", ["full"]),
+    "g": ("async promote (delay hits): RAM and SSD", ["full"]),
 }
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
-SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"}}
+SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
+            "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"}}
 SUFFIX = ".q27kv"  # the name frontend/tiercache.py indexes at start()
 FOLLOW = 300  # new tokens of each follow-up turn
 KEYS = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "backed_up", "pinned_bytes",
-        "pin_hits", "pin_misses")
+        "pin_hits", "pin_misses", "restoring", "restored_async", "restore_failed")
 # Variables the tiered cache reads at engine creation: the driver sets them per run, never inherits them.
 CACHE_VARS = {"STATE_HOST_CACHE", "KV_POOL_TOKENS", "CHECKPOINT_INTERVAL", "MAX_SEQS", "VRAM_BACKUP_IDLE_S"}
 
@@ -146,11 +155,13 @@ class Run:
         self.log(f"  {key}: {len(out)} tokens, pos {self.eng.pos}")
         return out
 
-    def turn2(self, key, follow):
+    def turn2(self, key, follow, pre=None):
         """The conversation continues: prompt + generation + follow. With the cache it resumes at the end of the
         generation; the reference replays the first turn (prefill, then the generation) and runs the rest."""
         p2 = self.ids[key] + self.outs[key] + follow
         if self.cache:
+            if pre:
+                pre(p2)  # (scenario g: the background restore of the checkpoint this turn resumes from)
             cached = self.eng.prefix_begin(p2, spec=self.spec)
             self.check(f"{key}+: the follow-up resumes at the end of the first generation",
                        cached == self.fed[key], f"cached {cached}, end {self.fed[key]}")
@@ -274,7 +285,70 @@ def scen_f(R, spill_dir):
     scen_b(R, spill_dir)  # (the same conversations again, now through the SSD tier: segments written / read in order)
 
 
-SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f}
+RESTORE_WAIT_S = 120.0  # scenario g: how long a background restore may take before it is a failure
+
+
+def async_restore(R, key, p2, on_disk):
+    """Scenario g: restores key's spilled checkpoint through the delay-hit API, checking each step. The follow-up's own
+    prefix_begin (turn2) then has to resume at the end of the first generation, as in scenarios a and b."""
+    eng = R.eng
+    m = eng.spill_match(p2, R.spec)
+    R.check(f"{key}: spill_match finds the spilled checkpoint ({'file' if on_disk else 'RAM'})",
+            m is not None and m["pos"] == R.fed[key] and m["on_disk"] == on_disk, m)
+    if m is None:
+        return
+    before = eng.spill_stats()
+    began = eng.spill_restore_begin(m["id"])
+    want = 2 if on_disk else 1
+    R.check(f"{key}: spill_restore_begin returns {want}", began == want, began)
+    if not began:
+        return
+    again = eng.spill_match(p2, R.spec)
+    R.check(f"{key}: the restoring entry is still matched, so a second request waits for it too",
+            again is not None and again["id"] == m["id"], again)
+    cached0 = eng.prefix_begin(p2, spec=R.spec)  # (not a lookup of the loading checkpoint: invisible until the poll says so)
+    R.check(f"{key}: a loading checkpoint is invisible to prefix_begin", cached0 < R.fed[key],
+            f"cached {cached0} of {R.fed[key]}")
+    t0, done = time.monotonic(), []
+    while m["id"] not in dict(done) and time.monotonic() - t0 < RESTORE_WAIT_S:
+        done += eng.spill_restore_poll()
+        time.sleep(0.002)
+    dt = time.monotonic() - t0
+    R.check(f"{key}: spill_restore_poll reports the entry as restored", dict(done).get(m["id"]) is True,
+            f"{dt * 1000:.0f} ms")
+    # The restored checkpoint is held for its request: other requests that run before it (a new conversation, whose
+    # prefill takes pages and a state slot) take other checkpoints first. The follow-up's prefix_begin (turn2) must
+    # still resume at the end of the first generation.
+    other = R.prompt(4)[:1024]
+    c = eng.prefix_begin(other, spec=R.spec)
+    R._gen(other[c:])
+    eng.checkpoint()
+    R.log(f"  {key}: another request ran before the owner (held checkpoint must survive it)")
+    after = eng.spill_stats()
+    R.check(f"{key}: one async restore finished, none failed, none left",
+            delta(before, after, "restored_async") == 1 and delta(before, after, "restore_failed") == 0
+            and after["restoring"] == 0, f"{m['bytes'] / 1e9:.2f} GB, {m['bytes'] / max(dt, 1e-9) / 1e9:.1f} GB/s")
+
+
+def scen_g(R, spill_dir):
+    R.turn1("A", R.prompt(0))
+    s0 = R.snap("A's checkpoint in VRAM")
+    R.turn1("B", R.prompt(1))  # B's prefill evicts A's checkpoint to RAM
+    s1 = R.snap("after B's prefill (evicts A)")
+    R.check("B's prefill spilled A's checkpoint to RAM", delta(s0, s1, "spilled") > 0, f"spilled +{delta(s0, s1, 'spilled')}")
+    R.turn2("A", R.prompt(9)[:FOLLOW], pre=lambda p2: async_restore(R, "A", p2, False))
+    st = R.snap("pinned pool")
+    R.check("the entries were given pinned memory", st["pin_hits"] > 0 and st["pinned_bytes"] > 0,
+            f"pin_hits {st['pin_hits']}, pin_misses {st['pin_misses']}")
+    R.turn1("C", R.prompt(2))
+    R.turn1("D", R.prompt(3))  # evicts C's checkpoint; every RAM entry is then written to the files
+    n = export_ram(R.eng, spill_dir) if R.cache else 0
+    s2 = R.snap("RAM entries written to SPILL_DIR")
+    R.check("RAM entries written to SPILL_DIR", n > 0 and s2["on_disk"] > 0, f"{n} files, on_disk {s2['on_disk']}")
+    R.turn2("C", R.prompt(8)[:FOLLOW], pre=lambda p2: async_restore(R, "C", p2, True))
+
+
+SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g}
 
 
 # ---- worker: one process, one mode (ref | tiered), one phase
@@ -357,7 +431,7 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=3000, help="tokens per conversation")
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--pool-tokens", type=int, help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K)")
-    ap.add_argument("--scenarios", default="a,b,c,d,e,f", help="a,b,c,d,e,f")
+    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g", help="a,b,c,d,e,f,g")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     # internal: one worker process
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -375,7 +449,7 @@ def main():
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
         if s not in SCENARIOS:
-            ap.error(f"unknown scenario {s} (a-f)")
+            ap.error(f"unknown scenario {s} (a-g)")
     work = pathlib.Path(a.keep_dir or tempfile.mkdtemp(prefix="tiered_cache_test_")).resolve()
     work.mkdir(parents=True, exist_ok=True)
     fails = 0

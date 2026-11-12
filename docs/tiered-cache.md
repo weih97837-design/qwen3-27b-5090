@@ -73,13 +73,14 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 ## 加速選項（預設關閉）
 
 目前每次 spill（逐出）與 promote（前綴命中時搬回）都是在運算 stream 上以一般（pageable）主機記憶體複製，複製完才繼續，
-因此會暫停所有 GPU 工作與引擎執行緒，速度也只有 PCIe 的一半左右。兩個選項可改善，**預設都關閉**，行為與先前審查過的版本完全相同；
+因此會暫停所有 GPU 工作與引擎執行緒，速度也只有 PCIe 的一半左右。三個選項可改善，**預設都關閉**，行為與先前審查過的版本完全相同；
 請先在自己的 GPU 上通過 `scripts/tiered_cache_test.py`（輸出 token 必須與參考完全相同）再開啟。
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
 | `SPILL_PINNED_GIB` | `0` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉 |
 | `SPILL_ASYNC_IO` | `0` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
+| `SPILL_ASYNC_PROMOTE` | `0` | `1`：命中已 spill 的 checkpoint 時，請求進入「載入快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
 | `SPILL_PINNED_SLAB_MIB` | `1024` | 每次 pin 的區塊大小（MiB）：閒置時每輪只 pin 一個區塊，所以也是單次停頓的上限；一般不需調整 |
 
 - **SPILL_PINNED_GIB**：pin 記憶體很慢（WSL2 上約每 GiB 0.45 秒，期間其他 CUDA 呼叫都要等），所以絕不在請求處理中進行：
@@ -95,6 +96,36 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
   閒置備份仍會在該次呼叫結束前等它完成。**只有 entry 是 pinned 時，非同步才真的讓 CPU 不必等待**：
   對一般（pageable）記憶體的 `cudaMemcpyAsync` 在 CPU 端仍是同步的（驅動程式會先經由暫存區複製），
   所以單獨開 `SPILL_ASYNC_IO` 只改變 GPU 端的排序、CPU 仍會被卡住。**建議兩個選項一起開**（`SPILL_PINNED_GIB` 與 `SPILL_ASYNC_IO=1`）。
+
+- **SPILL_ASYNC_PROMOTE（delay hit 排程，參考 Strata, OSDI'26：排程時不要為快取載入而停擺）**：原本的 promote 在 `prefix_begin`
+  裡同步完成：RAM 的項目要等 H2D 複製，SSD 的項目還要在引擎執行緒上 `fread` 最多約 4.5 GiB，整個引擎停頓數秒。開啟後：
+  1. 排程器在放行等待中的請求之前呼叫 `spill_match`（唯讀）找出比 KV 池自己的命中更深的 spill entry。
+  2. 值得載入的話呼叫 `spill_restore_begin`：RAM 的項目立刻配好頁並把 H2D 排在 I/O stream 上（回傳 1）；
+     只在 SSD 的項目由引擎執行緒配好緩衝區（可 pinned），再由一條背景執行緒**只做** `fread`（回傳 2；該執行緒不碰任何引擎狀態與 CUDA）。
+  3. 請求進入 `restoring` 狀態（UI：「載入快取」，Slot 標題顯示「載入中 N」），**仍保留排隊順序，但被跳過**，後面的請求照常放行
+     （這就是 delay hit：等的是快取，不是 GPU）。每個排程迴圈與解碼步驟之間都會 `spill_restore_poll`（不阻塞）：
+     檔案讀完就接著配頁並排入 H2D；H2D 的 event 完成後，載入中的 checkpoint 才變成可見（`loading=false`），
+     entry 才被釋放，請求再度可被放行，它的 `prefix_begin` 就命中這個 checkpoint。
+  4. **載入中的 checkpoint 不可見也不可逐出**：不參與 `prefix_begin` 的查找、`spill_lookup`、重複檢查、閒置備份與
+     `cache_stats` 的「可逐出頁數」（這些頁在載入完成前不能算作新請求的空間）；`reserve_area` 搬移 parking 區的頁之前，
+     運算 stream 會先等它的 event。載入中的 entry 為 busy：不會被寫出、丟棄、TTL 刪除或再次 promote。
+  4b. **載入完成後的 checkpoint 是 `held`（保留給等它的請求）**：`evict_checkpoint` 先逐出其他 checkpoint，其次才是最舊的 held，
+     若只剩載入中的，則同步等待最舊那個載入完成（`cudaEventSynchronize`，少見的短暫停頓）再逐出，而不是回報 `KvFull`。
+     `cache_stats` 與 `spill_room` 不把 held 的頁算作空間。解除 held 的時機：該請求的 `prefix_begin` 命中它、worker 呼叫
+     `spill_release`（逾時、取消、結束、`begin` 之後），或只剩 held／載入中時的最舊者後備。**不設時間上限自動解除**：所有放棄等待的路徑
+     都會呼叫 release，最舊 held 後備則限制了遺漏的損害。`spill_restore_poll` 回傳 `(id, ok)`，失敗只算在該 id 上。
+     worker 在啟動載入前檢查 KV 池放得下（與 `kv_room` 同一套保留頁邏輯），放不下就不啟動；`KvFull` 時先 poll 一次載入並重試，才搶佔其他請求。
+  5. 逾時（30 秒）、讀檔失敗、或載入完成時 KV 池已沒有空間，請求都不再等：照原本的路徑繼續（`prefix_begin` 的同步 promote 仍在，作為後備）。
+
+  **載入還是重算（load-vs-recompute）。** 只有在 `估計載入時間 < 0.8 × 估計重算時間` 時才載入；否則放行請求讓 prefill 重算，
+  並關閉這一次 `prefix_begin` 的同步 promote（否則引擎仍會照樣停頓去載入）。
+  估計載入時間 ＝ entry 大小（KV＋state）÷ 載入速度 ＋ 0.05 秒；載入速度先用預設值（RAM pinned 12 GB/s、pageable 6 GB/s、SSD 2 GB/s），
+  有完成的載入之後改用實測值（以預設值的 0.25–4 倍為界，避免一次偏慢的量測讓之後都不載入）。
+  估計重算時間 ＝ 命中的 token 數 ÷ 實測的 prefill 速度（排程器每個 prefill chunk 量測；尚無量測時用 8000 tok/s，介於
+  architecture.md 量到的 19K 11,295 tok/s 與 194K 5,875 tok/s 之間）。門檻都是 `frontend/worker.py` 開頭的常數
+  （`RESTORE_MARGIN`、`RESTORE_TIMEOUT_S`、`RESTORE_BW_*`、`PREFILL_TPS_DEFAULT`）。
+  `/stats` 的 tiers 區塊有 `restoring`（載入中）、`restored_async`、`restore_failed` 與實測的 `restore_gbps`。
+  **沒有 `SPILL_ASYNC_IO=1` 時，複製本身仍是同步的**（SSD 的讀檔仍在背景，但 H2D 會停住運算 stream），建議三個選項一起開。
 
 **Windows 共享 GPU 記憶體預算。** pinned 記憶體會計入 Windows 的「共享 GPU 記憶體」，上限約為主機 RAM 的一半。
 引擎本身已經 pin 約 7 GiB（state 快取等），所以「約 7 GiB ＋ `SPILL_PINNED_GIB`」必須低於主機 RAM 的一半左右
@@ -170,7 +201,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
 ```
 
-`tiered_cache_test.py` 有五個情境，各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
+`tiered_cache_test.py` 有七個情境（a–g），各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
 
 | 情境 | 強制走的路徑 | 檢查的計數器 |
 | --- | --- | --- |
@@ -179,6 +210,8 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | c 重啟後匯入 | 第一個行程寫出檔案後結束；第二個行程 `spill_import` 後續談 | 匯入的檔案數；後續回合 `restored` 增加 |
 | d 閒置備份重用 | `spill_backup_one` 直到 False；之後的逐出不再複製 | `backed_up` 增加；逐出時 `spilled` 不變；後續回合 `restored` 增加 |
 | e 推測解碼 | 同 a，使用草稿模型（環形 checkpoint）；沒有草稿模型時跳過 | 同 a |
+| f pinned＋async I/O | 同 a、b，`SPILL_PINNED_GIB=2`、`SPILL_ASYNC_IO=1`（entry 分成多個 pinned 區段） | `pin_hits` 增加 |
+| g 背景載入 | 同 a、b，再加 `SPILL_ASYNC_PROMOTE=1`，直接呼叫引擎 API：`spill_match` → `spill_restore_begin`（RAM 回 1、檔案回 2）→ 載入中的 checkpoint 對 `prefix_begin` 不可見 → `spill_restore_poll` 直到回報該 id | `restored_async` 增加、`restore_failed` 不變；續談從上一回合結束處開始 |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。若情境失敗，先確認 `--pool-tokens`：池太大時不會逐出，
 檢查會失敗而不是通過，此時把池調小（預設為一段對話加其 checkpoint 再加 1K tokens）。

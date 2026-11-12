@@ -179,7 +179,8 @@ class TierPolicy:
 
         # RAM -> SSD: the oldest checkpoints first; when busy, only after twice the retention. An idle backup is not
         # written: its checkpoint is still in VRAM, so the file would be a copy of data that is not lost.
-        ram = sorted((e for e in entries if e["ram_bytes"] > 0 and not e.get("backup")),
+        # (an entry being restored in the background, "busy", is neither written out nor dropped: the engine refuses)
+        ram = sorted((e for e in entries if e["ram_bytes"] > 0 and not e.get("backup") and not e.get("busy")),
                      key=lambda e: self.ram_since.get(e["id"], now))
         for e in ram:
             age = now - self.ram_since.get(e["id"], now)
@@ -192,7 +193,7 @@ class TierPolicy:
         self.listed = entries
         for e in entries:
             entry_id = e["id"]
-            if not e["on_disk"]:
+            if not e["on_disk"] or e.get("busy"):
                 continue
             if entry_id not in self.written:
                 self.written[entry_id] = _mtime(e["path"], now)
@@ -260,7 +261,7 @@ class TierPolicy:
             return result
         deadline = clock() + budget_s
         now = self.clock()
-        ram = sorted((e for e in self.engine.spill_list() if e["ram_bytes"] > 0),
+        ram = sorted((e for e in self.engine.spill_list() if e["ram_bytes"] > 0 and not e.get("busy")),
                      key=lambda e: self.ram_since.get(e["id"], now))
         for i, e in enumerate(ram):
             if clock() >= deadline:
@@ -303,6 +304,8 @@ class TierPolicy:
             if fits():
                 break
             entry_id = e["id"]
+            if e.get("busy"):  # (being restored: its file is read right now)
+                continue
             try:
                 self.engine.spill_drop(entry_id)
             except RuntimeError as ex:

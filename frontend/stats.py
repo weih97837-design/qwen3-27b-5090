@@ -173,6 +173,11 @@ def _env_float(env, name):
         return None
 
 
+def _gbps(nbytes, ms):
+    """GB/s (10^9 bytes) of the engine's finished background restores, or None before one finished."""
+    return nbytes / (ms / 1000.0) / 1e9 if nbytes and ms and ms > 0 else None
+
+
 def tiers_block(engine, tiers, environ=None):
     """The tiered cache for the UI (None without a tier policy): the engine's spill counters, the policy's SSD use and
     the disk. Never raises: a failure is {"error": text}."""
@@ -195,7 +200,10 @@ def tiers_block(engine, tiers, environ=None):
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
                 "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],
-                "backed_up": sp.get("backed_up", 0), "pinned_bytes": sp.get("pinned_bytes", 0),
+                "backed_up": sp.get("backed_up", 0), "restoring": sp.get("restoring", 0),
+                "restored_async": sp.get("restored_async", 0), "restore_failed": sp.get("restore_failed", 0),
+                "restore_gbps": _gbps(sp.get("restore_bytes_total", 0), sp.get("restore_ms_total", 0)),
+                "pinned_bytes": sp.get("pinned_bytes", 0),
                 "pinned_used": sp.get("pinned_used", 0), "backup_entries": ts.get("backup_entries", 0),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,

@@ -503,11 +503,13 @@ function drawVram() {
 }
 
 // ---------------------------------------------------------------- sessions
-const STATE_COLOR = { running: "--good", parked: "--s1", admitted: "--muted", waiting: "--warning" };
+// "restoring" (SPILL_ASYNC_PROMOTE): a waiting request whose cached prefix is being loaded from RAM / SSD in the background.
+const STATE_COLOR = { running: "--good", parked: "--s1", admitted: "--muted", waiting: "--warning", restoring: "--s6" };
+const isQueued = (s) => s.state === "waiting" || s.state === "restoring";  // not in the engine yet: nothing prefilled
 function ctxBar(s) {
-  const prompt = s.prompt, cached = Math.min(s.cached, prompt), fed = Math.max(s.fed, s.state === "waiting" ? 0 : cached);
+  const prompt = s.prompt, cached = Math.min(s.cached, prompt), fed = Math.max(s.fed, isQueued(s) ? 0 : cached);
   const parts = [
-    ["cached" + (s.state === "waiting" ? " (expected)" : ""), cached, "--s1"],
+    ["cached" + (isQueued(s) ? " (expected)" : ""), cached, "--s1"],
     ["prefilled", Math.max(0, fed - cached), "--s3"],
     ["prompt to run", Math.max(0, prompt - Math.max(fed, cached)), "--pending"],
     ["generated", s.out, "--s2"],
@@ -531,7 +533,7 @@ function ctxBar(s) {
   const comp = [`system + tools ${fmtTok(sysEnd)}`, `history ${fmtTok(Math.max(0, lastMsg - sysEnd))}`,
     `last message ${fmtTok(Math.max(0, prompt - lastMsg))}`, `output ${fmtTok(s.out)}`];
   hoverable(wrap, () => ({ title: `context ${fmtTok(total)} tokens`, rows: [
-    [css("--s1"), fmtTok(cached), s.state === "waiting" ? "cached (expected)" : "cached"],
+    [css("--s1"), fmtTok(cached), isQueued(s) ? "cached (expected)" : "cached"],
     [css("--s3"), fmtTok(Math.max(0, fed - cached)), "prefilled"],
     [css("--pending"), fmtTok(Math.max(0, prompt - Math.max(fed, cached))), "prompt to run"],
     [css("--s2"), fmtTok(s.out), "generated"],
@@ -544,13 +546,14 @@ function drawSessions() {
   const box = $("sess"), seqs = state.tick?.seqs || [];
   if (!seqs.length) { box.replaceChildren(el("div", { class: "empty" }, state.tick ? "No requests running." : "Waiting for the engine.")); return; }
   const kids = seqs.map((s) => {
-    const phase = s.state === "waiting" ? (s.held ? "waiting for room" : "queued") : s.phase;
+    const phase = s.state === "restoring" ? `${fmtTok(s.restore?.tokens ?? 0)} tok from ${s.restore?.on_disk ? "SSD" : "RAM"}`
+      : s.state === "waiting" ? (s.held ? "waiting for room" : "queued") : s.phase;
     const [bar, comp] = ctxBar(s);
     const decAvg = s.out > 1 && s.decode_wall > 0 ? (s.out - 1) / s.decode_wall : null;
     const preAvg = s.prefill_s > 0 ? s.computed / s.prefill_s : null;
     const kv = [
       ["context", `${fmtTok(s.prompt + s.out)} tok`],
-      ["prefill now", s.phase === "prefill" && s.state !== "waiting" ? fmtRate(s.prefill_now) + " tok/s" : "–"],
+      ["prefill now", s.phase === "prefill" && !isQueued(s) ? fmtRate(s.prefill_now) + " tok/s" : "–"],
       ["prefill avg", preAvg ? fmtRate(preAvg) + " tok/s" : "–"],
       ["decode now", s.phase === "decode" ? fmtRate(s.decode_now) + " tok/s" : "–"],
       ["decode avg", decAvg ? fmtRate(decAvg) + " tok/s" : "–"],
@@ -565,7 +568,7 @@ function drawSessions() {
     ];
     return el("div", { class: "seq" },
       el("div", { class: "top" },
-        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), `${s.state} · ${phase}`),
+        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), s.state === "restoring" ? `載入快取 · ${phase}` : `${s.state} · ${phase}`),
         el("span", { class: "rid" }, s.rid),
         el("span", { class: "sub" }, s.endpoint || ""),
         el("span", { class: "muted" }, s.client || ""),
@@ -683,13 +686,15 @@ function drawSlots() {
   sec.hidden = false;
   const used = slots.filter((s) => s.state === "running" || s.state === "parked" || s.state === "admitted").length;
   const open = slots.filter((s) => s.open !== false).length;  // no "open" field (older server): every lane is open
-  $("slots-sum").textContent = `使用中 ${used} ／ 開放 ${open} ／ 上限 ${slots.length}`;
+  // Requests waiting while their cached prefix loads (SPILL_ASYNC_PROMOTE) are not in a lane: counted here.
+  const loading = (state.tick?.seqs || []).filter((s) => s.state === "restoring").length;
+  $("slots-sum").textContent = `使用中 ${used} ／ 開放 ${open} ／ 上限 ${slots.length}` + (loading ? ` ／ 載入中 ${loading}` : "");
   $("slots").replaceChildren(...(slots.length ? slots.map(slotTile) : [el("div", { class: "empty" }, "沒有推理 slot。")]));
 }
 
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["溢出 spilled", "spilled"], ["還原 restored", "restored"], ["寫入 SSD written", "written"],
-  ["已備份 backed_up", "backed_up"], ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+  ["已備份 backed_up", "backed_up"], ["背景還原 restored_async", "restored_async"], ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
 function tierCol(title, used, cap, note) {
   const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
   return el("div", { class: "tier" },
@@ -720,6 +725,8 @@ function drawTiers() {
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
     kvRow("保留 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 筆`),
+    ...(t.restoring || t.restored_async ? [kvRow("載入中", `${n(t.restoring)} 筆`),
+      kvRow("載入速度", t.restore_gbps == null ? "–" : `${t.restore_gbps.toFixed(1)} GB/s`)] : []),
     kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")));
   if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
   if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));

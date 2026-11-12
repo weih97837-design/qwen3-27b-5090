@@ -9,11 +9,18 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace q27 {
@@ -212,5 +219,114 @@ inline bool alloc_pinned_kv(PinnedPool& pool, size_t total, size_t page, HostKv&
   }
   return true;
 }
+
+// ---------------------------------------------------------------- the spill file, and its background reader
+
+inline constexpr char kSpillMagic[8] = {'Q', '2', '7', 'K', 'V', 'C', '1', '\0'};
+inline constexpr uint32_t kSpillVersion = 1;
+
+// The file: this header, n_ids token ids (int32), state_bytes of state, then kv_bytes of KV (the linear stream).
+struct SpillHeader {
+  char magic[8];
+  uint32_t version;
+  uint32_t kv_slices;
+  uint64_t fingerprint;     // the model, the draft and the KV type (Model::spill_fingerprint)
+  uint64_t kv_page_bytes;
+  uint64_t state_bytes;
+  uint32_t page_tokens;
+  uint32_t ring;
+  uint32_t n_ids;
+  uint32_t reserved;
+  uint64_t kv_bytes;
+};
+
+inline constexpr size_t kIoChunk = size_t(256) << 20;
+
+// fread of n bytes in chunks; with `cancel`, a set flag stops it between chunks (false).
+inline bool read_all(std::FILE* f, void* p, size_t n, const std::atomic<bool>* cancel = nullptr,
+                     size_t chunk = kIoChunk) {
+  char* c = static_cast<char*>(p);
+  while (n) {
+    if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+    const size_t k = std::min(n, chunk);
+    if (std::fread(c, 1, k, f) != k) return false;
+    c += k, n -= k;
+  }
+  return true;
+}
+
+// SPILL_ASYNC_PROMOTE: reads a spill file into buffers the engine thread prepared, on a background thread, so the
+// engine keeps stepping. THREADING CONTRACT: the thread touches only this object and the buffers it was given
+// (`state`, `segs`: the bytes of an entry's HostKv, which nobody else reads or frees meanwhile, as the entry is busy)
+// and the file. It never touches Model, the spill map, the page pool, the PinnedPool bookkeeping or CUDA. It ends by
+// storing `st` (release); the engine thread reads it with acquire, and only then joins the thread and uses the bytes.
+// The destructor sets `cancel` (the thread stops between chunks) and joins, so a Model can be destroyed while one runs.
+// Not movable (the thread holds `this`): keep it in a unique_ptr.
+struct DiskRead {
+  static constexpr size_t kChunk = size_t(32) << 20;
+  // inputs, set before start() and read-only afterwards
+  std::string path;
+  uint64_t fingerprint = 0, state_bytes = 0, kv_bytes = 0;
+  std::vector<int32_t> ids;                     // the tokens the file must hold
+  char* state = nullptr;                        // state_bytes bytes
+  std::vector<std::pair<char*, size_t>> segs;   // the KV stream, in order (sum of the lengths == kv_bytes)
+  // outputs
+  std::atomic<int> st{0};                       // 0 running, 1 ok, -1 failed
+  std::atomic<bool> cancel{false};
+  std::atomic<int64_t> ns{0};                   // wall time of the read
+  std::thread th;
+
+  DiskRead() = default;
+  DiskRead(const DiskRead&) = delete;
+  DiskRead& operator=(const DiskRead&) = delete;
+  ~DiskRead() {
+    cancel.store(true);
+    if (th.joinable()) th.join();
+  }
+  void start() {
+    th = std::thread([this] {
+      const auto t0 = std::chrono::steady_clock::now();
+      bool ok = false;
+      try {
+        ok = run();
+      } catch (...) {
+        ok = false;
+      }
+      ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+               std::memory_order_relaxed);
+      st.store(ok ? 1 : -1, std::memory_order_release);
+    });
+  }
+  // The engine thread, once st != 0 (acquire): the thread is over.
+  void join() {
+    if (th.joinable()) th.join();
+  }
+  int state_now() const { return st.load(std::memory_order_acquire); }
+
+ private:
+  // The checks of Model::spill_load, then the payload.
+  bool run() {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    struct Closer {
+      std::FILE* f;
+      ~Closer() { std::fclose(f); }
+    } closer{f};
+    SpillHeader h{};
+    if (!read_all(f, &h, sizeof h, &cancel, kChunk) || std::memcmp(h.magic, kSpillMagic, sizeof kSpillMagic) != 0 ||
+        h.version != kSpillVersion || h.fingerprint != fingerprint || h.n_ids != ids.size() ||
+        h.state_bytes != state_bytes || h.kv_bytes != kv_bytes)
+      return false;
+    std::vector<int32_t> got(h.n_ids);
+    if (!read_all(f, got.data(), got.size() * sizeof(int32_t), &cancel, kChunk) || got != ids) return false;
+    if (!read_all(f, state, state_bytes, &cancel, kChunk)) return false;
+    size_t total = 0;
+    for (const auto& [p, n] : segs) {
+      if (!read_all(f, p, n, &cancel, kChunk)) return false;
+      total += n;
+    }
+    return total == kv_bytes;
+  }
+};
 
 }  // namespace q27
