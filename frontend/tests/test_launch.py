@@ -396,3 +396,13 @@ def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):
     h.deploy_env = lambda: {"SPILL_RAM_GIB": "64", "VRAM_RESERVE_GIB": None}
     assert h.deploy_environ()["SPILL_RAM_GIB"] == "64"
     assert h.tick()["deploy"]["settings"]["SPILL_RAM_GIB"] == "64"
+
+
+def test_spill_fair_agents_setting(monkeypatch):
+    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", True, "flag")
+    assert launch.ENV_NAMES["spill_fair_agents"] == "SPILL_FAIR_AGENTS"
+    monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
+    assert launch.env_settings()["spill_fair_agents"] is True
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
+    assert launch.env_settings()["spill_fair_agents"] is False
+    assert launch.tier_env_value("spill_fair_agents", False) == "0" and launch.tier_env_value("spill_fair_agents", True) == "1"

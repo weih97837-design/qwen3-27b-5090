@@ -117,6 +117,7 @@ everywhere above.
 | `SPILL_PINNED_GIB` | 8 | Pinned host memory (GiB) for spill entries, pinned in 1 GiB slabs while the server is idle (`SPILL_PINNED_SLAB_MIB`). Faster copies. An entry is stored in segments (each inside one slab), so entries larger than a slab are pinned too; an entry the pool cannot hold completely uses normal memory. Part of the `SPILL_RAM_GIB` budget: the whole pinned pool counts toward it (reserved host memory, even when unused), and the value is clamped at startup to below it, leaving room for one checkpoint (at least 0.25 GiB). 8 by default since v0.3.2 (verified on an RTX 5090); 0: off. Counts against Windows shared GPU memory ([tiered-cache.md](tiered-cache.md)) |
 | `SPILL_ASYNC_IO` | 1 | 1: checkpoint pages are copied on a separate CUDA stream, so a spill or restore no longer stalls the GPU and the engine thread. The CPU is only freed for entries in pinned memory (copies to/from pageable memory block the CPU), so use it together with `SPILL_PINNED_GIB`. On by default since v0.3.2; 0: off |
 | `SPILL_ASYNC_PROMOTE` | 1 | 1: a request whose prompt matches a checkpoint spilled to RAM or SSD waits in state `restoring` while the engine loads it in the background (a thread reads the file, the copy runs on the I/O stream), and the requests behind it keep running; with 0 the match is promoted synchronously inside `prefix_begin`, stalling the engine for the whole load. A load starts only when it is clearly faster than computing the prompt again (estimated load time < 0.8 × recompute time) and gives up waiting after 30 s. Needs `SPILL_RAM_GIB` > 0; use with `SPILL_PINNED_GIB` and `SPILL_ASYNC_IO=1` (without async I/O the copy itself is synchronous). On by default since v0.3.2; 0: off |
+| `SPILL_FAIR_AGENTS` | 1 | 1: when the RAM tier or the SSD tier must free space, the victim is taken from the agent that currently uses the most bytes of that tier (bytes of a chunk shared by several agents are split between them; no guaranteed minimum share, so an idle agent's entries are the first to go when it is the biggest). Within that agent the order is: superseded checkpoints (a deeper checkpoint of the same conversation exists, and it is not a branch point or a prefix shared by several agents), then entries never reused before reused ones, then the oldest. 0: the same order over the whole tier, with no per-agent step. The VRAM pool stays plain least-recently-used either way. The agent is the `X-Agent-Id` / `user` of the request (see "Agent identity"). Read by the engine process (RAM tier) and by `frontend/tiercache.py` (SSD tier); see `docs/tiered-cache.md` "Retention" |
 | `SPILL_DIR` | `/cache/kv` | Directory in the container where spilled checkpoints are written. `compose.yaml` mounts the named volume `kvcache` there |
 | `SPILL_RAM_RETENTION_S` | 3600 | Seconds a checkpoint stays in RAM before `frontend/tiercache.py` writes it to SSD (only when idle) |
 | `SPILL_SSD_GIB` | 100 | Cap of the SSD tier in GiB; the oldest files are deleted first |
@@ -265,6 +266,7 @@ variables:
 | `spill_pinned_gib` | `SPILL_PINNED_GIB` | GiB, 0 or more (8; 0: off; the engine clamps it below `SPILL_RAM_GIB`) |
 | `spill_async_io` | `SPILL_ASYNC_IO` | `true` or `false` (`true`) |
 | `spill_async_promote` | `SPILL_ASYNC_PROMOTE` | `true` or `false` (`true`) |
+| `spill_fair_agents` | `SPILL_FAIR_AGENTS` | `true` or `false` (`true`) |
 | `spill_dir` | `SPILL_DIR` | A folder for the spilled checkpoints; empty: no SSD tier |
 
 The tiered cache settings ("分層快取" in the page, and a group of the tray app's settings window) have no upper limit, since
@@ -411,7 +413,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
-| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_SSD_MIN_TOKENS`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
+| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_SSD_MIN_TOKENS`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_FAIR_AGENTS`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |

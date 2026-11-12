@@ -116,30 +116,48 @@ def request_meta(path, headers, body):
             "preview": last[:PREVIEW] + ("…" if len(last) > PREVIEW else "")}
 
 
-def agents_block(seqs, totals):
+def agents_block(seqs, totals, use=None):
     """Per-agent aggregate for the UI (worker.Scheduler.stats). seqs: the snapshot's request rows (with "agent",
     "state"); totals: agent -> {"requests", "prompt_tokens", "cached_tokens", "hit_requests"} counted since the
-    worker started. ram_bytes / ssd_bytes are placeholders (None) for the tiered-cache eviction change to fill from
-    its per-agent accounting (Scheduler.agent_of_ids). Sorted by running + waiting, then by requests."""
+    worker started. use: the engine's per-agent tier bytes (TierPolicy.agent_rows: [{"owner", "ram_bytes", "ssd_bytes",
+    "ram_entries", "ssd_entries"}], shared chunks split between the agents that reference them); an owner is the agent's
+    id (agent.owner_id) and is matched to the names this snapshot knows. ram_bytes / ssd_bytes are None without it (an older
+    engine); an owner no known agent maps to (owner 0, or an agent of an earlier run: the SSD keeps them) is the "unknown"
+    row. Sorted by running + waiting, then by requests."""
+    have_use = use is not None and len(use) > 0
+
+    def blank(a):
+        return {"agent": a, "running": 0, "waiting": 0, "requests": 0, "hit_requests": 0, "prompt_tokens": 0, "cached_tokens": 0,
+                "hit": None, "ram_bytes": 0 if have_use else None, "ssd_bytes": 0 if have_use else None,
+                "ram_entries": 0 if have_use else None, "ssd_entries": 0 if have_use else None}
     out = {}
     for a, t in totals.items():
-        out[a] = {"agent": a, "running": 0, "waiting": 0, "requests": t["requests"], "hit_requests": t["hit_requests"],
-                  "prompt_tokens": t["prompt_tokens"], "cached_tokens": t["cached_tokens"],
-                  "hit": t["cached_tokens"] / t["prompt_tokens"] if t["prompt_tokens"] else None,
-                  "ram_bytes": None, "ssd_bytes": None}
+        row = out[a] = blank(a)
+        row.update(requests=t["requests"], hit_requests=t["hit_requests"], prompt_tokens=t["prompt_tokens"],
+                   cached_tokens=t["cached_tokens"],
+                   hit=t["cached_tokens"] / t["prompt_tokens"] if t["prompt_tokens"] else None)
     for r in seqs:
         a = r.get("agent")
         if a is None:
             continue
-        row = out.setdefault(a, {"agent": a, "running": 0, "waiting": 0, "requests": 0, "hit_requests": 0, "prompt_tokens": 0,
-                                 "cached_tokens": 0, "hit": None, "ram_bytes": None, "ssd_bytes": None})
+        row = out.setdefault(a, blank(a))
         row["waiting" if r["state"] in ("waiting", "restoring") else "running"] += 1
+    if have_use:
+        names = {agent.owner_id(a): a for a in out}
+        for u in use:
+            name = names.get(u.get("owner"), UNKNOWN_AGENT)
+            row = out.setdefault(name, blank(name))
+            for k in ("ram_bytes", "ssd_bytes", "ram_entries", "ssd_entries"):
+                row[k] += int(u.get(k) or 0)
     return sorted(out.values(), key=lambda x: (-(x["running"] + x["waiting"]), -x["requests"], x["agent"]))
+
+
+UNKNOWN_AGENT = "unknown"
 
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
                    "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS",
-                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "VRAM_BACKUP_IDLE_S")
+                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "VRAM_BACKUP_IDLE_S")
 DAY_S = 86400.0
 
 
@@ -204,6 +222,12 @@ def _gbps(nbytes, ms):
 
 
 TIER_SPLIT_KEYS = tuple(f"{t}_{k}_{u}" for t in ("ram", "disk") for k in ("backup", "evicted") for u in ("entries", "bytes"))
+TIER_REUSE_KEYS = tuple(f"{t}_{k}_{u}" for t in ("ram", "disk") for k in ("reused", "never", "superseded") for u in ("entries", "bytes"))
+
+
+def _rate(n, d):
+    """n / d, None when n is unknown (an older engine) or d is 0 (0.0 restored of some is a real rate)."""
+    return n / d if n is not None and d else None
 
 
 def prefix_block(snap, memory):
@@ -256,6 +280,10 @@ def tiers_block(engine, tiers, environ=None):
                 "ram_chunks": sp.get("chunks"), "chunk_hits": sp.get("chunk_hits"), "chunk_misses": sp.get("chunk_misses"),
                 "ram_cap_bytes": int(ram_gib * (1 << 30)) if ram_gib is not None else None,
                 "in_ram": sp["in_ram"], "on_disk": sp["on_disk"], "ssd_bytes": ts.get("ssd_bytes"),
+                # SSD dedup (an older engine / policy: None): ssd_bytes is the PHYSICAL use (each shared chunk file once, what the
+                # cap is about); logical is what the entries would take as separate files
+                "ssd_logical_bytes": ts.get("ssd_logical_bytes"), "ssd_physical_bytes": ts.get("ssd_physical_bytes"),
+                "ssd_dedup_ratio": ts.get("ssd_dedup_ratio"),
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
                 "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],
@@ -266,6 +294,13 @@ def tiers_block(engine, tiers, environ=None):
                 "pinned_used": sp.get("pinned_used", 0), "backup_entries": ts.get("backup_entries", 0),
                 # per tier: entries and bytes, split into live backups (copies of checkpoints still in VRAM) and evicted ones
                 **{k: ts.get(k, 0) for k in TIER_SPLIT_KEYS},
+                # retention: entries / bytes per tier that were restored at least once vs never (and the superseded ones); the
+                # reuse rate is restored / entries received (RAM: restored from RAM / spilled; SSD: restored from the SSD / written)
+                **{k: ts.get(k, 0) for k in TIER_REUSE_KEYS},
+                "ram_restored": sp.get("restored_ram"), "ssd_restored": sp.get("restored_disk"),
+                "ram_reuse_rate": _rate(sp.get("restored_ram"), sp["spilled"]),
+                "ssd_reuse_rate": _rate(sp.get("restored_disk"), sp["written"]),
+                "fair_agents": ts.get("fair_agents"), "ssd_skipped_superseded": ts.get("ssd_skipped_superseded", 0),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
                 "dir": str(directory) if directory else None}

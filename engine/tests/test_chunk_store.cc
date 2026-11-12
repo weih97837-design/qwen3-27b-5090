@@ -671,6 +671,48 @@ static void test_choose_victim() {
   CHECK(steps == 5 && b.empty() && sl.empty());
 }
 
+// Retention (retention.h): the ONE victim order within a class: the agent using the most bytes, then superseded, then never hit,
+// then the old rule. Candidates: {last_use, freed, state, agent, agent_use, hits, superseded}.
+static void test_retention_order() {
+  using V = std::vector<VictimCand>;
+  auto cand = [](uint64_t last_use, size_t freed, uint64_t agent, double use, uint32_t hits, bool sup) {
+    VictimCand c;
+    c.last_use = last_use, c.freed = freed, c.state = 100, c.agent = agent, c.agent_use = use, c.hits = hits, c.superseded = sup;
+    return c;
+  };
+  // defaults (what the engine has when nobody tags anything): the old order, whatever `fair` says
+  CHECK(pick_victim({{5, 100}, {3, 100}, {9, 100}}, false) == 1 && pick_victim({{5, 100}, {3, 100}, {9, 100}}, true) == 1);
+  // never hit before hit, even when the hit one is older and frees more
+  CHECK(pick_victim(V{cand(1, 900, 0, 0, 2, false), cand(8, 300, 0, 0, 0, false)}) == 1);
+  // superseded before never-hit (and a superseded one that was hit before a never-hit one that is not superseded)
+  CHECK(pick_victim(V{cand(1, 300, 0, 0, 0, false), cand(9, 300, 0, 0, 3, true)}) == 1);
+  // within the same group the old rule: most freed, oldest within a factor 2
+  CHECK(pick_victim(V{cand(4, 600, 0, 0, 0, false), cand(7, 1000, 0, 0, 0, false), cand(2, 400, 0, 0, 0, false)}) == 0);
+  // fairness: the agent with the most bytes gives the victim, even when the small agent's entry is older / never hit / superseded
+  V f{cand(1, 500, 7, 10.0, 0, true), cand(50, 500, 9, 900.0, 5, false), cand(60, 500, 9, 900.0, 5, false)};
+  CHECK(pick_victim(f, true) == 1);   // agent 9 (900 B > 10 B): its older entry (both hit, not superseded)
+  CHECK(pick_victim(f, false) == 0);  // no fairness: the superseded one, whoever owns it
+  // within the big agent the rules still apply
+  f[2].hits = 0;
+  CHECK(pick_victim(f, true) == 2);
+  // ties between agents: the smaller id
+  CHECK(pick_victim(V{cand(5, 100, 4, 50.0, 0, false), cand(1, 100, 3, 50.0, 0, false)}) == 1);
+  // the class choice is unchanged by the order: a backup of a small agent still goes before a sole copy
+  CHECK(choose_victim(V{cand(5, 300, 7, 10.0, 0, false)}, V{cand(1, 1000, 9, 900.0, 0, true)}).pass == 0);
+  // each class applies the order on its own candidates: the agent with the most bytes THAT HAS a candidate there
+  CHECK(choose_victim(V{}, V{cand(1, 500, 7, 10.0, 0, false), cand(2, 500, 9, 900.0, 0, false)}).idx == 1);
+  // termination with a mixed bag
+  V mix{cand(1, 100, 1, 5, 0, false), cand(2, 80, 2, 90, 1, true), cand(3, 60, 2, 90, 0, false), cand(4, 40, 0, 0, 0, true)};
+  int steps = 0;
+  while (!mix.empty()) {
+    const int k = pick_victim(mix);
+    CHECK(k >= 0);
+    mix.erase(mix.begin() + k);
+    CHECK(++steps <= 4);
+  }
+  CHECK(steps == 4);
+}
+
 static void test_pick_victim() {
   // equal freed: LRU
   CHECK(pick_victim({{5, 100}, {3, 100}, {9, 100}}) == 1);
@@ -746,6 +788,7 @@ int main() {
   test_free_inflight_parks();
   test_restore_holds_chunks();
   test_choose_victim();
+  test_retention_order();
   test_churn();
   if (fails) {
     std::printf("%d check(s) FAILED\n", fails);

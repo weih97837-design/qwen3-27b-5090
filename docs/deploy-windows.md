@@ -146,7 +146,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 **情境 e（推測解碼）**：需要 DFlash2 草稿模型。`SPEC=none` 或草稿未下載時，該情境顯示 `SKIP`，這不是失敗。
 
 **`bench.cmd` 的注意事項**：
-- SSD 檔案放在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache\bench`；腳本會刪除該資料夾內的 `*.q27kv` 檔案，請不要把它指向其他資料。
+- SSD 檔案放在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache\bench`；腳本會刪除該資料夾內 `entries\`、`chunks\` 子資料夾的檔案，請不要把它指向其他資料。
 - 每個尺寸都會建立兩個引擎，執行時間以分鐘計。耗時的實際數字**未驗證**。
 - 預設 `SPILL_RAM_GIB=40`（測試為 2），所以 bench 在 RAM 中保留的 checkpoint 可達 40 GiB。
 - 腳本只讀取 `settings.ini` 的 `HF_HOME` 與 `WEIGHTS`；其他 `SPILL_*` 設定由腳本自己決定，不會套用 `settings.ini` 的值。

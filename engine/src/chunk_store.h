@@ -275,7 +275,7 @@ void chunk_free(Store& st, typename Store::C* c, std::vector<Retired>& retired, 
   put_event(out.done);  // (complete: not inflight)
 }
 
-// The entry's linear slice-major stream (the .q27kv payload: page i of slice sl at (sl * n + i) * page_bytes, n =
+// The entry's linear slice-major stream (the old linear file payload; now the layout of a private entry's kv: page i of slice sl at (sl * n + i) * page_bytes, n =
 // chunks * chunk_pages + tail_pages) from its chunks (each [slice][chunk_pages] inside) and tail ([slice][tail_pages]
 // inside): fn(const char*, bytes) in file order. With no chunks this is the tail's stream unchanged.
 template <class C, class F>
@@ -291,20 +291,48 @@ void linear_pieces(const std::vector<C*>& chunks, const HostKv& tail, int slices
   }
 }
 
-// Which entry spill_enforce_ram evicts: the one that frees the most host memory, the least recently used among those
-// within a factor 2 of the best (so an entry whose chunks are shared with others, which frees almost nothing, is kept
-// in favour of one that gives real memory back, without always sacrificing the newest big entry). `state`: the part of
-// `freed` that is the recurrent state alone (an entry whose KV is shared or pinned frees only that).
+// Which entry spill_enforce_ram evicts: ONE value-based order (retention.h, docs/tiered-cache.md "Retention"), the same the frontend
+// applies to the SSD. In order: (1) the agent using the most bytes in the tier (`agent_use`; skipped with fair == false), then in that
+// agent (2) superseded entries, (3) never-hit before hit ones, and (4) the one that frees the most host memory, the least recently
+// used among those within a factor 2 of the best (so an entry whose chunks are shared with others, which frees almost nothing, is
+// kept in favour of one that gives real memory back, without always sacrificing the newest big entry). With the defaults of the
+// new fields (agent 0, hits 0, not superseded: what the engine has when the frontend never tags anything) (1)-(3) change nothing and
+// this is the old rule. `state`: the part of `freed` that is the recurrent state alone (an entry whose KV is shared or pinned
+// frees only that).
 struct VictimCand {
   uint64_t last_use = 0;
   size_t freed = 0;
   size_t state = 0;
+  uint64_t agent = 0;      // 0: unknown (its own bucket)
+  double agent_use = 0;    // bytes the candidate's agent uses in this tier (the same number for all of an agent's candidates)
+  uint32_t hits = 0;       // times it (or the checkpoint it was spilled from) was restored / hit
+  bool superseded = false;
 };
-inline int pick_victim(const std::vector<VictimCand>& v) {
-  size_t best = 0;
-  for (const VictimCand& c : v) best = std::max(best, c.freed);
+inline int pick_victim(const std::vector<VictimCand>& v, bool fair = true) {
+  if (v.empty()) return -1;
+  std::vector<size_t> pool(v.size());
+  for (size_t i = 0; i < v.size(); i++) pool[i] = i;
+  auto keep = [&](auto&& pred) {  // the candidates of `pool` for which pred(v[i]) holds
+    std::vector<size_t> r;
+    for (size_t i : pool)
+      if (pred(v[i])) r.push_back(i);
+    pool.swap(r);
+  };
+  if (fair) {  // (1) the agent with the most bytes (ties: the smaller id)
+    size_t top = pool[0];
+    for (size_t i : pool)
+      if (v[i].agent_use > v[top].agent_use || (v[i].agent_use == v[top].agent_use && v[i].agent < v[top].agent)) top = i;
+    const uint64_t a = v[top].agent;
+    keep([&](const VictimCand& c) { return c.agent == a; });
+  }
+  int best_rank = 4;  // (2) + (3): superseded, then never hit, then hit
+  auto rank = [](const VictimCand& c) { return (c.superseded ? 0 : 2) + (c.hits > 0 ? 1 : 0); };
+  for (size_t i : pool) best_rank = std::min(best_rank, rank(v[i]));
+  keep([&](const VictimCand& c) { return rank(c) == best_rank; });
+  size_t best = 0;  // (4)
+  for (size_t i : pool) best = std::max(best, v[i].freed);
   int pick = -1;
-  for (size_t i = 0; i < v.size(); i++)
+  for (size_t i : pool)
     if (v[i].freed * 2 >= best && (pick < 0 || v[i].last_use < v[size_t(pick)].last_use)) pick = int(i);
   return pick;
 }
@@ -319,8 +347,8 @@ struct VictimChoice {
   int pass = -1;  // 0 / 1; -1: no candidate
   int idx = -1;
 };
-inline VictimChoice choose_victim(const std::vector<VictimCand>& backups, const std::vector<VictimCand>& sole) {
-  const int k0 = pick_victim(backups), k1 = pick_victim(sole);
+inline VictimChoice choose_victim(const std::vector<VictimCand>& backups, const std::vector<VictimCand>& sole, bool fair = true) {
+  const int k0 = pick_victim(backups, fair), k1 = pick_victim(sole, fair);
   if (k0 >= 0) {
     const VictimCand& b = backups[size_t(k0)];
     size_t best_sole = 0;

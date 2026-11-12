@@ -1004,7 +1004,7 @@ struct Row {
 enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
 enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
 
-constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 23;
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 24;
 
 struct SettingsWindow {
     HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
@@ -1060,6 +1060,7 @@ std::vector<Row> make_rows() {
         {L"Pinned RAM (GiB)", L"SPILL_PINNED_GIB", "spill_pinned_gib", K::edit, T::engine, L"0: off. Faster copies"},
         {L"Asynchronous copies", L"SPILL_ASYNC_IO", "spill_async_io", K::choice, T::engine, nullptr},
         {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
+        {L"Fair agents (evict from the biggest)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
         {L"SSD folder", L"SPILL_DIR", "spill_dir", K::edit, T::engine, nullptr},
     };
 }
@@ -1081,7 +1082,9 @@ bool tier_number_row(const Row& row) {
         if (!strcmp(row.key, key)) return true;
     return false;
 }
-bool tier_flag_row(const Row& row) { return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote")); }
+bool tier_flag_row(const Row& row) {
+    return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote") || !strcmp(row.key, "spill_fair_agents"));
+}
 bool tier_row(const Row& row) { return tier_number_row(row) || tier_flag_row(row) || (row.key && !strcmp(row.key, "spill_dir")); }
 
 // A number of the tiered cache as text: finite and 0 or more ("" if it is not).

@@ -45,7 +45,7 @@ import native_env  # noqa: E402 - before q27lib and qwen27b (HF_HOME, Q27_LIB; s
 DEFAULT_WEIGHTS = native_env.apply()
 
 OPS = ("evict_spill", "promote_ram", "backup_idle", "evict_backup", "export_ssd", "import_ssd", "promote_ssd")
-SUFFIX = ".q27kv"
+SUFFIX = ".q27m"  # a manifest in SPILL_DIR/entries; its chunk files go to SPILL_DIR/chunks (the engine decides)
 
 
 def parse_env(text):
@@ -161,10 +161,12 @@ def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
         if e is None:
             rows.append(row(size, "export_ssd", None, 0, "no RAM entry to export"))
             return
-        path = os.path.join(spill_dir, uuid.uuid4().hex + SUFFIX)
+        os.makedirs(os.path.join(spill_dir, "entries"), exist_ok=True)
+        path = os.path.join(spill_dir, "entries", uuid.uuid4().hex + SUFFIX)
         ms, _ = timed(lambda: eng.spill_export(e["id"], path))
-        rows.append(row(size, "export_ssd", ms, e["ram_bytes"], f"file {os.path.getsize(path) / 1e9:.2f} GB"))
-        fbytes = os.path.getsize(path)
+        usage = eng.spill_disk_usage()  # (the files this entry took: its manifest and its chunk files; an older engine: the one file)
+        fbytes = usage["physical_bytes"] if usage else os.path.getsize(path)
+        rows.append(row(size, "export_ssd", ms, e["ram_bytes"], f"files {fbytes / 1e9:.2f} GB"))
     finally:
         eng.close()
 
@@ -190,8 +192,9 @@ def run_once(args):
     rows, info = [], []
     try:
         for size in args.sizes:
-            for f in pathlib.Path(spill_dir).glob("*" + SUFFIX):
-                f.unlink()
+            for sub in ("entries", "chunks"):
+                for f in pathlib.Path(spill_dir, sub).glob("*"):
+                    f.unlink()
             run_size(size, docs, spill_dir, args.weights, args.kv_dtype, rows, info)
     finally:
         if own:

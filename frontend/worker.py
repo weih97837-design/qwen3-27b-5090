@@ -401,7 +401,8 @@ class Scheduler:
         self.m["q27:requests_total"] += 1
 
     def note_checkpoints(self, s, ids, positions):
-        """Remembers that request s's agent saved (or is about to save) checkpoints of ids at these positions: a bounded
+        """(The tiered cache's retention does not use this: the engine tags each checkpoint with its agent, set_owner / agent.owner_id.)
+        Remembers that request s's agent saved (or is about to save) checkpoints of ids at these positions: a bounded
         dict (the last AGENT_NOTES) from agents.prefix_fingerprint(ids, pos) to the agent. A later change that evicts
         per agent asks agent_of_ids(ids, pos) for a checkpoint or spilled entry it holds. The latest writer wins when
         two agents save the same prefix; a fingerprint is cheap (first 4096 tokens + last 64 + pos), not exact."""
@@ -1005,6 +1006,10 @@ class Scheduler:
         self.cur = None  # (prefix_begin drops whatever the engine held)
         if s.no_sync:  # (loading its spilled match was judged slower than computing it: prefix_begin must not load it)
             self.engine.spill_sync_lookup(False)
+        # Retention: the checkpoints this sequence saves (also while it is parked) belong to its agent (an older engine: a no-op).
+        set_owner = getattr(self.engine, "set_owner", None)
+        if set_owner is not None:
+            set_owner(agents.owner_id(s.agent))
         try:
             cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
         finally:
@@ -1345,6 +1350,9 @@ class Scheduler:
             for key in ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes"):
                 if key in sp:  # (RAM dedup: an older engine does not report them)
                     out[f"q27:tier_ram_{key}"] = sp[key]
+            for key in ("ssd_logical_bytes", "ssd_physical_bytes"):
+                if ts.get(key) is not None:  # (SSD dedup: an older engine keeps flat files and has no such figures)
+                    out[f"q27:tier_{key}"] = ts[key]
         return out
 
 
@@ -1385,7 +1393,8 @@ class Scheduler:
                 "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
                 "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
                 "tiers": tiers_block(self.engine, getattr(self, "tiers", None)),
-                "agents": agents_block(seqs, self.__dict__.get("agent_totals", {})),
+                "agents": agents_block(seqs, self.__dict__.get("agent_totals", {}),
+                                       getattr(getattr(self, "tiers", None), "agent_rows", None)),
                 "hits": {"requests": self.m["q27:requests_total"], "prompt_tokens": self.m["q27:prompt_tokens_total"],
                          "cached_tokens": self.m["q27:cached_tokens_total"],
                          "turn2_requests": self.m["q27:turn2_requests_total"],

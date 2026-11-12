@@ -1,101 +1,38 @@
-// Host-only test of the background spill-file reader (DiskRead in src/host_kv.h, SPILL_ASYNC_PROMOTE): no CUDA, no GPU.
+// Host-only test of the background entry reader (DiskRead in src/spill_files.h, SPILL_ASYNC_PROMOTE): no CUDA, no GPU.
 //   g++ -std=c++20 -O1 -Wall -Wextra -fsanitize=thread -Isrc tests/test_spill_read.cc -o /tmp/test_spill_read -pthread && /tmp/test_spill_read
 //   (and the same with -fsanitize=address,undefined)
-// The reader reads a file in Model::spill_write's format into a segmented HostKv (pinned-pool regions or one pageable
-// buffer) on a thread, as Model::spill_restore_begin / spill_restore_poll use it: the "engine thread" here polls the
-// atomic state, joins, then checks the bytes. Failure cases: damaged header, fingerprint, ids, truncation, no file.
-#include <unistd.h>
+// The reader reads a manifest AND the chunk files it lists (several files, some shared by other entries being read at the same
+// moment) into a segmented HostKv (pinned-pool regions or one pageable buffer) on a thread, as Model::spill_restore_begin /
+// spill_restore_poll use it: the "engine thread" here polls the atomic state, joins, then checks the bytes. Failure cases: a
+// missing / damaged chunk (named in `bad`), fingerprint, tokens, truncation. Cancelling by destruction joins before the buffers go.
+#include "spill_test_util.h"
 
-#include <cstdio>
-#include <cstdlib>
-#include <random>
-#include <string>
-
-#include "host_kv.h"
-
-using namespace q27;
-
-static int fails = 0;
-#define CHECK(c)                                                               \
-  do {                                                                         \
-    if (!(c)) {                                                                \
-      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                 \
-      if (++fails > 20) std::exit(1);                                          \
-    }                                                                          \
-  } while (0)
-
-constexpr uint64_t kFp = 0x1234abcd5678ef01ull;
-
-struct Entry {
-  std::vector<int32_t> ids;
-  std::vector<char> state, kv;
-};
-
-static Entry make_entry(std::mt19937& rng, size_t n_ids, size_t state_bytes, size_t kv_bytes) {
-  Entry e;
-  for (size_t i = 0; i < n_ids; i++) e.ids.push_back(int32_t(rng() % 100000));
-  e.state.resize(state_bytes), e.kv.resize(kv_bytes);
-  for (auto& c : e.state) c = char(rng());
-  for (auto& c : e.kv) c = char(rng());
-  return e;
-}
-
-static std::string write_file(const Entry& e, uint64_t fp, const char* dir, int idx) {
-  std::string path = std::string(dir) + "/e" + std::to_string(idx) + ".q27kv";
-  SpillHeader h{};
-  std::memcpy(h.magic, kSpillMagic, sizeof kSpillMagic);
-  h.version = kSpillVersion;
-  h.fingerprint = fp;
-  h.state_bytes = e.state.size();
-  h.n_ids = uint32_t(e.ids.size());
-  h.kv_bytes = e.kv.size();
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  CHECK(f);
-  std::fwrite(&h, sizeof h, 1, f);
-  std::fwrite(e.ids.data(), sizeof(int32_t), e.ids.size(), f);
-  std::fwrite(e.state.data(), 1, e.state.size(), f);
-  std::fwrite(e.kv.data(), 1, e.kv.size(), f);
-  std::fclose(f);
-  return path;
-}
-
-// Destination buffers: pinned-pool style segments (page multiples) or one pageable buffer.
-struct Dest {
-  HostKv kv;
-  std::unique_ptr<char[]> state;
-};
-
-static void fill_read(DiskRead& d, const Entry& e, const std::string& path, uint64_t fp, Dest& dst, const std::vector<int32_t>* ids = nullptr) {
-  d.path = path, d.fingerprint = fp, d.state_bytes = e.state.size(), d.kv_bytes = e.kv.size();
-  d.ids = ids ? *ids : e.ids;
-  d.state = dst.state.get();
-  for (size_t i = 0; i < dst.kv.seg.size(); i++) d.segs.emplace_back(dst.kv.seg[i].get(), dst.kv.len[i]);
-}
-
-static int wait_state(DiskRead& d) {
-  while (d.state_now() == 0) std::this_thread::yield();  // (the engine thread polls; here it spins)
-  d.join();
-  return d.state_now();
-}
-
-static bool same(const Entry& e, const Dest& dst) {
-  if (std::memcmp(dst.state.get(), e.state.data(), e.state.size()) != 0) return false;
-  size_t off = 0;
-  for (size_t i = 0; i < dst.kv.seg.size(); i++) {
-    if (std::memcmp(dst.kv.seg[i].get(), e.kv.data() + off, dst.kv.len[i]) != 0) return false;
-    off += dst.kv.len[i];
-  }
-  return off == e.kv.size();
-}
+using namespace q27test;
 
 int main() {
-  char tmpl[] = "/tmp/test_spill_read_XXXXXX";
-  const char* dir = mkdtemp(tmpl);
-  CHECK(dir);
+  const std::string dir = tmpdir("spill_read");
   std::mt19937 rng(7);
-  constexpr size_t kPage = 4096 * 3;
+  DiskIndex idx;
+  idx.set_dir(dir + "/chunks");
 
-  // 1. Several entries read at once into segments of a fragmented PinnedPool, and into pageable buffers.
+  // A family of entries over a shared 2-chunk prefix, plus unrelated ones.
+  const Entry base = make_entry(rng, {}, 3, 90, 700);
+  std::vector<int32_t> prefix(base.ids.begin(), base.ids.begin() + std::ptrdiff_t(2 * base.chunk_tokens()));
+  std::vector<Entry> es;
+  for (int i = 0; i < 6; i++) {
+    Entry e = make_entry(rng, i < 4 ? prefix : std::vector<int32_t>{}, 2 + rng() % 3, 20 + rng() % 200, 300 + rng() % 400);
+    if (i < 4)  // (the shared prefix has the same KV: that is what a chunk file shared between entries holds)
+      for (uint32_t sl = 0; sl < e.g.slices; sl++)
+        std::memcpy(e.linear.data() + size_t(sl) * e.n_pages() * e.g.page_bytes,
+                    base.linear.data() + size_t(sl) * base.n_pages() * base.g.page_bytes, size_t(2) * e.g.chunk_pages * e.g.page_bytes);
+    es.push_back(std::move(e));
+  }
+  std::vector<Exported> xs(es.size());
+  for (size_t i = 0; i < es.size(); i++) CHECK(export_entry(es[i], idx, dir + "/entries/e" + std::to_string(i) + ".q27m", &xs[i]));
+  CHECK(idx.find(xs[0].names[0])->refs == 4);  // the shared chunk file: once on disk, listed by four manifests
+
+  // 1. All entries read at once (the four that share chunk files read the same files concurrently), into segments of a
+  // fragmented PinnedPool and into pageable buffers.
   {
     constexpr size_t slab = size_t(1) << 20;
     std::vector<char*> bases;
@@ -105,10 +42,6 @@ int main() {
       bases.push_back(b);
       pool.add_slab(b, slab);
     }
-    std::vector<Entry> es;
-    std::vector<Dest> dsts(6);
-    std::vector<std::string> paths;
-    std::vector<std::unique_ptr<DiskRead>> reads;
     std::vector<std::pair<char*, size_t>> held;
     for (int i = 0; i < 24; i++) {  // fragment the pool: keep a random half of many small regions
       const size_t len = (rng() % 5 + 1) * 4096;
@@ -117,101 +50,93 @@ int main() {
         else pool.release(p, len);
       }
     }
-    for (int i = 0; i < 6; i++) {
-      const size_t pages = 5 + rng() % 40;
-      es.push_back(make_entry(rng, 100 + rng() % 5000, 777 + rng() % 100, pages * kPage));
-      paths.push_back(write_file(es.back(), kFp, dir, i));
-      if (i % 2 == 0) {
-        CHECK(alloc_pinned_kv(pool, es.back().kv.size(), kPage, dsts[i].kv));
-        CHECK(dsts[i].kv.pinned());
-      } else {
-        dsts[i].kv.push(KvBuf(new char[es.back().kv.size()], KvDel{}), es.back().kv.size());
-      }
-      dsts[i].state.reset(new char[es.back().state.size()]);
+    std::vector<HostKv> dsts(es.size());
+    std::vector<std::vector<char>> states(es.size());
+    std::vector<std::unique_ptr<DiskRead>> reads;
+    int pinned = 0;
+    for (size_t i = 0; i < es.size(); i++) {
+      if (i % 2 == 0 && alloc_pinned_kv(pool, es[i].linear.size(), es[i].g.page_bytes, dsts[i])) pinned++;
+      else dsts[i] = empty_kv(es[i].linear.size());
     }
-    for (int i = 0; i < 6; i++) {
+    CHECK(pinned >= 1);
+    for (size_t i = 0; i < es.size(); i++) {
       reads.push_back(std::make_unique<DiskRead>());
-      fill_read(*reads.back(), es[i], paths[i], kFp, dsts[i]);
+      plan_read(*reads.back(), es[i], idx, xs[i].manifest, xs[i].names, &states[i], &dsts[i]);
       reads.back()->start();
     }
-    for (int i = 0; i < 6; i++) {
+    for (size_t i = 0; i < es.size(); i++) {
       CHECK(wait_state(*reads[i]) == 1);
-      CHECK(same(es[i], dsts[i]));
+      CHECK(same(es[i], states[i], dsts[i]));
       CHECK(reads[i]->ns.load() > 0);
     }
     reads.clear();
-    for (auto& d : dsts) d.kv.reset();  // regions go back to the pool
+    for (auto& d : dsts) d.reset();  // regions go back to the pool
     for (auto& [p, len] : held) pool.release(p, len);
     CHECK(pool.used() == 0);
     for (char* b : bases) std::free(b);
   }
 
-  // 2. Failures: each ends with st == -1 and never touches memory past the buffers.
+  // 2. Failures end with st == -1 and never touch memory past the buffers; a chunk's failure is named.
   {
-    Entry e = make_entry(rng, 300, 512, 4 * kPage);
-    const std::string good = write_file(e, kFp, dir, 100);
-    auto run = [&](const std::string& path, uint64_t fp, const std::vector<int32_t>* ids, size_t kv_override) {
-      Dest d;
-      Entry shape = e;
-      if (kv_override) shape.kv.resize(kv_override);
-      d.kv.push(KvBuf(new char[shape.kv.size()], KvDel{}), shape.kv.size());
-      d.state.reset(new char[shape.state.size()]);
+    auto run = [&](const Entry& want, const std::string& manifest, const std::vector<std::string>& names, int* bad) {
+      HostKv dst = empty_kv(want.linear.size());
+      std::vector<char> state;
       DiskRead r;
-      fill_read(r, shape, path, fp, d, ids);
+      plan_read(r, want, idx, manifest, names, &state, &dst);
       r.start();
-      return wait_state(r);
+      const int st = wait_state(r);
+      *bad = r.bad.load();
+      return st;
     };
-    CHECK(run(good, kFp, nullptr, 0) == 1);
-    CHECK(run(good, kFp + 1, nullptr, 0) == -1);                   // another model
-    std::vector<int32_t> other = e.ids;
-    other[17]++;
-    CHECK(run(good, kFp, &other, 0) == -1);                        // other tokens
-    CHECK(run(std::string(dir) + "/missing.q27kv", kFp, nullptr, 0) == -1);
-    CHECK(run(good, kFp, nullptr, 3 * kPage) == -1);               // kv_bytes differs from the header
-    // truncated file
-    std::string cut = std::string(dir) + "/cut.q27kv";
-    {
-      std::FILE* f = std::fopen(good.c_str(), "rb");
-      std::vector<char> all(sizeof(SpillHeader) + 300 * 4 + 512 + 4 * kPage);
-      CHECK(std::fread(all.data(), 1, all.size(), f) == all.size());
-      std::fclose(f);
-      f = std::fopen(cut.c_str(), "wb");
-      std::fwrite(all.data(), 1, all.size() - 100, f);
-      std::fclose(f);
-    }
-    CHECK(run(cut, kFp, nullptr, 0) == -1);
-    // bad magic / version
-    for (int which = 0; which < 2; which++) {
-      std::string bad = std::string(dir) + "/bad" + std::to_string(which) + ".q27kv";
-      std::FILE* f = std::fopen(good.c_str(), "rb");
-      std::vector<char> all(sizeof(SpillHeader) + 300 * 4 + 512 + 4 * kPage);
-      CHECK(std::fread(all.data(), 1, all.size(), f) == all.size());
-      std::fclose(f);
-      all[which == 0 ? 0 : 8] ^= 0x55;
-      f = std::fopen(bad.c_str(), "wb");
-      std::fwrite(all.data(), 1, all.size(), f);
-      std::fclose(f);
-      CHECK(run(bad, kFp, nullptr, 0) == -1);
-    }
+    int bad = 0;
+    CHECK(run(es[0], xs[0].manifest, xs[0].names, &bad) == 1);
+    Entry w = es[0];
+    w.fp++;
+    CHECK(run(w, xs[0].manifest, xs[0].names, &bad) == -1);
+    w = es[0];
+    w.ids[17]++;  // other tokens
+    CHECK(run(w, xs[0].manifest, xs[0].names, &bad) == -1);
+    CHECK(run(es[0], dir + "/entries/missing.q27m", xs[0].names, &bad) == -1 && bad == -1);
+    // a chunk file the entry shares with its siblings is damaged: every sibling fails on it, the entry that does not list it reads
+    const std::string shared = idx.path(xs[0].names[1]);
+    fs::copy_file(shared, shared + ".keep");
+    flip(shared, long(sizeof(ChunkHeader) + es[0].chunk_tokens() * 4 + 100));
+    for (int i = 0; i < 4; i++) CHECK(run(es[size_t(i)], xs[size_t(i)].manifest, xs[size_t(i)].names, &bad) == -1 && bad == 1);
+    CHECK(run(es[4], xs[4].manifest, xs[4].names, &bad) == 1);
+    fs::rename(shared + ".keep", shared);
+    CHECK(run(es[1], xs[1].manifest, xs[1].names, &bad) == 1);
+    // a chunk file that is gone
+    fs::rename(shared, shared + ".away");
+    CHECK(run(es[2], xs[2].manifest, xs[2].names, &bad) == -1 && bad == 1);
+    fs::rename(shared + ".away", shared);
+    // truncated chunk
+    fs::copy_file(shared, shared + ".keep");
+    truncate_by(shared, 1);
+    CHECK(run(es[3], xs[3].manifest, xs[3].names, &bad) == -1 && bad == 1);
+    fs::remove(shared);
+    fs::rename(shared + ".keep", shared);
+    CHECK(run(es[3], xs[3].manifest, xs[3].names, &bad) == 1);
   }
 
-  // 3. Destroying a running reader (the Model's destructor) cancels it between chunks and joins: no hang, no race.
+  // 3. Destroying a running reader (the Model's destructor) cancels it between blocks and joins: no hang, no race, and the
+  // buffers outlive the thread. (A big entry: 3 slices x 48 pages x 64 KiB per page of tail and chunks.)
   {
-    Entry e = make_entry(rng, 50, 256, size_t(48) << 20);
-    const std::string path = write_file(e, kFp, dir, 200);
-    for (int round = 0; round < 5; round++) {
-      Dest d;
-      d.kv.push(KvBuf(new char[e.kv.size()], KvDel{}), e.kv.size());
-      d.state.reset(new char[e.state.size()]);
+    const Entry big = make_entry(rng, {}, 2, 40 * 64, 256, 3, 4, size_t(1) << 20);
+    Exported bx;
+    CHECK(export_entry(big, idx, dir + "/entries/big.q27m", &bx));
+    for (int round = 0; round < 6; round++) {
+      HostKv dst = empty_kv(big.linear.size());
+      std::vector<char> state;
       auto r = std::make_unique<DiskRead>();
-      fill_read(*r, e, path, kFp, d);
+      plan_read(*r, big, idx, bx.manifest, bx.names, &state, &dst);
       r->start();
       if (round % 2) std::this_thread::yield();
       r.reset();      // joins first,
-      d.kv.reset();   // and only then are the buffers freed
+      dst.reset();    // and only then are the buffers freed
     }
   }
 
+  fs::remove_all(dir);
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
 }

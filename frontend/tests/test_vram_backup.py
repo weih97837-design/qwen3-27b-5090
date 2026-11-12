@@ -125,6 +125,7 @@ class Conn:
 
 
 def tiers_for(engine, directory=None, backup_idle_s=60, flush_on_stop_s=8, **kw):
+    kw.setdefault("ssd_min_tokens", 8192)  # (these tests' entries are 10000 tokens; the policy's own default is 32768)
     return TierPolicy(engine, str(directory) if directory else None, backup_idle_s=backup_idle_s,
                       flush_on_stop_s=flush_on_stop_s, disk_free=lambda _d: 10 ** 12, log=lambda _m: None, **kw)
 

@@ -574,6 +574,8 @@ void Model::reset() {
   plan_.clear();
   ring_from_ = 0;
   ring_valid_ = false;
+  seq_owner_ = 0;  // (prefix_begin sets it right after)
+  seq_hits_ = 0;
   spec_last_ = -1;
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
@@ -656,6 +658,7 @@ bool Model::evict_checkpoint(bool for_slot) {
   } else if (b != spill_.end()) {
     b->second.live = false;
     b->second.last_use = it->last_use;
+    b->second.hits = it->hits, b->second.last_hit = it->last_hit, b->second.owner = it->owner;  // (hits since the copy was made)
   } else if (spill_on()) {
     spill_checkpoint(*it);
   }
@@ -680,11 +683,11 @@ int Model::grow_state_cache(int n) {
 void Model::save_checkpoint(bool ring) {
   if (!cache_on_ || pos_ == 0) return;
   Q27_CHECK(int(seq_ids_.size()) == pos_, "checkpoint: token history does not match the position");
-  save_checkpoint_from(nullptr, seq_ids_, seq_pages_, ring);
+  save_checkpoint_from(nullptr, seq_ids_, seq_pages_, seq_owner_, seq_hits_, ring);
 }
 
 void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
-                                 bool ring) {
+                                 uint64_t owner, uint32_t hits, bool ring) {
   const int pos = int(ids.size());
   if (!cache_on_ || pos == 0) return;
   for (auto& c : ckpts_)
@@ -707,6 +710,8 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   for (int32_t p : ck.pages) pool_.ref(p);
   ck.slot = slot;
   ck.ring = ring;
+  ck.owner = owner;
+  ck.hits = hits, ck.last_hit = hits ? use_clock_ + 1 : 0;
   ck.last_use = ++use_clock_;
   if (share_take(pos)) ck.share_until = use_clock_ + kShareTtl;
   slot_used_[slot] = true;
@@ -726,6 +731,8 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
 
 int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec) {
   reset();
+  seq_owner_ = owner_next_;  // (retention.h: the checkpoints this sequence saves are its agent's)
+  seq_hits_ = 0;
   cstats_.lookups++;
   cstats_.prompt_tokens += n;
   if (!cache_on_) return 0;
@@ -740,6 +747,9 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     const_cast<Checkpoint*>(best)->held = false;  // (its owner is here)
+    const_cast<Checkpoint*>(best)->hits++;  // (retention: reused)
+    const_cast<Checkpoint*>(best)->last_hit = use_clock_;
+    seq_hits_ = inherited_hits(cached, best->hits);  // (the checkpoints this sequence saves carry the reuse on)
     // The shared checkpoints on this chain have served their waiter (a later one, deeper, is the match now).
     for (auto& c : ckpts_)
       if (c.share_until && c.pos() <= cached && std::equal(c.ids.begin(), c.ids.end(), ids)) c.share_until = 0;
@@ -1925,6 +1935,8 @@ void Model::seq_take(SeqState& st) {
   st.mm = std::move(mm_spans_);
   st.spec_last = spec_last_;
   st.ring_valid = ring_valid_;
+  st.owner = seq_owner_;
+  st.hits = seq_hits_;
   st.ring_from = ring_from_;
   st.smp = spec_smp_;
   seq_pages_.clear(), seq_ids_.clear(), plan_.clear(), mm_spans_.clear();
@@ -1942,6 +1954,8 @@ void Model::seq_give(SeqState& st) {
   mm_spans_ = std::move(st.mm);
   spec_last_ = st.spec_last;
   ring_valid_ = st.ring_valid;
+  seq_owner_ = st.owner;
+  seq_hits_ = st.hits;
   ring_from_ = st.ring_from;
   spec_smp_ = st.smp;
   st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
@@ -2112,7 +2126,7 @@ void Model::seq_suspend(int a) {
   Q27_CHECK(a >= 0 && a < int(parked_.size()) && parked_[a].used, "seq_suspend: no sequence in that area");
   batch_exit();
   SeqState& st = parked_[a];
-  if (st.pos > 0 && int(st.ids.size()) == st.pos) save_checkpoint_from(st.dev, st.ids, st.pages, st.ring_valid);
+  if (st.pos > 0 && int(st.ids.size()) == st.pos) save_checkpoint_from(st.dev, st.ids, st.pages, st.owner, st.hits, st.ring_valid);
   seq_drop(a);
 }
 
