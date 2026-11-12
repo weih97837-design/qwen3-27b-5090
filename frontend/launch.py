@@ -47,12 +47,12 @@ TIER_SETTINGS = {
     "spill_ram_retention_s": ("SPILL_RAM_RETENTION_S", 3600, "num"),
     "spill_ssd_gib": ("SPILL_SSD_GIB", 100, "num"),
     "spill_ssd_min_free_gib": ("SPILL_SSD_MIN_FREE_GIB", 10, "num"),
-    "spill_ssd_min_tokens": ("SPILL_SSD_MIN_TOKENS", 8192, "num"),  # shorter spilled entries are never written to the SSD
+    "spill_ssd_min_tokens": ("SPILL_SSD_MIN_TOKENS", 32768, "num"),  # shorter spilled entries are never written to the SSD
     "spill_ttl_days": ("SPILL_TTL_DAYS", 7, "num"),
     "vram_backup_idle_s": ("VRAM_BACKUP_IDLE_S", 60, "num"),
-    "spill_pinned_gib": ("SPILL_PINNED_GIB", 0, "num"),
-    "spill_async_io": ("SPILL_ASYNC_IO", False, "flag"),
-    "spill_async_promote": ("SPILL_ASYNC_PROMOTE", False, "flag"),
+    "spill_pinned_gib": ("SPILL_PINNED_GIB", 8, "num"),
+    "spill_async_io": ("SPILL_ASYNC_IO", True, "flag"),
+    "spill_async_promote": ("SPILL_ASYNC_PROMOTE", True, "flag"),
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down

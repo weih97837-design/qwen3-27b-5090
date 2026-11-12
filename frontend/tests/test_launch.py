@@ -296,8 +296,8 @@ def test_tier_validate():
 
 def test_ssd_min_tokens_setting():
     lc = settings()
-    assert launch.TIER_SETTINGS["spill_ssd_min_tokens"][:2] == ("SPILL_SSD_MIN_TOKENS", 8192)
-    assert lc.validate({})["spill_ssd_min_tokens"] == 8192
+    assert launch.TIER_SETTINGS["spill_ssd_min_tokens"][:2] == ("SPILL_SSD_MIN_TOKENS", 32768)
+    assert lc.validate({})["spill_ssd_min_tokens"] == 32768
     assert lc.validate({"spill_ssd_min_tokens": 0})["spill_ssd_min_tokens"] == 0
     v = lc.validate({"spill_ssd_min_tokens": 4096.7})["spill_ssd_min_tokens"]
     assert v == 4096 and isinstance(v, int)  # (a count: rounded down)
@@ -305,8 +305,8 @@ def test_ssd_min_tokens_setting():
         with pytest.raises(ValueError):
             lc.validate({"spill_ssd_min_tokens": bad})
     assert launch.parse_tier("spill_ssd_min_tokens", "1000.5") == 1000
-    assert launch.parse_tier("spill_ssd_min_tokens", None) == 8192
-    assert launch.parse_tier("spill_ssd_min_tokens", "-3", warn=lambda m: None) == 8192
+    assert launch.parse_tier("spill_ssd_min_tokens", None) == 32768
+    assert launch.parse_tier("spill_ssd_min_tokens", "-3", warn=lambda m: None) == 32768
 
 
 def test_tier_validate_dir_is_a_folder(tmp_path):
@@ -343,7 +343,7 @@ def test_tier_flags_are_read_like_atoi(monkeypatch):
         assert launch.parse_tier("spill_async_io", text) is want, text
         monkeypatch.setenv("SPILL_ASYNC_PROMOTE", text)
         assert launch.env_settings()["spill_async_promote"] is want, text
-    assert launch.parse_tier("spill_async_io", "") is False and launch.parse_tier("spill_async_io", None) is False
+    assert launch.parse_tier("spill_async_io", "") is True and launch.parse_tier("spill_async_io", None) is True  # (the default: on)
 
 
 def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path):
@@ -352,7 +352,7 @@ def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path
     monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
     (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
     s = lc.validate({"spec": "none", "spill_ram_gib": 16, "spill_ram_retention_s": 120, "spill_ssd_gib": 50, "spill_ssd_min_free_gib": 2.5,
-                     "spill_ttl_days": 3, "vram_backup_idle_s": 0, "spill_pinned_gib": 4, "spill_async_io": True,
+                     "spill_ttl_days": 3, "vram_backup_idle_s": 0, "spill_pinned_gib": 4, "spill_async_io": True, "spill_async_promote": False,
                      "spill_ssd_min_tokens": 2048, "spill_dir": str(tmp_path / "kv")})
     env = lc.config(s)["env"]
     assert env["SPILL_RAM_GIB"] == "16" and env["SPILL_PINNED_GIB"] == "4" and env["SPILL_ASYNC_IO"] == "1"
@@ -385,8 +385,8 @@ def test_tier_env_is_not_part_of_a_plan_job(monkeypatch, tmp_path):
 def test_tier_env_changes():
     lc = object.__new__(launch.Launch)
     lc.settings = lc.at_start = dict(DEFAULTS)
-    lc.settings = dict(lc.at_start, spill_ram_gib=48, spill_async_io=True, spill_ttl_days=0.5, spill_dir="")
-    assert lc.env_changes() == {"SPILL_RAM_GIB": "48", "SPILL_ASYNC_IO": "1", "SPILL_TTL_DAYS": "0.5", "SPILL_DIR": ""}
+    lc.settings = dict(lc.at_start, spill_ram_gib=48, spill_async_io=False, spill_ttl_days=0.5, spill_dir="")
+    assert lc.env_changes() == {"SPILL_RAM_GIB": "48", "SPILL_ASYNC_IO": "0", "SPILL_TTL_DAYS": "0.5", "SPILL_DIR": ""}
 
 
 def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):

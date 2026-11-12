@@ -109,7 +109,7 @@ class TierPolicy:
                                   ("VRAM_BACKUP_IDLE_S", "backup_idle_s", 60),
                                   ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8),
                                   ("VRAM_BACKUP_VICTIMS", "backup_victims", 8),
-                                  ("SPILL_SSD_MIN_TOKENS", "ssd_min_tokens", 8192)):
+                                  ("SPILL_SSD_MIN_TOKENS", "ssd_min_tokens", 32768)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:

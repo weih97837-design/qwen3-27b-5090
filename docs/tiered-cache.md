@@ -63,7 +63,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後才寫入 SSD |
 | `SPILL_SSD_GIB` | `100` | SSD 層容量上限（GiB），最舊的檔案先刪除 |
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | 磁碟可用空間目標。只在能靠刪除本層自己的檔案達成時才追求，不會刪除其他檔案 |
-| `SPILL_SSD_MIN_TOKENS` | `8192` | 短於此 token 數的 checkpoint 不會寫入 SSD：超過 RAM 保留時間後直接從 RAM 丟棄。每個 checkpoint 都帶約 190 MiB 的遞迴狀態，與長度無關；短前綴重算只需約 0.2–0.4 秒，與讀回時間相近，寫入只會浪費 SSD 空間與寫入壽命。`0`：不設下限（舊行為）。已在磁碟上的檔案不受影響；`/metrics` 的 `ssd_skipped_short` 計算被丟棄的筆數 |
+| `SPILL_SSD_MIN_TOKENS` | `32768` | 短於此 token 數的 checkpoint 不會寫入 SSD：超過 RAM 保留時間後直接從 RAM 丟棄。每個 checkpoint 都帶約 190 MiB 的遞迴狀態，與長度無關；短前綴重算只需約 0.2–0.4 秒，與讀回時間相近，寫入只會浪費 SSD 空間與寫入壽命。`0`：不設下限（舊行為）。已在磁碟上的檔案不受影響；`/metrics` 的 `ssd_skipped_short` 計算被丟棄的筆數 |
 | `SPILL_TTL_DAYS` | `7` | 自寫入 SSD 起算（重用後會重新計時），超過此天數的檔案會被刪除 |
 | `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
@@ -101,7 +101,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
   4 段對話：實體 < 0.6 × 邏輯、`chunk_hits > 0`、還原後 token 與無快取參考完全相同）、`i`（同上，加 pinned 與 async I/O）。
   設計與不變量見 `engine/src/spill.cc` 開頭的 (H)–(L) 與 `engine/src/chunk_store.h`。
 
-## 加速選項（預設關閉）
+## 加速選項（v0.3.2 起預設開啟）
 
 目前每次 spill（逐出）與 promote（前綴命中時搬回）都是在運算 stream 上以一般（pageable）主機記憶體複製，複製完才繼續，
 因此會暫停所有 GPU 工作與引擎執行緒，速度也只有 PCIe 的一半左右。三個選項可改善，**預設都關閉**，行為與先前審查過的版本完全相同；
@@ -109,9 +109,9 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `SPILL_PINNED_GIB` | `0` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉 |
-| `SPILL_ASYNC_IO` | `0` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
-| `SPILL_ASYNC_PROMOTE` | `0` | `1`：命中已 spill 的 checkpoint 時，請求進入「載入快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
+| `SPILL_PINNED_GIB` | `8` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉（v0.3.2 起預設 8） |
+| `SPILL_ASYNC_IO` | `1` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
+| `SPILL_ASYNC_PROMOTE` | `1` | `1`：命中已 spill 的 checkpoint 時，請求進入「載入快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
 | `SPILL_PINNED_SLAB_MIB` | `1024` | 每次 pin 的區塊大小（MiB）：閒置時每輪只 pin 一個區塊，所以也是單次停頓的上限；一般不需調整 |
 
 - **SPILL_PINNED_GIB**：pin 記憶體很慢（WSL2 上約每 GiB 0.45 秒，期間其他 CUDA 呼叫都要等），所以絕不在請求處理中進行：

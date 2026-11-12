@@ -522,7 +522,7 @@ def test_from_env_reads_min_tokens(monkeypatch, tmp_path):
     monkeypatch.setenv("SPILL_RAM_GIB", "4")
     monkeypatch.setenv("SPILL_DIR", str(tmp_path))
     monkeypatch.delenv("SPILL_SSD_MIN_TOKENS", raising=False)
-    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 8192
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 32768
     monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "0")
     assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).ssd_min_tokens == 0
     monkeypatch.setenv("SPILL_SSD_MIN_TOKENS", "2000.9")
