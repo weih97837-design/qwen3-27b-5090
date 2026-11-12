@@ -50,6 +50,7 @@ PREFILL, DECODE = "prefill", "decode"
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
+SHARE_MIN = 128      # tokens a sibling's prefix must reach past what the cache holds for a newcomer to wait for it
 STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
 STATS_IDLE = 5.0      # s between them while idle
 
@@ -349,13 +350,18 @@ class Scheduler:
         for o in list(self.alive) + list(self.waiting):
             n = lcp_bytes(p, array.array("i", o.eng_ids).tobytes())
             n = min(n, len(s.prompt) - 1) // 64 * 64
-            if n > max(s.reusable, s.share_len) + 256 and not (o.started and o.fed >= n):
+            if n > max(s.reusable, s.share_len) + SHARE_MIN and not (o.started and o.fed >= n):
                 s.share_with, s.share_len = o, n
         if s.share_with is not None:
             o = s.share_with
-            if not o.started:
-                o.at = sorted(set(o.at) | {s.share_len})
-            s.reusable = s.share_len
+            # A sibling that has not begun gets the position with its other checkpoints (prefix_begin); one that is
+            # part-way through its prompt needs the engine to plan it now. Without that checkpoint there is nothing
+            # to wait for (the newcomer would only get the first message's), so it does not share.
+            if o.started and not self.plan_sibling_checkpoint(o, s.share_len):
+                s.share_with, s.share_len = None, 0
+            else:
+                o.at = sorted(set(o.at) | {s.share_len})  # (also for a later restart of o)
+                s.reusable = s.share_len
         s.at = self.checkpoints(s.prompt, s.reusable)
         # (stats: where the first message ends, the last message and the generation prompt start)
         starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
@@ -366,6 +372,22 @@ class Scheduler:
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def plan_sibling_checkpoint(self, o, n):
+        """Asks the engine for a checkpoint at n in the already running (or parked) request o, which has not run
+        past n. False when it cannot: o is not in the engine, it is too close to n or to the end of its prompt (a
+        chunk of <= 64 tokens would not match an uncut prefill bit for bit), or the engine has no such call."""
+        if o.dead or o.phase != PREFILL or o.fed >= n or len(o.eng_ids) - n <= 64:
+            return False
+        area = -1 if o is self.cur else o.area
+        add = getattr(self.engine, "add_checkpoint_at", None)
+        if add is None or area is None:
+            return False
+        try:
+            return bool(add(area, n))
+        except Exception as e:  # noqa: BLE001 - a sharing hint must not stop the request
+            log(f"{o.rid}: checkpoint at {n} not planned: {e}")
+            return False
 
     def matcher(self, grammar):
         """An llguidance matcher of a grammar (structured output); ValueError when it cannot be used."""
@@ -405,7 +427,7 @@ class Scheduler:
             return
         if s in self.waiting:
             self.waiting.remove(s)
-        self.finish(s, "cancelled", save=False)
+        self.finish(s, "cancelled")
 
     def configure(self, c):
         """Admission settings (cfg at the start, then /admin/concurrency); values are clamped to valid ones."""
@@ -1164,7 +1186,10 @@ class Scheduler:
         self.by_id.pop(s.rid, None)
         # The end of the generation: the next turn resumes here when it re-renders this output as is (a parked
         # request, e.g. one of a batched step, is saved from its parking area).
-        end = save and reason in ("stop", "length")
+        # A client that disconnects (cancelled) after the prompt has run still leaves a state the next turn continues from
+        # (agents often drop a stream and re-send the conversation); one cancelled during the prefill, or an error, saves
+        # nothing (the engine state may be partial or unusable).
+        end = save and (reason in ("stop", "length") or (reason == "cancelled" and s.started and s.phase == DECODE))
         if s.area is not None:
             (self.engine.seq_suspend if end else self.engine.seq_drop)(s.area)
             s.area = None

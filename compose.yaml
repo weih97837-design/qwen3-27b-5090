@@ -80,9 +80,9 @@ services:
       SPEC: ${SPEC:-dflash2}                       # dflash2 | none
       Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
       Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
-      STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
+      STATE_HOST_CACHE: ${STATE_HOST_CACHE:-8}     # prefix cache: GiB of pinned state checkpoints (0: off)
       KV_POOL_TOKENS: ${KV_POOL_TOKENS:-524288}    # 524288 = 512K tokens (about 9 GiB VRAM with NVFP4 KV); 0: what the VRAM budget leaves
-      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-8192}
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-4096}
       SPILL_RAM_GIB: ${SPILL_RAM_GIB:-64}          # host RAM for checkpoints evicted from the KV pool (0: off; the tiers are in docs/tiered-cache.md)
       SPILL_PINNED_GIB: ${SPILL_PINNED_GIB:-0}     # pinned host memory for spill entries, faster copies (off by default: turn on only after scripts/tiered_cache_test.py passes on your GPU; counts against Windows shared GPU memory, see docs/tiered-cache.md)
       SPILL_PINNED_SLAB_MIB: ${SPILL_PINNED_SLAB_MIB:-1024}  # size of each pinned slab, pinned one per idle step (an entry may span several; only used with SPILL_PINNED_GIB)

@@ -31,7 +31,7 @@ struct Options {
   // checkpoints inside long prompts.
   double state_cache_gib = 0;
   int kv_pool_tokens = 0;
-  int checkpoint_interval = 8192;
+  int checkpoint_interval = 4096;
   // Tiered cache (needs the prefix cache): GiB of host memory for checkpoints the KV pool gives up (0: off, they are
   // dropped as before), and the folder they are written to when that is full (empty: the oldest is dropped then).
   double spill_ram_gib = 0;
@@ -228,6 +228,12 @@ class Model {
   void seq_drop(int a);
   void seq_suspend(int a);
   int park_slots() const { return int(parked_.size()); }
+  // Adds a checkpoint position to the plan of a sequence that is already prefilling: the running one (a < 0) or the
+  // one in parking area a. pos is rounded down to a multiple of 64 and must lie more than 64 tokens past the
+  // sequence's position and from every planned one (a shorter chunk takes the decode GEMMs and would not match an
+  // uncut prefill bit for bit, prefix_begin); the caller also keeps it more than 64 before the end of that prompt
+  // (the engine does not know it). True also when it is planned already; false, with nothing changed, when it cannot be.
+  bool add_checkpoint_at(int a, int pos);
 
   // Batched speculative steps (P6-10). One step of each of n (2..4) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
@@ -276,6 +282,7 @@ class Model {
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
+  bool ckpt_covered(const Checkpoint& c) const;  // a deeper, usable checkpoint of the same chain is in the pool and c is long
   uint64_t spill_copy(const Checkpoint& c, bool live);  // the copy of c's pages and state as a new entry; 0: no memory
   uint64_t spill_add(const Checkpoint& c, Spilled&& s, bool live);  // s (copied from c) becomes entry spill_next_; its id
   void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's

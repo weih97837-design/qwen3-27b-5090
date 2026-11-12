@@ -310,6 +310,10 @@ int q27_seq_unpark(void* m, int area) {
 int q27_seq_swap(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_swap(area); });
 }
+// ok = 1 when the position was added to the plan of the sequence in `area` (-1: the running one), else 0.
+int q27_add_checkpoint_at(void* m, int area, int pos, int* ok) {
+  return guard([&] { *ok = static_cast<Model*>(m)->add_checkpoint_at(area, pos) ? 1 : 0; });
+}
 int q27_seq_drop(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_drop(area); });
 }

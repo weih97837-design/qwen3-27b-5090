@@ -123,7 +123,7 @@ def planner_or_skip():
 def test_plans_match_the_engine():
     lc = planner_or_skip()
     os.environ.setdefault("MAX_TOKENS_FIT", "1")
-    os.environ.setdefault("STATE_HOST_CACHE", "4")
+    os.environ.setdefault("STATE_HOST_CACHE", "8")
     out = lc.plans(lc.settings, DEVICE)
     p = out["plan"]
     # The serve default's startup log on this device: kv pool 9461 pages (605504 tokens), device 28.377 GiB
@@ -228,7 +228,7 @@ def test_engine_defaults_applied_when_unset(monkeypatch, tmp_path):
     assert os.environ["KV_POOL_TOKENS"] == "524288"
     assert os.environ["SPILL_RAM_GIB"] == "64"
     assert os.environ["SPILL_DIR"] == ("/cache/kv" if os.name != "nt" else launch.spill_dir_default())
-    assert os.environ["MAX_TOKENS_FIT"] == "1" and os.environ["STATE_HOST_CACHE"] == "4"
+    assert os.environ["MAX_TOKENS_FIT"] == "1" and os.environ["STATE_HOST_CACHE"] == "8"
 
 
 def test_engine_defaults_do_not_override_set_values(monkeypatch, tmp_path):

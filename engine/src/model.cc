@@ -617,10 +617,17 @@ bool Model::evict_checkpoint() {
   // (SPILL_ASYNC_PROMOTE; spill.cc (F)) The least recently used checkpoint that is neither loading (its host -> device
   // copy is still queued) nor held (restored, its request has not run yet); else the oldest held one; else, with only
   // loading ones left, the oldest of those is finished synchronously (a rare stall instead of KvFull) and evicted.
+  // Within that, a checkpoint another one of its chain covers (ckpt_covered: the turns of one conversation each save
+  // theirs, and the deepest resumes all of them) goes before any other, least recently used first; the rest is LRU.
   auto oldest = [&](bool held) {
     auto it = ckpts_.end();
-    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c)
-      if (!c->loading && c->held == held && (it == ckpts_.end() || c->last_use < it->last_use)) it = c;
+    bool it_covered = false;
+    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c) {
+      if (c->loading || c->held != held) continue;
+      if (it != ckpts_.end() && c->last_use >= it->last_use && it_covered) continue;  // (cannot beat a covered LRU one)
+      const bool cov = ckpt_covered(*c);
+      if (it == ckpts_.end() || (cov && !it_covered) || (cov == it_covered && c->last_use < it->last_use)) it = c, it_covered = cov;
+    }
     return it;
   };
   auto it = oldest(false);
@@ -2043,6 +2050,22 @@ void Model::seq_drop(int a) {
   st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
   st.used = false;
   release_area(a);
+}
+
+bool Model::add_checkpoint_at(int a, int pos) {
+  if (!cache_on_) return false;
+  std::vector<int32_t>* plan = &plan_;
+  int cur = pos_;
+  if (a >= 0) {
+    if (a >= int(parked_.size()) || !parked_[a].used) return false;
+    plan = &parked_[a].plan, cur = parked_[a].pos;
+  }
+  const int p = pos / kGdnChunk * kGdnChunk;
+  if (p - cur <= kSkinnyMaxM) return false;
+  if (std::find(plan->begin(), plan->end(), p) != plan->end()) return true;  // (planned already: a second sharer)
+  if (std::any_of(plan->begin(), plan->end(), [&](int32_t q) { return std::abs(q - p) <= kSkinnyMaxM; })) return false;
+  plan->insert(std::upper_bound(plan->begin(), plan->end(), p), p);
+  return true;
 }
 
 void Model::seq_suspend(int a) {

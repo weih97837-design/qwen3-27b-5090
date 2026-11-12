@@ -148,7 +148,7 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   holds `(p / G) * 32G + p % G`. As a result, starting with `MAX_SEQS=8` costs only the lanes' buffers, and one
   request still gets the full 262K context.
 - **Host memory** (pinned): the embedding table (2.4 GiB), the prefix-cache checkpoints (`STATE_HOST_CACHE`,
-  4 GiB), the vision tower (0.9 GiB) and the image embeddings.
+  8 GiB), the vision tower (0.9 GiB) and the image embeddings.
 
 `tools/model_budget.py` computes the plan for other settings without a GPU (and the decode roofline).
 
@@ -286,9 +286,9 @@ convolution, the draft's context ring: 189.6 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
   holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
-  one, every `CHECKPOINT_INTERVAL` (8,192) tokens inside a long prompt (the last four), and at the end of each
+  one, every `CHECKPOINT_INTERVAL` (4,096) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
-- **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 4 GiB = 21 checkpoints). Saving copies the
+- **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 8 GiB = 43 checkpoints). Saving copies the
   state to one staging buffer on the GPU and then to the host on a copy stream; restoring copies from the host
   (4 to 6 ms). Eviction is LRU, and the KV pool also reclaims pages from the least recently used checkpoints.
 - **Lookup** is a linear scan with `memcmp` over the token sequences; there are at most a few dozen checkpoints.
@@ -406,7 +406,7 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   exactly. A helper process runs the plans, since each sets the environment the engine reads.
 - Loading (`engine/src/prefetch.cc`): the loaders plan the byte ranges they read, `Q27_LOAD_THREADS` threads read
   them ahead into pinned slots (the embedding straight into its pinned table), and the loaders upload them in plan
-  order as before. The prefix cache's pinned state slots (4 GiB) are allocated after startup, one by one while the
+  order as before. The prefix cache's pinned state slots (8 GiB) are allocated after startup, one by one while the
   engine is idle (`q27_cache_grow`) or when a checkpoint needs one.
 
 ## 13. Correctness

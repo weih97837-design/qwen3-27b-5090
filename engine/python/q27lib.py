@@ -28,6 +28,7 @@ SIGNATURES = {
     "q27_seq_unpark": ([P, I], I),
     "q27_seq_swap": ([P, I], I),
     "q27_seq_drop": ([P, I], I),
+    "q27_add_checkpoint_at": ([P, I, I, P], I),
     "q27_seq_suspend": ([P, I], I),
     "q27_has_draft": ([P], I),
     "q27_max_lanes": ([P], I),
@@ -371,6 +372,14 @@ class Engine:
     def seq_swap(self, area):
         """Parks the running sequence in `area` and resumes the one that was there."""
         self._check(lib().q27_seq_swap(self.h, area), "q27_seq_swap")
+
+    def add_checkpoint_at(self, area, pos):
+        """Plans one more checkpoint at pos (rounded down to 64) in a sequence that is already prefilling: the running one
+        (area -1) or the one parked in `area`. False when the engine cannot (too near its position or another
+        checkpoint, no prefix cache): nothing is saved there then."""
+        ok = ctypes.c_int()
+        self._check(lib().q27_add_checkpoint_at(self.h, area, pos, ctypes.byref(ok)), "q27_add_checkpoint_at")
+        return bool(ok.value)
 
     def seq_drop(self, area):
         """Gives the pages of the sequence parked in `area` back."""

@@ -306,6 +306,17 @@ bool Model::spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const {
   return false;
 }
 
+// Whether evicting c loses little: a deeper checkpoint of the same chain (same tokens up to c's) is in the pool and
+// usable, and c is past kKeepShort (shorter ones are shared by new conversations, kept like in spill_subsumed). The
+// deeper one resumes everything c would, except a retry that branches off before c's end. Not loading ones: they are
+// not usable yet.
+bool Model::ckpt_covered(const Checkpoint& c) const {
+  if (c.pos() <= kKeepShort) return false;
+  for (const auto& o : ckpts_)
+    if (&o != &c && !o.loading && o.ids.size() > c.ids.size() && covers(o.ids, o.ring, c.ids, c.ring)) return true;
+  return false;
+}
+
 void Model::spill_checkpoint(const Checkpoint& c) {
   if (spill_subsumed(c, 0)) {
     sstats_.subsumed++;
