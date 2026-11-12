@@ -104,6 +104,15 @@ class TierPolicy:
             return
         # No try here: a directory that cannot be created is a config error the user must see.
         self.directory.mkdir(parents=True, exist_ok=True)
+        probe = self.directory / ".write-test"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as e:
+            raise RuntimeError(
+                f"SPILL_DIR {self.directory} is not writable ({e}). If it is the kvcache volume, it was probably "
+                "created owned by root: remove the kvcache volume (docker volume rm) and recreate it, or fix the "
+                "directory's permissions.") from e
         for p in self.directory.glob("*" + TMP_SUFFIX):  # left by a write that did not finish
             _unlink(p)
         for p in sorted(self.directory.glob("*" + SUFFIX)):

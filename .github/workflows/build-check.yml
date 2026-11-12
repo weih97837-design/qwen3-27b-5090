@@ -20,7 +20,6 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           context: .
-          target: build
           push: false
           load: false
           # (the same limit as image.yml: the largest CUDA files need a few GB of RAM each; the runner has 16 GB)

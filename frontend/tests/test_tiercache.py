@@ -441,3 +441,17 @@ def test_empty_spill_dir_never_exports(monkeypatch):
     tier.start()
     tier.tick(idle=True, now=10 ** 9)
     assert eng.exports == [] and eng.entries[rid]["ram_bytes"] == 400
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_start_fails_loudly_when_spill_dir_is_not_writable(tmp_path):
+    d = tmp_path / "ro"
+    d.mkdir()
+    d.chmod(0o555)
+    try:
+        tier = TierPolicy(FakeEngine(), str(d), log=lambda _m: None)
+        with pytest.raises(RuntimeError, match="SPILL_DIR"):
+            tier.start()
+        assert not any(d.iterdir())  # the probe file is not left behind
+    finally:
+        d.chmod(0o755)

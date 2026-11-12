@@ -93,6 +93,7 @@ bool covers(const std::vector<int32_t>& d_ids, bool d_ring, const std::vector<in
 }  // namespace
 
 uint64_t Model::spill_fingerprint() const {
+  if (fingerprint_set_) return fingerprint_;  // computed once: the directory scan and config.json read are not free
   uint64_t h = 1469598103934665603ull;
   h = fnv(h, opt_.model_dir.data(), opt_.model_dir.size());
   h = fnv(h, "\0", 1);
@@ -131,6 +132,8 @@ uint64_t Model::spill_fingerprint() const {
       h = fnv(h, bytes.data(), bytes.size());
     }
   }
+  fingerprint_ = h;
+  fingerprint_set_ = true;
   return h;
 }
 

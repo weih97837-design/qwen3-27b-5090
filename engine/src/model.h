@@ -342,6 +342,8 @@ class Model {
   CacheStats cstats_;
   std::map<uint64_t, Spilled> spill_;  // (a map: entries stay put while others come and go)
   uint64_t spill_next_ = 1;
+  mutable uint64_t fingerprint_ = 0;   // spill_fingerprint(), once computed
+  mutable bool fingerprint_set_ = false;
   size_t spill_ram_ = 0;               // host bytes the entries in memory hold
   SpillStats sstats_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
