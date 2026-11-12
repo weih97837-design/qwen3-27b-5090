@@ -95,6 +95,7 @@ struct Entry {
   size_t tail_pages = 0, kv_bytes = 0;
   uint64_t last_use = 0;
   bool live = false;
+  bool busy = false;
 };
 
 struct SimCache {
@@ -166,6 +167,24 @@ struct SimCache {
     erase(id);
   }
 
+  // Model::spill_restore_issue (item 4): the entry's tail is parked, its chunks stay LISTED (references held) until
+  // restore_finish; the H2D copy is simulated at once, the "inflight" flags stay set until the finish.
+  void restore_issue(int id, Dev& dev2, const std::vector<int32_t>& pages) {
+    Entry& e = entries.at(id);
+    CHECK(!e.busy);
+    e.busy = true;
+    for (size_t c = 0; c < e.chunks.size(); c++) {
+      copy_pages(dev2, sub(pages, c * kChunkPages, kChunkPages), e.chunks[c]->kv, false, block);
+      e.chunks[c]->inflight = true;
+    }
+    if (e.tail_pages) copy_pages(dev2, sub(pages, e.chunks.size() * kChunkPages, e.tail_pages), e.tail, false, block);
+  }
+  void restore_finish(int id) {  // spill_loading_done -> spill_restore_finish -> spill_erase
+    for (Ch* c : entries.at(id).chunks) c->inflight = false;
+    entries.at(id).busy = false;
+    erase(id);
+  }
+
   // The old linear stream of an entry (what spill_write puts in the file)
   std::vector<char> linear(int id) {
     Entry& e = entries.at(id);
@@ -191,13 +210,15 @@ struct SimCache {
         for (Ch* c : orph) free_chunk(c);
         continue;
       }
-      std::vector<VictimCand> cand;
-      std::vector<int> ids;
-      for (int pass = 0; pass < 2 && cand.empty(); pass++)
-        for (auto& kv : entries)
-          if (kv.second.live == (pass == 0)) cand.push_back({kv.second.last_use, freed(kv.second)}), ids.push_back(kv.first);
-      if (cand.empty()) return evicted;
-      erase(ids[size_t(pick_victim(cand))]);
+      std::vector<VictimCand> cand[2];
+      std::vector<int> ids[2];
+      for (auto& kv : entries) {
+        const int cls = kv.second.live ? 0 : 1;
+        cand[cls].push_back({kv.second.last_use, freed(kv.second), 0}), ids[cls].push_back(kv.first);
+      }
+      const VictimChoice v = choose_victim(cand[0], cand[1]);
+      if (v.pass < 0) return evicted;
+      erase(ids[v.pass][size_t(v.idx)]);
       evicted++;
     }
     return evicted;
@@ -248,30 +269,54 @@ static void test_keys() {
 
 static void test_collision() {
   Store st;
-  const auto x = make_ids(5, 8), y = make_ids(6, 8);
+  const auto x = make_ids(5, 8), y = make_ids(6, 8), z = make_ids(7, 8);
   const Key128 nominal{42, 43};
-  Key128 sk;
-  CHECK(st.find(nominal, x.data(), 8, &sk) == nullptr && sk == nominal);
-  Ch* cx = st.add(sk, x.data(), 8, alloc_kv(nullptr, 100));
+  CHECK(st.find(nominal, 0, x.data(), 8) == nullptr);
+  Ch* cx = st.add(nominal, 0, x.data(), 8, alloc_kv(nullptr, 100));
   st.ref(cx);
-  CHECK(st.find(nominal, x.data(), 8, &sk) == cx && sk == nominal);
-  // the same key, other ids (a collision): a miss, and the new chunk goes to the next probe
-  CHECK(st.find(nominal, y.data(), 8, &sk) == nullptr && !(sk == nominal));
-  Ch* cy = st.add(sk, y.data(), 8, alloc_kv(nullptr, 50));
+  CHECK(st.find(nominal, 0, x.data(), 8) == cx);
+  // the same key, other ids (a collision): a miss; the new chunk coexists under the same key
+  CHECK(st.find(nominal, 0, y.data(), 8) == nullptr);
+  Ch* cy = st.add(nominal, 0, y.data(), 8, alloc_kv(nullptr, 50));
   st.ref(cy);
-  CHECK(cy != cx && st.size() == 2 && st.bytes() == 150);
-  Key128 sk2;
-  CHECK(st.find(nominal, x.data(), 8, &sk2) == cx);
-  CHECK(st.find(nominal, y.data(), 8, &sk2) == cy && sk2 == sk);
-  // removing the first leaves a gap: y is then only a miss (never wrong data)
+  Ch* cz = st.add(nominal, 0, z.data(), 8, alloc_kv(nullptr, 25));
+  st.ref(cz);
+  CHECK(cy != cx && cz != cy && st.size() == 3 && st.bytes() == 175);
+  CHECK(cx->uid != cy->uid && cy->uid != cz->uid && cx->uid > 0);
+  CHECK(st.find(nominal, 0, x.data(), 8) == cx && st.find(nominal, 0, y.data(), 8) == cy &&
+        st.find(nominal, 0, z.data(), 8) == cz);
+  // extracting one in the MIDDLE of the colliding group leaves no hole: the others are still found (item 5)
+  CHECK(st.unref(cy));
+  Ch outy = st.extract(cy);
+  CHECK(st.bytes() == 125 && st.orphan_count() == 0 && st.size() == 2);
+  CHECK(st.find(nominal, 0, y.data(), 8) == nullptr);
+  CHECK(st.find(nominal, 0, x.data(), 8) == cx && st.find(nominal, 0, z.data(), 8) == cz);
+  // ... and the first one (the one every other probe used to pass through)
   CHECK(st.unref(cx));
-  Ch out = st.extract(cx);
-  CHECK(st.bytes() == 50 && st.orphan_count() == 0);
-  CHECK(st.find(nominal, y.data(), 8, &sk2) == nullptr);
-  CHECK(st.find(nominal, x.data(), 8, &sk2) == nullptr);
-  st.unref(cy);
-  st.extract(cy);
+  Ch outx = st.extract(cx);
+  CHECK(st.find(nominal, 0, z.data(), 8) == cz && st.find(nominal, 0, x.data(), 8) == nullptr && st.bytes() == 25);
+  // a re-registered chunk has a NEW uid (a child of the old one cannot hit it)
+  Ch* cx2 = st.add(nominal, 0, x.data(), 8, alloc_kv(nullptr, 100));
+  CHECK(cx2->uid != outx.uid && cx2->uid != outy.uid);
+  st.ref(cx2), st.unref(cx2);
+  st.extract(cx2);
+  st.unref(cz);
+  st.extract(cz);
   CHECK(st.size() == 0 && st.bytes() == 0 && st.orphan_count() == 0);
+
+  // The parent is verified: the same ids under the same key but another parent are another chunk, so a collision of an
+  // EARLIER chunk never lets a later chunk of another prefix hit.
+  Store sp;
+  const Key128 k0{1, 2}, k1{3, 4};
+  const auto a0 = make_ids(11, 8), b0 = make_ids(12, 8), tail = make_ids(13, 8);
+  Ch* ca = sp.add(k0, 0, a0.data(), 8, alloc_kv(nullptr, 10));
+  Ch* cb = sp.add(k0, 0, b0.data(), 8, alloc_kv(nullptr, 10));  // collides with ca
+  Ch* ta = sp.add(k1, ca->uid, tail.data(), 8, alloc_kv(nullptr, 10));
+  Ch* tb = sp.add(k1, cb->uid, tail.data(), 8, alloc_kv(nullptr, 10));  // same ids, same key, another prefix
+  CHECK(ta != tb && sp.find(k1, ca->uid, tail.data(), 8) == ta && sp.find(k1, cb->uid, tail.data(), 8) == tb);
+  CHECK(sp.find(k1, 999, tail.data(), 8) == nullptr);
+  CHECK(sp.find(k1, kNoParent, tail.data(), 8) == nullptr);
+  sp.clear();
 
   // through a whole chain: chunk 0 collides (forced: a chunk with other ids sits at the key of chunk 0), so chunk 1
   // must not hit the chunk 1 of the entry that owns the real chain
@@ -285,16 +330,26 @@ static void test_collision() {
   CHECK(f1.size() == 2);
   // an impostor registered at the nominal key of chunk 0 of `b` (ids differ from b's)
   auto b = make_ids(10, 2 * kChunkTokens);
-  Key128 sk0;
   const Key128 nom0 = chunk_next(seed, b.data(), kChunkTokens);
-  CHECK(s2.find(nom0, b.data(), kChunkTokens, &sk0) == nullptr);
-  s2.ref(s2.add(nom0, a.data(), kChunkTokens, alloc_kv(nullptr, 64)));  // wrong ids under b's key
+  CHECK(s2.find(nom0, 0, b.data(), kChunkTokens) == nullptr);
+  s2.ref(s2.add(nom0, 0, a.data(), kChunkTokens, alloc_kv(nullptr, 64)));  // wrong ids under b's key
   chunk_acquire(s2, seed, b.data(), 2, kChunkTokens, 64, alloc, r2, f2);
   CHECK(f2.size() == 2 && r2[0] != r1[0] && r2[1] != r1[1]);  // both miss
   CHECK(r2[0]->ids == std::vector<int32_t>(b.begin(), b.begin() + long(kChunkTokens)));
-  // and b again hits its own chunks (the probe path is deterministic)
+  CHECK(r2[1]->parent == r2[0]->uid && r1[1]->parent == r1[0]->uid);
+  // and b again hits its own chunks
   chunk_acquire(s2, seed, b.data(), 2, kChunkTokens, 64, alloc, r3, f3);
   CHECK(f3.empty() && r3 == r2);
+  // freeing b's chunk 0 (in the middle of the probe path of that key) does not hide `a`'s chain, and a miss after a
+  // missing parent is a miss all the way down (no stale child hits)
+  for (Ch* c : r3) s2.unref(c);
+  for (Ch* c : r2) s2.unref(c);
+  Ch dead = s2.extract(r2[0]);
+  std::vector<Ch*> r4;
+  std::vector<std::pair<size_t, Ch*>> f4;
+  chunk_acquire(s2, seed, a.data(), 2, kChunkTokens, 64, alloc, r4, f4);
+  CHECK(f4.empty() && r4 == r1);
+  CHECK(chunk_missing_bytes(s2, seed, b.data(), 2, kChunkTokens, 64) == 128);  // b's chunk 0 gone, so chunk 1 misses too
 }
 
 static void test_refcounts_accounting() {
@@ -531,6 +586,91 @@ static void test_acquire_throws() {
   }
 }
 
+// Item 1: freeing a chunk that is still in flight never waits for its copy (a fake event layer: the wait callback counts).
+struct FakeRetired {
+  HostKv kv;
+  int* done;
+  bool async;
+};
+static void test_free_inflight_parks() {
+  Store st;
+  std::vector<FakeRetired> retired;
+  int syncs = 0, puts = 0;
+  int ev_a = 1, ev_b = 2;
+  auto wait = [&](Ch*) { syncs++; };
+  auto put = [&](int* e) { if (e) puts++; };
+  const auto x = make_ids(21, 8), y = make_ids(22, 8);
+  Ch* a = st.add(Key128{1, 1}, 0, x.data(), 8, alloc_kv(nullptr, 100));
+  Ch* b = st.add(Key128{2, 2}, 0, y.data(), 8, alloc_kv(nullptr, 100));
+  st.ref(a), st.ref(b);
+  a->done = &ev_a, a->inflight = true;  // another entry's restore is still copying it to the device
+  b->done = &ev_b, b->inflight = false;
+  CHECK(st.unref(a) && st.unref(b));
+  chunk_free(st, a, retired, wait, put);
+  CHECK(syncs == 0 && retired.size() == 1 && retired[0].async && retired[0].done == &ev_a && retired[0].kv.total == 100);
+  CHECK(st.size() == 1 && st.bytes() == 100 && st.orphan_count() == 1 && puts == 0);  // gone from the store, memory parked
+  CHECK(st.find(Key128{1, 1}, 0, x.data(), 8) == nullptr);
+  chunk_free(st, b, retired, wait, put);  // not in flight: freed at once, its event recycled
+  CHECK(syncs == 0 && retired.size() == 1 && puts == 1 && st.size() == 0 && st.bytes() == 0 && st.orphan_count() == 0);
+}
+
+// Item 4: an async restore keeps its chunk references until it completes: another spill of the same prefix finds the
+// chunks in the meantime (no second copy), and dropping that other entry while the restore runs frees nothing.
+static void test_restore_holds_chunks() {
+  std::mt19937 rng(5);
+  SimCache sc;
+  const auto ids = make_ids(31, 2 * kChunkTokens + 640);
+  auto pages = random_pages(rng, 300, (ids.size() + 63) / 64);
+  Dev dev(300);
+  fill_dev(dev, ids, pages);
+  const int a = sc.spill(dev, ids, pages);
+  CHECK(sc.store.size() == 2 && sc.misses == 2);
+  auto other = random_pages(rng, 300, pages.size());
+  Dev dev2(300);
+  sc.restore_issue(a, dev2, other);  // the restore is in flight
+  CHECK(sc.entries.at(a).chunks[0]->refs == 1 && sc.store.size() == 2);
+  // a different entry of the same prefix (the pool gave it up meanwhile): both chunks are found, not copied again
+  const int b = sc.spill(dev, ids, pages);
+  CHECK(sc.hits == 2 && sc.misses == 2 && sc.store.size() == 2 && sc.entries.at(b).chunks == sc.entries.at(a).chunks);
+  CHECK(sc.entries.at(a).chunks[0]->refs == 2);
+  sc.erase(b);  // dropped while the restore is still running: the chunks stay (the restore lists them)
+  CHECK(sc.store.size() == 2 && sc.entries.at(a).chunks[1]->refs == 1);
+  sc.restore_finish(a);  // the copy completed: the references go, the chunks with them
+  CHECK(sc.store.size() == 0 && sc.store.bytes() == 0 && sc.own == 0 && sc.entries.empty());
+  for (size_t i = 0; i < other.size(); i++)
+    for (int sl = 0; sl < kSlices; sl++) CHECK(std::memcmp(dev2.page(other[i], sl), dev.page(pages[i], sl), kP) == 0);
+}
+
+// Item 3: spill_enforce_ram's victim class.
+static void test_choose_victim() {
+  using V = std::vector<VictimCand>;
+  CHECK(choose_victim({}, {}).pass == -1);
+  CHECK(choose_victim(V{{1, 100, 100}}, {}).pass == 0);
+  CHECK(choose_victim({}, V{{1, 100, 100}}).pass == 1);
+  // a backup that frees real memory goes first, even when a sole copy would free more (it loses nothing)
+  CHECK(choose_victim(V{{5, 300, 100}}, V{{1, 1000, 100}}).pass == 0);
+  // a backup that frees only its state, a sole copy that frees >= 4x: the sole copy
+  VictimChoice c = choose_victim(V{{5, 100, 100}}, V{{1, 400, 100}, {2, 900, 100}});
+  CHECK(c.pass == 1 && c.idx == 1);  // (the most bytes freed, not the oldest: 400 is outside the factor-2 band of 900)
+  // ... but not when the sole copy frees less than 4x
+  CHECK(choose_victim(V{{5, 100, 100}}, V{{1, 399, 100}}).pass == 0);
+  // within the backups: the most bytes freed first (the oldest within a factor 2 of the best)
+  c = choose_victim(V{{1, 100, 100}, {2, 5000, 100}, {3, 3000, 100}}, {});
+  CHECK(c.pass == 0 && c.idx == 1);  // (5000 and 3000 are within a factor 2: the older of the two)
+  // a backup that frees nothing at all (state 0 by accounting) vs a sole copy: the sole copy
+  CHECK(choose_victim(V{{1, 0, 0}}, V{{1, 10, 0}}).pass == 1);
+  // termination: removing the chosen candidate each time empties both classes
+  V b{{1, 100, 100}, {2, 50, 50}, {3, 7000, 100}}, sl{{1, 800, 100}, {2, 4000, 100}};
+  int steps = 0;
+  for (;;) {
+    const VictimChoice v = choose_victim(b, sl);
+    if (v.pass < 0) break;
+    (v.pass == 0 ? b : sl).erase((v.pass == 0 ? b : sl).begin() + v.idx);
+    CHECK(++steps <= 5);
+  }
+  CHECK(steps == 5 && b.empty() && sl.empty());
+}
+
 static void test_pick_victim() {
   // equal freed: LRU
   CHECK(pick_victim({{5, 100}, {3, 100}, {9, 100}}) == 1);
@@ -603,6 +743,9 @@ int main() {
   test_orphans_and_enforce();
   test_acquire_throws();
   test_pick_victim();
+  test_free_inflight_parks();
+  test_restore_holds_chunks();
+  test_choose_victim();
   test_churn();
   if (fails) {
     std::printf("%d check(s) FAILED\n", fails);

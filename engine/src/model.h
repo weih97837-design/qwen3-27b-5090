@@ -315,14 +315,26 @@ class Model {
   void spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file);
   // RAM dedup (spill.cc (H)-(K)).
   size_t spill_chunk_count(size_t ntokens) const;  // full chunks of an entry of ntokens (by tokens; 0 with SPILL_DEDUP=0)
-  size_t spill_new_bytes(const Checkpoint& c);      // host bytes spilling c would add: its tail + the chunks not resident
-  void spill_chunk_unref(SpillChunk* c, bool park);  // refs--; at 0 the chunk goes (park: a copy reading it may be queued)
-  void spill_chunk_free(SpillChunk* c, bool park);   // refs == 0: leaves the store, its memory freed / parked in retired_
+  size_t spill_new_host_bytes(const Checkpoint& c);  // growth of spill_host_use() from spilling c, state excluded: piece by piece (its tail, the chunks not resident), a piece the free pinned pool can still take costs nothing
+  void spill_chunk_unref(SpillChunk* c, bool now);   // refs--; at 0 the chunk goes (now: not even inside an OrphanScope: a host -> device copy that reads it was queued)
+  void spill_chunk_free(SpillChunk* c);              // refs == 0: leaves the store; an in-flight chunk is parked in retired_ (never waited for), else freed
+  void spill_unacquire(std::vector<int32_t>& pages, int slot);  // undo spill_acquire after a throw: waits for the stream, then frees pages + slot
   void spill_trim_orphans();                         // frees the chunks nobody lists
   void spill_release_mem(Spilled& s, bool park);     // drops the entry's chunks and memory; accounting; the entry may stay (file)
   void spill_h2d(Spilled& s, const std::vector<int32_t>& pages, cudaStream_t st, bool record);  // chunks + tail -> pool pages
   bool spill_parts_ok(const Spilled& s) const;       // chunk + tail bytes add up to kv_bytes, and the chunks are whole
   size_t spill_freed(const Spilled& s) const;        // host bytes erasing the entry would give back (spill_enforce_ram)
+  // Runs f when it goes out of scope, unless dismissed (undoing a half-done step when an exception passes through).
+  template <class F>
+  struct Undo {
+    F f;
+    bool on = true;
+    explicit Undo(F f_) : f(std::move(f_)) {}
+    ~Undo() {
+      if (on) f();
+    }
+    void dismiss() { on = false; }
+  };
   struct OrphanScope {                               // chunks reaching 0 refs stay resident until end() (a replacing copy re-finds them)
     Model* m;
     bool on = true;
