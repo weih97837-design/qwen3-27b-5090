@@ -1,6 +1,6 @@
-<#
+﻿<#
 Updates the Windows package (app\scripts\update.ps1; update.cmd runs a copy of it) to the latest release of
-mkyt/qwen3-27b-5090, or to the one -Tag names (an older one too). settings.ini, the weights and the log stay.
+-Repo (default weih97837-design/qwen3-27b-5090, this fork), or to the one -Tag names (an older one too). settings.ini, the weights and the log stay.
 
 Installed packages run their own copy of this script to install later releases, so it assumes as little as it can
 about them. This copy finds the release, downloads its zip (curl.exe; an interrupted download resumes), checks it
@@ -29,7 +29,7 @@ param(
   [switch]$Check,  # only print the installed and the release's version
   [switch]$Force,  # also when the version is the same
   [string]$Zip = "",  # a zip already downloaded (its SHA-256 is not checked)
-  [string]$Repo = "mkyt/qwen3-27b-5090",
+  [string]$Repo = "weih97837-design/qwen3-27b-5090",  # this fork (the upstream is mkyt/qwen3-27b-5090)
   [string]$Root = "",  # the package's folder (update.cmd runs a copy of this script from %TEMP%)
   # The install step, which an older copy of this script hands over: the unpacked package of this script
   [string]$InstallFrom = "",
@@ -116,6 +116,10 @@ function Download($url, $file, [switch]$Resume) {  # (-Resume: the zip, with pro
   }
 }
 
+function Throw-NoRelease {  # (this fork has no Windows release yet: say so, in both languages)
+  throw "${Repo} 還沒有 Windows 發佈版（找不到 *-windows-x64.zip）。請用 scripts\windows\package.ps1 自行建置。`nThis fork (${Repo}) has no Windows release yet (no *-windows-x64.zip): build the package with scripts\windows\package.ps1."
+}
+
 function Find-Release {
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   $api = "https://api.github.com/repos/$Repo/releases/" + $(if ($Tag) { "tags/$Tag" } else { "latest" })
@@ -133,7 +137,7 @@ function Find-Release {
       $t = ($resp.Headers["Location"] -split "/")[-1]
       $resp.Close()
     }
-    if (-not $t -or $t -eq "releases") { throw "cannot find the latest release" }
+    if (-not $t -or $t -eq "releases") { Throw-NoRelease }
     $name = "qwen3-27b-5090-$t-windows-x64.zip"
     $base = "https://github.com/$Repo/releases/download/$t"
     return @{ tag = $t; assets = @(@{ name = $name; url = "$base/$name"; size = 0 }, @{ name = "$name.sha256"; url = "$base/$name.sha256"; size = 0 }) }
@@ -162,7 +166,7 @@ if (-not $Zip) {
   $release = Find-Release
   $asset = @($release.assets | Where-Object { $_.name -like "*-windows-x64.zip" }) +
            @($release.assets | Where-Object { $_.name -like "*windows*.zip" }) | Select-Object -First 1
-  if (-not $asset) { throw "release $($release.tag) has no Windows package" }
+  if (-not $asset) { Throw-NoRelease }
   $size = if ($asset.size) { " ($([math]::Round($asset.size / 1MB, 1)) MB)" } else { "" }
   Write-Host "installed: $shown, release: $($release.tag)$size"
   if ($Check) { exit 0 }

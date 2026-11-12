@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Start / stop the serve container from anywhere (scripts/windows/serve.cmd calls this through wsl.exe).
 #   scripts/serve.sh up          # docker compose up -d serve, then wait until the server answers (the engine keeps loading);
-#                                # the image is the one pulled (or built) last, built here if there is none
+#                                # the image is built from this checkout (compose.yaml: pull_policy: build)
 #   scripts/serve.sh up --idle   # the same with ENGINE_AUTOSTART=0: no VRAM until the engine is started at /ui
 #   scripts/serve.sh up --build  # with the image built from this checkout (after a code change)
-#   scripts/serve.sh update      # pull the published image (ghcr.io), then up
+#   scripts/serve.sh update      # rebuild from this checkout, then up: the same as up --build (this fork publishes no image)
 #   scripts/serve.sh down        # docker compose down
 #   scripts/serve.sh status      # the container's state and /health
 #   scripts/serve.sh keepalive   # block while the container exists: keeps the WSL distro from shutting down when idle
@@ -51,8 +51,7 @@ case "${1:-}" in
     exit 1
     ;;
   update)
-    docker compose pull serve
-    exec "$0" up "${@:2}"
+    exec "$0" up --build "${@:2}"  # (never pull: the published image is upstream's, without the tiered cache)
     ;;
   down)
     docker compose down
