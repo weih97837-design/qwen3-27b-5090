@@ -24,10 +24,14 @@ class Eng:
         self.finished, self.failed, self.sync = [], 0, []
         self.released = []
         self.pos = 0
+        self.resets = []
 
     def spill_match(self, ids, spec=False):
         self.match_calls.append((len(ids), spec))
         return dict(self.match) if self.match else None
+
+    def reset(self):
+        self.resets.append(len(self.begin_calls))  # (how many begins came before this reset)
 
     def spill_restore_begin(self, entry_id):
         self.begin_calls.append(entry_id)
@@ -706,3 +710,29 @@ def test_finished_restore_is_admitted_without_charging_its_prefix_twice():
     r.restore_id, r.restore_pos = None, 0
     assert s.admit(r) is False
     assert s.blocked == "kv"
+
+
+def test_finished_cur_is_reset_before_restore_begin():
+    eng = Eng(match=ram_match(), begin=1)
+    s = sched(eng)
+    done = seq("done")
+    done.dead = True
+    s.cur = done
+    a = seq("a")
+    s.waiting.append(a)
+    s.admit_waiting()
+    assert eng.resets == [0] and eng.begin_calls == [7]  # reset first, then the restore
+    assert s.cur is None and a.restoring is not None
+
+
+def test_running_cur_is_not_reset_for_a_restore():
+    eng = Eng(match=ram_match(), begin=1)
+    s = sched(eng)
+    run = seq("run")
+    run.started = True
+    s.cur = run
+    s.alive.append(run)
+    a = seq("a")
+    s.waiting.append(a)
+    s.admit_waiting()
+    assert eng.resets == [] and s.cur is run and eng.begin_calls == [7]
