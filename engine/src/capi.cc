@@ -140,6 +140,8 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   if (const char* e = getenv("SPILL_ASYNC_PROMOTE")) o.spill_async_promote = atoi(e) != 0;
   // SPILL_DEDUP (default 1): spilled entries share identical 4096-token chunks in RAM; 0 keeps every entry's KV whole.
   if (const char* e = getenv("SPILL_DEDUP")) o.spill_dedup = atoi(e) != 0;
+  // SPILL_FAIR_AGENTS (default 1): the RAM tier's victim comes from the agent using the most RAM (retention.h); 0: no per-agent step.
+  if (const char* e = getenv("SPILL_FAIR_AGENTS"); e && *e) o.spill_fair_agents = atoi(e) != 0;
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
@@ -403,6 +405,31 @@ int q27_spill_list_ex(void* m, char* buf, int cap) {
     buf[n] = 0;
   }
   return int(r.size());
+}
+
+// Retention (retention.h, Model::set_owner / spill_meta / spill_agents). q27_set_owner: the agent id of the next prefix_begin's
+// sequence (0: unknown). q27_spill_meta: "id\towner\thits\tsuperseded" per entry. q27_spill_agents: "owner\tram_bytes\tssd_bytes\t
+// ram_entries\tssd_entries" per agent. The two lists are copied as q27_spill_list copies its list.
+int q27_set_owner(void* m, uint64_t owner) {
+  return guard([&] { static_cast<Model*>(m)->set_owner(owner); });
+}
+static int copy_text(const std::string& r, char* buf, int cap) {
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+int q27_spill_meta(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->spill_meta(); }) != 0) return -1;
+  return copy_text(r, buf, cap);
+}
+int q27_spill_agents(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->spill_agents(); }) != 0) return -1;
+  return copy_text(r, buf, cap);
 }
 
 // Writes min(n, 5) values: physical bytes on the SSD (each chunk file once + the manifests + chunk files whose deletion failed and

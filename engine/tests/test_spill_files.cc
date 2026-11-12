@@ -126,9 +126,10 @@ static void test_roundtrip_and_damage() {
       {"chunk 1 header (key)", idx.path(ex.names[1]), 20, 0, 1},
       {"chunk 2 magic", idx.path(ex.names[2]), 1, 0, 2},
       {"chunk 0 truncated", idx.path(ex.names[0]), -1, 9, 0},
-      {"manifest state", ex.manifest, long(sizeof(ManifestHeader) + e.ids.size() * 4 + 3 * kNameField + 10), 0, -1},
+      {"manifest state", ex.manifest, long(sizeof(ManifestHeader) + sizeof(ManifestMeta) + e.ids.size() * 4 + 3 * kNameField + 10), 0, -1},
       {"manifest tail", ex.manifest, -20, 0, -1},
-      {"manifest ids", ex.manifest, long(sizeof(ManifestHeader) + 40), 0, -1},
+      {"manifest ids", ex.manifest, long(sizeof(ManifestHeader) + sizeof(ManifestMeta) + 40), 0, -1},
+      {"manifest meta", ex.manifest, long(sizeof(ManifestHeader) + 3), 0, -1},
       {"manifest truncated", ex.manifest, -1, 5, -1},
   };
   for (const Case& c : cases) {
@@ -517,9 +518,10 @@ static void test_io_errors_and_pending_deletes() {
     x.forget_file("aa-bb");
     CHECK(x.find("aa-bb") && !x.find("aa-bb")->present);  // (not served)
     CHECK(x.pending_files() == 1 && x.physical_bytes() == 1500 && x.files() == 2);  // (still on the disk: still counted)
+    CHECK(x.is_pending("aa-bb") && !x.is_pending("cc-dd"));  // (export_entry_files does not adopt a pending name's old file)
     CHECK(x.retry_pending() == 0 && x.pending_files() == 1);
     fs::remove_all(x.path("aa-bb"));
-    CHECK(x.retry_pending() == 1 && x.pending_files() == 0 && x.physical_bytes() == 500);
+    CHECK(x.retry_pending() == 1 && x.pending_files() == 0 && x.physical_bytes() == 500 && !x.is_pending("aa-bb"));
     // the last reference goes while the file is held: the entry leaves the index, the file stays counted until it can be removed
     fs::create_directories(x.path("cc-dd") + "/held");
     CHECK(x.unref("cc-dd") == 500 && !x.find("cc-dd") && x.pending_files() == 1 && x.physical_bytes() == 500);
@@ -540,6 +542,70 @@ static void test_io_errors_and_pending_deletes() {
   fs::remove_all(dir);
 }
 
+// Retention fields in the manifest (version 2: owner, hits), and a version 1 manifest (written before them) that is still read and
+// restored, with owner 0 / hits 0.
+static void test_manifest_meta_and_version1() {
+  std::mt19937 rng(21);
+  const std::string dir = tmpdir("spill_files_meta");
+  DiskIndex idx;
+  idx.set_dir(dir + "/chunks");
+  const Entry e = make_entry(rng, {}, 2, 64, 100);
+  Exported ex;
+  const EntryMeta meta{0xC0FFEE1234567890ull, 7};
+  CHECK(export_entry(e, idx, dir + "/entries/a.q27m", &ex, nullptr, nullptr, nullptr, meta));
+  ManifestHead head;
+  CHECK(read_manifest_head(ex.manifest, head));
+  CHECK(head.info.version == 2 && head.info.owner == meta.owner && head.info.hits == 7);
+  CHECK(fs::file_size(ex.manifest) == manifest_file_bytes(e.state.size(), e.tail_pages * e.g.slices * e.g.page_bytes, e.ids.size(), 2));
+  {
+    HostKv dst = empty_kv(e.linear.size());
+    std::vector<char> state;
+    DiskRead d;
+    plan_read(d, e, idx, ex.manifest, ex.names, &state, &dst);
+    CHECK(d.run_sync() && same(e, state, dst));
+  }
+  // the same entry as a version 1 manifest (what an older build wrote)
+  const std::string v1 = dir + "/entries/old.q27m";
+  {
+    HostKv tail = tail_kv(e);
+    CPieces tp;
+    all_pieces(tail, tp);
+    ManifestInfo mi;
+    mi.fingerprint = e.fp, mi.g = e.g, mi.ring = e.ring, mi.state_bytes = e.state.size(), mi.tail_bytes = tail.total;
+    mi.version = 1;
+    std::string err;
+    CHECK(write_manifest_file(v1, mi, e.ids, ex.names, e.state.data(), tp, &err));
+    CHECK(fs::file_size(v1) == fs::file_size(ex.manifest) - sizeof(ManifestMeta));
+  }
+  ManifestHead h1;
+  CHECK(read_manifest_head(v1, h1));
+  CHECK(h1.info.version == 1 && h1.info.owner == 0 && h1.info.hits == 0 && h1.ids == e.ids && h1.names == ex.names);
+  DiskIndex idx2;  // (a restart: validate_manifest as spill_import does)
+  idx2.set_dir(idx.dir());
+  std::vector<std::string> unknown;
+  ManifestHead h2;
+  CHECK(validate_manifest(idx2, v1, e.fp, e.g, e.state.size(), 1 << 20, h2, unknown) && h2.info.version == 1);
+  {
+    HostKv dst = empty_kv(e.linear.size());
+    std::vector<char> state;
+    DiskRead d;
+    plan_read(d, e, idx, v1, ex.names, &state, &dst, 1);
+    CHECK(d.run_sync() && same(e, state, dst));  // restored as before
+    DiskRead d2;  // (the engine carries the file's version: a reader told version 2 refuses a version 1 file, it does not guess)
+    plan_read(d2, e, idx, v1, ex.names, &state, &dst, 2);
+    CHECK(!d2.run_sync());
+  }
+  // a version this build does not know is not imported
+  {
+    const std::string v3 = dir + "/entries/new.q27m";
+    fs::copy_file(ex.manifest, v3);
+    flip(v3, 8);  // the version field's low byte
+    ManifestHead h3;
+    CHECK(!read_manifest_head(v3, h3));
+  }
+  fs::remove_all(dir);
+}
+
 int main() {
   test_hash();
   test_names();
@@ -548,6 +614,7 @@ int main() {
   test_crash_leftovers_and_sweep();
   test_export_import_branches();
   test_io_errors_and_pending_deletes();
+  test_manifest_meta_and_version1();
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
 }

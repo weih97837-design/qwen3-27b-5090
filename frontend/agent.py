@@ -76,3 +76,13 @@ def prefix_fingerprint(ids, pos):
     h.update(array.array("i", ids[max(4096, pos - 64):pos]).tobytes())
     h.update(pos.to_bytes(8, "little"))
     return h.digest()
+
+
+def owner_id(agent):
+    """The engine's id of an agent (Model::set_owner, docs/tiered-cache.md "Retention"): a stable 63-bit integer derived from the
+    fairness key, so the tag stored with a checkpoint (and in the SSD manifest) means the same agent after a restart without any table.
+    0 is "unknown" (no agent). Two keys colliding (2^-63) would share a bucket: harmless."""
+    if not agent:
+        return 0
+    v = int.from_bytes(hashlib.blake2b(agent.encode("utf-8", "replace"), digest_size=8).digest(), "little") & ((1 << 63) - 1)
+    return v or 1

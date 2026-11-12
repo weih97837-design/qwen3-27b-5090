@@ -95,6 +95,13 @@
 //      and recycles the load event; the entry is not left busy (spill_promote's own guard; spill_restore_begin /
 //      spill_restore_poll for a restore, which also drop its restoring_ record and report it failed).
 //
+// RETENTION (retention.h, docs/tiered-cache.md "Retention"). Which entry spill_enforce_ram evicts is value based: the agent using the
+// most RAM (Options::spill_fair_agents), then superseded entries, never-hit before hit ones, then the old rule (chunk_store.h
+// pick_victim); a superseded sole copy is dropped, never written to the SSD. An entry's `owner` (Model::set_owner, carried by the
+// sequence through park / resume), `hits` (a prefix_begin match, or a restore) and the manifest's copy of both (version 2) follow the
+// entry through spill, the SSD, import and restore. The frontend applies the same order to the SSD (frontend/tiercache.py) from
+// spill_list + spill_meta + spill_agents. All of it is bookkeeping on the engine thread: no stream, event or buffer is touched.
+//
 // RAM DEDUP (Options::spill_dedup, default on; SPILL_DEDUP=0 turns it off; chunk_store.h). The RAM tier stores the full
 // kChunkPages-page (4096-token) blocks of an entry once, content-addressed, and entries reference them; only the
 // remainder (the "tail": < kChunkPages pages, with the partial last page) and the recurrent state are per entry. The SSD
@@ -187,6 +194,7 @@
 #include <utility>
 
 #include "model.h"
+#include "retention.h"
 
 namespace q27 {
 
@@ -202,7 +210,7 @@ uint64_t fnv(uint64_t h, const void* p, size_t n) {
 
 // Short checkpoints (a system prompt and tools) are shared by new conversations and cheap to keep, so they are
 // never subsumed by a deeper one (only by an equal one).
-constexpr int kKeepShort = 16384;
+constexpr int kKeepShort = kKeepShortTokens;
 
 // d holds the tokens of c (at least as many, the same prefix) and, when c has the draft's ring, d has it too.
 bool covers(const std::vector<int32_t>& d_ids, bool d_ring, const std::vector<int32_t>& c_ids, bool c_ring) {
@@ -646,6 +654,7 @@ uint64_t Model::spill_add(const Checkpoint& c, Spilled&& s, bool live) {
   s.ids = c.ids;
   s.ring = c.ring;
   s.last_use = c.last_use;
+  s.owner = c.owner, s.hits = c.hits, s.last_hit = c.last_hit;
   s.live = live;
   const size_t own = s.own_bytes();
   const uint64_t id = spill_next_;
@@ -874,6 +883,7 @@ bool Model::spill_promote(uint64_t id) {
   ck.pages = std::move(pages);  // (one reference each, from alloc)
   ck.slot = slot;
   ck.ring = s.ring;
+  ck.owner = s.owner, ck.hits = s.hits, ck.last_hit = s.last_hit;  // (the use that follows, prefix_begin's match, counts the hit)
   ck.last_use = ++use_clock_;
   ckpts_.push_back(std::move(ck));
   if (s.inflight) {  // (3) the H2D copy still reads kv: park it until the copy is done (state was copied above)
@@ -887,6 +897,7 @@ bool Model::spill_promote(uint64_t id) {
   undo_busy.dismiss();  // (the entry goes; nothing waits any more: inflight is clear)
   spill_erase(it, true);  // (the pool's copy is the one now; it is spilled again when the pool gives it up)
   sstats_.restored++;
+  (from_disk ? sstats_.restored_disk : sstats_.restored_ram)++;
   return true;
 }
 
@@ -989,6 +1000,7 @@ int Model::spill_restore_begin(uint64_t id) {
   spill_ram_ += s.own_bytes();  // (a private entry: all its pages are in kv)
   s.busy = true;
   restoring_.at(id).disk = std::move(d);
+  restoring_.at(id).from_disk = true;
   return 2;
 }
 
@@ -1047,6 +1059,7 @@ int Model::spill_restore_issue(uint64_t id) {
   ck.pages = std::move(pages);
   ck.slot = slot;
   ck.ring = s.ring;
+  ck.owner = s.owner, ck.hits = s.hits, ck.last_hit = s.last_hit;
   ck.last_use = ++use_clock_;
   ck.load_id = id;
   if (ev) ck.loading = true, ck.load_ev = ev;
@@ -1073,7 +1086,10 @@ void Model::spill_restore_finish(uint64_t id) {
   if (auto r = restoring_.find(id); r != restoring_.end()) {
     sstats_.restore_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - r->second.t0).count();
     sstats_.restore_bytes += int64_t(r->second.bytes);
+    (r->second.from_disk ? sstats_.restored_disk : sstats_.restored_ram)++;
     restoring_.erase(r);
+  } else {
+    sstats_.restored_ram++;
   }
   sstats_.restored++;
   sstats_.restored_async++;
@@ -1201,6 +1217,93 @@ int Model::spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap) {
   return n;
 }
 
+// ---------------------------------------------------------------- retention (retention.h)
+
+// Superseded flags of all spilled entries: nodes = the entries (checked), then the pool's checkpoints (extenders only). Cached until an
+// entry or a checkpoint was added or removed (the counters below change with each of those).
+void Model::spill_retention_refresh() const {
+  const int64_t key[6] = {int64_t(spill_next_), int64_t(spill_.size()), cstats_.saved, cstats_.evicted, int64_t(ckpts_.size()),
+                          sstats_.restored};
+  if (std::equal(std::begin(key), std::end(key), std::begin(sup_key_))) return;
+  std::vector<RetNode> nodes;
+  std::vector<uint64_t> ids;
+  nodes.reserve(spill_.size() + ckpts_.size()), ids.reserve(spill_.size());
+  auto bh = [](const std::vector<int32_t>& v, std::vector<uint64_t>& h) -> const std::vector<uint64_t>* {
+    if (h.size() != v.size() / kBlockTokens) h = block_hashes(v);  // (once per entry / checkpoint: its tokens never change)
+    return &h;
+  };
+  for (const auto& kv : spill_) {
+    nodes.push_back({&kv.second.ids, bh(kv.second.ids, kv.second.bh), kv.second.ring, kv.second.owner});
+    ids.push_back(kv.first);
+  }
+  const size_t n_check = nodes.size();
+  for (const auto& c : ckpts_) nodes.push_back({&c.ids, bh(c.ids, c.bh), c.ring, c.owner});
+  std::vector<char> flags;
+  superseded_flags(nodes, n_check, flags);
+  sup_.clear();
+  for (size_t i = 0; i < n_check; i++) sup_[ids[i]] = flags[i];
+  std::copy(std::begin(key), std::end(key), std::begin(sup_key_));
+}
+
+bool Model::spill_superseded(uint64_t id) const {
+  spill_retention_refresh();
+  const auto it = sup_.find(id);
+  return it != sup_.end() && it->second;
+}
+
+// Bytes per agent in a tier (retention.h agent_use): the RAM tier's entries' own bytes and the resident chunks they list; the SSD
+// tier's manifests and the chunk files their manifests list. A chunk shared by entries of several agents is split between the agents.
+std::map<uint64_t, double> Model::spill_use(bool ssd) const {
+  std::vector<UseEntry> use;
+  use.reserve(spill_.size());
+  for (const auto& kv : spill_) {
+    const Spilled& s = kv.second;
+    UseEntry u;
+    u.owner = s.owner;
+    if (!ssd) {
+      if (!s.in_ram() && s.chunks.empty()) continue;
+      u.own = double(s.own_bytes());
+      for (const SpillChunk* c : s.chunks) u.shared.emplace_back(c, double(c->bytes()));
+    } else {
+      if (s.path.empty()) continue;
+      u.own = double(s.manifest_bytes);
+      for (const std::string& n : s.dnames)
+        if (const DiskIndex::Chunk* c = disk_.find(n); c && c->present) u.shared.emplace_back(c, double(c->bytes));
+    }
+    use.push_back(std::move(u));
+  }
+  return agent_use(use);
+}
+
+std::string Model::spill_meta() const {
+  spill_retention_refresh();
+  std::ostringstream out;
+  for (const auto& kv : spill_) {
+    const auto it = sup_.find(kv.first);
+    out << kv.first << '\t' << kv.second.owner << '\t' << kv.second.hits << '\t' << (it != sup_.end() && it->second ? 1 : 0) << '\n';
+  }
+  return out.str();
+}
+
+std::string Model::spill_agents() const {
+  struct Row {
+    double ram = 0, ssd = 0;
+    int ram_n = 0, ssd_n = 0;
+  };
+  std::map<uint64_t, Row> rows;
+  for (const auto& [o, b] : spill_use(false)) rows[o].ram = b;
+  for (const auto& [o, b] : spill_use(true)) rows[o].ssd = b;
+  for (const auto& kv : spill_) {
+    const Spilled& s = kv.second;
+    if (s.in_ram() || (s.busy && !s.chunks.empty())) rows[s.owner].ram_n++;
+    if (!s.path.empty()) rows[s.owner].ssd_n++;
+  }
+  std::ostringstream out;
+  for (const auto& [o, r] : rows)
+    out << o << '\t' << int64_t(r.ram + 0.5) << '\t' << int64_t(r.ssd + 0.5) << '\t' << r.ram_n << '\t' << r.ssd_n << '\n';
+  return out.str();
+}
+
 void Model::spill_enforce_ram() {
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
   // (K) host use is re-read every iteration: an entry whose chunks others share frees little (or nothing).
@@ -1217,17 +1320,28 @@ void Model::spill_enforce_ram() {
     // the pool, counted whole), so pageable ones weigh more.
     // choose_victim (chunk_store.h): the backups first, most bytes freed first, unless the best one frees only its state
     // while a sole copy frees >= 4x that (then the sole copy goes to the SSD instead of backups being dropped one by one).
+    // Within a class the order is the retention policy's (retention.h; chunk_store.h pick_victim): the agent using the most RAM,
+    // then superseded entries, never-hit before hit ones, and the old "frees the most / least recently used".
     auto victim = spill_.end();
+    bool victim_superseded = false;
     {
       std::vector<VictimCand> cand[2];  // [0] the idle backups, [1] the sole copies
       std::vector<std::map<uint64_t, Spilled>::iterator> its[2];
+      const std::map<uint64_t, double> use = opt_.spill_fair_agents ? spill_use(false) : std::map<uint64_t, double>();
       for (auto it = spill_.begin(); it != spill_.end(); ++it)
         if (it->second.in_ram() && !it->second.busy) {
-          const int cls = it->second.live ? 0 : 1;
-          cand[cls].push_back({it->second.last_use, spill_freed(it->second), it->second.state_bytes});
+          const Spilled& s = it->second;
+          const int cls = s.live ? 0 : 1;
+          VictimCand vc{s.last_use, spill_freed(s), s.state_bytes};
+          vc.agent = s.owner, vc.hits = s.hits, vc.superseded = spill_superseded(it->first);
+          if (const auto u = use.find(s.owner); u != use.end()) vc.agent_use = u->second;
+          cand[cls].push_back(vc);
           its[cls].push_back(it);
         }
-      if (const VictimChoice v = choose_victim(cand[0], cand[1]); v.pass >= 0) victim = its[v.pass][size_t(v.idx)];
+      if (const VictimChoice v = choose_victim(cand[0], cand[1], opt_.spill_fair_agents); v.pass >= 0) {
+        victim = its[v.pass][size_t(v.idx)];
+        victim_superseded = cand[v.pass][size_t(v.idx)].superseded;
+      }
     }
     // (A victim may be an entry whose D2H copy is still in flight: spill_erase / spill_write wait for it, (3).)
     if (victim == spill_.end()) return;
@@ -1236,7 +1350,9 @@ void Model::spill_enforce_ram() {
       sstats_.dropped++;
       continue;
     }
-    if (!opt_.spill_dir.empty()) {
+    // A superseded entry is never written to the SSD (a deeper checkpoint of its conversation exists): dropped, as the frontend's
+    // retention does.
+    if (!opt_.spill_dir.empty() && !victim_superseded) {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count();
       const std::string path =
@@ -1315,6 +1431,7 @@ bool Model::spill_read_plan(Spilled& s, DiskRead& d) {
   const size_t tail_pages = npages - nch * kChunkPages;
   d.manifest = s.path;
   d.info.fingerprint = spill_fingerprint(), d.info.g = spill_geom(), d.info.ring = s.ring;
+  d.info.version = s.manifest_version;  // (the file's own: a version 1 manifest of an older build is read as it was written)
   d.info.state_bytes = s.state_bytes, d.info.tail_bytes = tail_pages * kKvSlices * kv_page_bytes_;
   d.ids = s.ids;
   d.names = s.dnames;
@@ -1375,8 +1492,9 @@ void Model::spill_write(Spilled& s, const std::string& path) {
   // A throw leaves the entry as it was (its memory, its old manifest) and removes the chunk files it wrote that nobody lists.
   const uint64_t mbytes = export_entry_files(
       disk_, spill_fingerprint(), spill_geom(), path, s.ring, s.ids, s.state.get(), s.state_bytes, s.kv, nch,
-      [&](size_t i) -> const HostKv& { return s.chunks[i]->kv; }, s.path, s.dnames);
+      [&](size_t i) -> const HostKv& { return s.chunks[i]->kv; }, s.path, s.dnames, EntryMeta{s.owner, s.hits});
   s.manifest_bytes = mbytes;
+  s.manifest_version = kManifestVersion;
   spill_release_mem(s, false);  // (its chunk references too: a chunk nobody else lists is freed)
   sstats_.written++;
 }
@@ -1495,6 +1613,7 @@ uint64_t Model::spill_import(const std::string& path) {
   s.kv_bytes = npages * kKvSlices * kv_page_bytes_;
   s.state_bytes = h.info.state_bytes;
   s.ring = h.info.ring;
+  s.owner = h.info.owner, s.hits = h.info.hits, s.manifest_version = h.info.version;
   s.path = path;
   s.dnames = h.names;
   s.manifest_bytes = h.file_bytes;
@@ -1527,6 +1646,7 @@ void Model::spill_stats(int64_t* out, int n) const {
   out[18] = sstats_.restore_ns / 1000000, out[19] = sstats_.restore_bytes;
   out[20] = logical, out[21] = phys, out[22] = int64_t(spill_chunks_.size());
   out[23] = sstats_.chunk_hits, out[24] = sstats_.chunk_misses, out[25] = std::max<int64_t>(0, logical - phys);
+  out[26] = sstats_.restored_ram, out[27] = sstats_.restored_disk;
   for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 

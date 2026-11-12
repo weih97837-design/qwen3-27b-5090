@@ -45,6 +45,17 @@ checks the spill counters to show that the intended path was taken.
                       (SPILL_ASYNC_PROMOTE=1: spill_match / spill_restore_begin returns 2 / poll). Every follow-up's tokens must equal the
                       uncached reference; when the last sibling is restored no chunk or manifest file is left.
 
+  k  Retention       (docs/tiered-cache.md "Retention"; needs the engine's set_owner / spill_meta, else skipped.) Two agents share a RAM
+                      tier that holds ~3 entries (phase probe measures one entry; phase run sets SPILL_RAM_GIB to 3.4 entries): B (owner 2)
+                      has ONE entry, A (owner 1) many, of which one was restored once (hits 1) and the others never. When a fourth entry
+                      arrives the engine's RAM cap must take its victim from A (the agent using the most RAM) although B's entry is
+                      the oldest, and from A's never-hit entries rather than the older hit one: B and the hit entry stay in RAM, A's
+                      oldest never-hit entry is written to SPILL_DIR. spill_meta / spill_list report owner and hits, spill_agents the
+                      bytes (A > B). A conversation whose longer continuation exists in VRAM (computed with spill_sync_lookup(False),
+                      so the spilled entry stays) is reported superseded, and the eviction of that continuation subsumes it instead of
+                      writing it. Every restored follow-up (B from RAM, A's from the file) must equal the uncached reference. Prompts
+                      are >= 25K tokens (superseded needs more than kKeepShort = 16384).
+
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens. The driver sizes the conversations
 to the engine's pool, including its block rounding (choose_prompt_len): the prompt length is raised until two
@@ -89,6 +100,7 @@ SCENARIOS = {
     "h": ("RAM dedup: shared prefix, spill, promote", ["full"]),
     "i": ("RAM dedup with pinned segments + async I/O", ["full"]),
     "j": ("SSD dedup: shared chunk files, restart, drop, restore (sync + async)", ["write", "read"]),
+    "k": ("retention: per-agent fairness, never-hit first, superseded", ["probe", "run"]),
 }
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
 SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
@@ -100,6 +112,8 @@ SUFFIX = ".q27m"  # the manifest name frontend/tiercache.py indexes at start(), 
 ENTRIES = "entries"
 CHUNKS = "chunks"
 J_N = 4  # scenario j: conversations that share the prefix
+K_OWNER_A, K_OWNER_B = 1, 2  # scenario k: the engine's agent ids (Model::set_owner)
+K_CAP_ENTRIES = 3.4  # scenario k: the RAM cap in entries (phase probe measures the size of one)
 FOLLOW = 300  # new tokens of each follow-up turn
 KEYS = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "backed_up", "pinned_bytes",
         "pin_hits", "pin_misses", "restoring", "restored_async", "restore_failed")
@@ -576,6 +590,120 @@ def scen_h(R, spill_dir):
                 f"logical {sf['logical_bytes']}, physical {sf['physical_bytes']}")
 
 
+class ScenarioSkip(Exception):
+    """A scenario that cannot run with this engine library (reported as SKIP, not FAIL)."""
+
+
+def k_ents(R):
+    """The spilled entries as the engine lists them, newest id last."""
+    return sorted(R.eng.spill_list(), key=lambda e: e["id"])
+
+
+def k_tier(e):
+    return "ram" if e["ram_bytes"] > 0 else "disk" if e["on_disk"] else "?"
+
+
+def scen_k(R, spill_dir):
+    """Retention (see the scenario list at the top). Phases: full (the reference: everything), probe (one entry's size), run."""
+    if R.L < H_PREFIX + H_MIN_TAIL:
+        raise SystemExit(f"scenario k needs prompts of at least {H_PREFIX + H_MIN_TAIL} tokens (got {R.L})")
+    if R.cache and not (hasattr(R.eng, "set_owner") and R.eng.has_retention):
+        raise ScenarioSkip("the engine library has no retention calls (set_owner / spill_meta / spill_agents)")
+    own = (lambda o: R.eng.set_owner(o)) if R.cache else (lambda o: None)
+    follow = {k: make_prompt(R.docs, 1000, 9 + ord(k[0]))[:FOLLOW] for k in ("A1", "A2", "A3", "B")}
+    if R.phase in ("full", "probe"):
+        s0 = R.snap("probe start")
+        own(K_OWNER_A)
+        R.turn1("P0", make_prompt(R.docs, R.L, 30))
+        R.turn1("P1", make_prompt(R.docs, R.L, 31))  # evicts P0's checkpoint: one entry in RAM
+        s1 = R.snap("probe entry")
+        R.eviction_check("the probe conversation was spilled to RAM", delta(s0, s1, "spilled") >= 1 and s1["in_ram"] == 1,
+                         f"spilled +{delta(s0, s1, 'spilled')}, in_ram {s1['in_ram']}")
+        if R.phase == "probe":
+            return
+    # ---- run: B (agent 2) has one entry, A (agent 1) several; RAM holds ~3.
+    conv = {"B": (K_OWNER_B, 20), "A1": (K_OWNER_A, 21), "A2": (K_OWNER_A, 22), "A3": (K_OWNER_A, 23), "A4": (K_OWNER_A, 24),
+            "A5": (K_OWNER_A, 25)}
+
+    def turn1(k):
+        own(conv[k][0])
+        R.turn1(k, make_prompt(R.docs, R.L, conv[k][1]))
+
+    s0 = R.snap("run start")
+    turn1("A1")
+    turn1("B")                       # evicts A1's checkpoint: RAM {A1}
+    own(K_OWNER_A)
+    R.turn2("A1", follow["A1"])      # restores A1 (hit); its prefill evicts B's checkpoint: RAM {B}; A1's checkpoint is in the pool, hits 1
+    if R.cache:  # the worker saves the end of every turn: a deeper checkpoint of the same conversation. It must inherit the hit (the
+        R.op("checkpoint (the end of A1's follow-up)", R.eng.checkpoint)  # restored one is subsumed when evicted, only this one spills)
+    turn1("A2")                      # evicts it: RAM {B, A1'' (the deeper checkpoint, hits 1: inherited)}
+    turn1("A3")                      # RAM {B, A1', A2}
+    if R.cache:
+        mid = k_ents(R)
+        R.check("A1's restored checkpoint came back with hits >= 1 and A's owner",
+                any(e["owner"] == K_OWNER_A and e["hits"] >= 1 and k_tier(e) == "ram" for e in mid), [(e["owner"], e["hits"], k_tier(e)) for e in mid])
+        R.check("B's entry carries B's owner and no hits", any(e["owner"] == K_OWNER_B and e["hits"] == 0 and k_tier(e) == "ram" for e in mid))
+    sa = R.snap("RAM holds B, A1' (hit), A2 (3 entries)")
+    turn1("A4")                      # evicts A3's checkpoint: 4 entries do not fit
+    sb = R.snap("RAM cap enforced")
+    if R.cache:
+        ents = k_ents(R)
+        ram = [e for e in ents if k_tier(e) == "ram"]
+        disk = [e for e in ents if k_tier(e) == "disk"]
+        R.check("the RAM cap was enforced (a fourth entry did not fit)", sb["spilled"] > sa["spilled"] and len(disk) + sb["dropped"] - sa["dropped"] >= 1,
+                f"ram {len(ram)}, disk {len(disk)}, dropped +{sb['dropped'] - sa['dropped']}")
+        R.check("fairness: the small agent's entry is still in RAM although it is the oldest",
+                any(e["owner"] == K_OWNER_B for e in ram), [(e["owner"], e["hits"], k_tier(e)) for e in ents])
+        R.check("the victim belonged to the big agent", all(e["owner"] == K_OWNER_A for e in disk) and len(disk) >= 1,
+                [(e["owner"], e["hits"], k_tier(e)) for e in ents])
+        R.check("never-hit first: the entry that was restored once is still in RAM, the evicted one was never hit",
+                any(e["owner"] == K_OWNER_A and e["hits"] >= 1 for e in ram) and all(e["hits"] == 0 for e in disk),
+                [(e["owner"], e["hits"], k_tier(e)) for e in ents])
+        ag = {a["owner"]: a for a in R.eng.spill_agents() or []}
+        R.check("spill_agents: the big agent uses more RAM than the small one, the small one has no SSD bytes",
+                ag.get(K_OWNER_A, {}).get("ram_bytes", 0) > ag.get(K_OWNER_B, {}).get("ram_bytes", 1 << 60) and ag.get(K_OWNER_B, {}).get("ssd_bytes", 1) == 0, ag)
+    # ---- superseded: A3's continuation computed without promoting A3's entry (spill_sync_lookup(False)). The continuation is a deeper
+    # checkpoint of the same chain in the pool, so A3's entry (it may have been written to the SSD by the cap meanwhile) is superseded;
+    # evicting the continuation (A5's prefill) subsumes it: spill_checkpoint erases the shallower entry instead of keeping both.
+    p3 = R.ids["A3"] + R.outs["A3"] + follow["A3"]
+    own(K_OWNER_A)
+    if R.cache:
+        R.op("spill_sync_lookup(False)", R.eng.spill_sync_lookup, False)
+        try:
+            cached = R.op("prefix_begin (continuation of A3, A3's entry is not promoted)", R.eng.prefix_begin, p3, spec=R.spec)
+            R.check("the continuation was computed (A3's entry was not used)", cached < R.fed["A3"], f"cached {cached}")
+            R.outs["A3+"] = R._gen(p3[cached:])
+            R.op("checkpoint", R.eng.checkpoint)
+        finally:
+            R.eng.spill_sync_lookup(True)
+        after = k_ents(R)
+        sup = [e for e in after if e.get("superseded")]
+        R.check("the shallower entry of A3 is reported superseded by the continuation in the pool",
+                len(sup) == 1 and sup[0]["owner"] == K_OWNER_A and sup[0]["hits"] == 0,
+                [(e["owner"], e["hits"], e.get("superseded"), k_tier(e)) for e in after])
+        se = R.snap("continuation of A3 in the pool")
+        turn1("A5")  # evicts the continuation
+        sf = R.snap("after A5")
+        R.check("evicting the continuation replaced the superseded entry (subsumed), not kept both",
+                sf["subsumed"] > se["subsumed"] and not any(e.get("superseded") for e in k_ents(R)),
+                f"subsumed +{sf['subsumed'] - se['subsumed']}")
+        R.check("the small agent's entry survived all of this", any(e["owner"] == K_OWNER_B and k_tier(e) == "ram" for e in k_ents(R)))
+    else:
+        R.turn2("A3", follow["A3"])
+        turn1("A5")
+    # ---- restored follow-ups: B from RAM (it survived), A2 from the file the cap wrote; their tokens equal the reference
+    own(K_OWNER_B)
+    sc = R.snap("before B's follow-up")
+    R.turn2("B", follow["B"])
+    sd = R.snap("after B's follow-up")
+    R.check("B's follow-up restored its checkpoint", delta(sc, sd, "restored") > 0, f"restored +{delta(sc, sd, 'restored')}")
+    own(K_OWNER_A)
+    R.turn2("A2", follow["A2"])
+    se = R.snap("after A2's follow-up")
+    R.check("A2's follow-up restored its checkpoint (the SSD file written by the RAM cap)", delta(sd, se, "restored") > 0,
+            f"restored +{delta(sd, se, 'restored')}, from_disk +{delta(sd, se, 'restored_disk') if 'restored_disk' in se else '?'}")
+
+
 def chunk_files(spill_dir):
     return {p.name for p in pathlib.Path(spill_dir, CHUNKS).glob("*.kvc")}
 
@@ -658,7 +786,7 @@ def scen_j(R, spill_dir):
         R.check("when the last sibling is restored no chunk or manifest file is left", not left, f"{sorted(left)[:4]}")
 
 
-SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g, "h": scen_h, "i": scen_h, "j": scen_j}
+SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g, "h": scen_h, "i": scen_h, "j": scen_j, "k": scen_k}
 
 
 # ---- worker: one process, one mode (ref | tiered), one phase
@@ -696,14 +824,18 @@ def worker(a):
     if a.spec and not eng.has_draft:
         return write_json(a.out, {"skip": "the engine has no draft model"})
     grow_pinned(eng, a.mode == "tiered")
-    docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i", "j"))
+    docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i", "j", "k"))
     R = Run(eng, a.mode == "tiered", a.spec, a.tokens, docs, a.prompt_len, a.phase, print)
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
-    if len(heads) != 4 and a.scenario not in ("h", "i", "j"):  # (h builds its own prompts, which share their first tokens)
+    if len(heads) != 4 and a.scenario not in ("h", "i", "j", "k"):  # (h builds its own prompts, which share their first tokens)
         raise SystemExit("the prompts do not differ in their first 64 tokens")
     if a.prior:
         R.load_prior(a.prior)
-    SCEN_FN[a.scenario](R, a.spill_dir)
+    try:
+        SCEN_FN[a.scenario](R, a.spill_dir)
+    except ScenarioSkip as e:
+        eng.close()
+        return write_json(a.out, {"skip": str(e)})
     write_json(a.out, {"outs": R.outs, "fed": R.fed, "checks": R.checks, "stats": R.stats})
     say("  > eng.close()")
     eng.close()
@@ -724,6 +856,8 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
         set_env.update(STATE_HOST_CACHE="1", SPILL_RAM_GIB=str(a.ram_gib), SPILL_DIR=str(spill_dir),
                        VRAM_BACKUP_IDLE_S="0")
         set_env.update(SCEN_ENV.get(scen, {}))
+        if scen == "k" and phase == "run":
+            set_env["SPILL_RAM_GIB"] = k_ram_gib(prior, a.ram_gib)
     # -u and faulthandler: the output is not buffered, and a crash (e.g. a Windows access violation) dumps the stack
     cmd = [sys.executable, "-u", "-X", "faulthandler", str(pathlib.Path(__file__).resolve()), "--worker",
            "--scenario", scen, "--mode", mode, "--phase", phase, "--out", str(out), "--spill-dir", str(spill_dir or ""),
@@ -734,6 +868,18 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
     if prior:
         cmd += ["--prior", str(prior)]
     return set_env, cmd
+
+
+def k_ram_gib(prior, default):
+    """Scenario k, phase run: SPILL_RAM_GIB holding K_CAP_ENTRIES entries, from the size of the one the probe phase measured
+    (its stats entry "probe entry"); the default (--ram-gib) when there is no probe result (e.g. --worker-cmd before a run)."""
+    try:
+        for st in json.load(open(prior))["stats"]:
+            if st.get("label") == "probe entry" and st.get("ram_bytes"):
+                return f"{K_CAP_ENTRIES * st['ram_bytes'] / 2**30:.4f}"
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return str(default)
 
 
 def show_invocation(title, set_env, cmd):
@@ -760,7 +906,7 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
 def scen_args(a, scen):
     """The arguments a scenario runs with: h and i need prompts longer than the shared prefix (and a pool that is still too
     small for two of them), so their length is raised and the pool re-sized for it (j too)."""
-    if scen not in ("h", "i", "j") or a.pool_tokens:
+    if scen not in ("h", "i", "j", "k") or a.pool_tokens:
         return a
     b = argparse.Namespace(**vars(a))
     b.prompt_len = choose_prompt_len(max(a.prompt_len, H_PREFIX + H_MIN_TAIL), a.tokens, a.kv_dtype)
@@ -778,7 +924,7 @@ def main():
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--pool-tokens", type=int,
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
-    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j", help="a,b,c,d,e,f,g,h,i,j")
+    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j,k", help="a,b,c,d,e,f,g,h,i,j,k")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     ap.add_argument("--worker-cmd", metavar="SCENARIO",
                     help="print the exact worker command lines of a scenario (its reference and tiered runs) and exit")
@@ -798,7 +944,7 @@ def main():
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
         if s not in SCENARIOS:
-            ap.error(f"unknown scenario {s} (a-j)")
+            ap.error(f"unknown scenario {s} (a-k)")
     if a.pool_tokens:
         _, max_tokens = sizes(a.prompt_len, a.tokens)
         say("pool: " + describe_pool(a.prompt_len, a.tokens, a.kv_dtype, a.pool_tokens, max_tokens), flush=True)
@@ -817,7 +963,7 @@ def main():
     if a.worker_cmd:
         s_ = a.worker_cmd
         if s_ not in SCENARIOS:
-            ap.error(f"unknown scenario {s_} (a-j)")
+            ap.error(f"unknown scenario {s_} (a-k)")
         base = pathlib.Path(a.keep_dir or "KEEP_DIR")  # (a placeholder without --keep-dir)
         say(f"worker commands of scenario {s_} ({SCENARIOS[s_][0]}), as the driver runs them; the other SPILL_* and cache")
         say("variables of your environment are unset. Windows cmd: set each NAME=VALUE first. Replace KEEP_DIR if needed.")

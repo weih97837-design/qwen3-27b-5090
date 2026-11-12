@@ -93,6 +93,13 @@ struct Checkpoint {
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   uint64_t last_use = 0;
   uint64_t backup = 0;         // the spill_ id of its host copy while the pool keeps it (idle backup); 0: none
+  // Retention (retention.h): who saved it (Model::set_owner: a stable id of the agent, 0 unknown; carried by a sequence through
+  // park / resume and by the entry through spill, the SSD manifest and restore), how often it was reused (prefix_begin took it as
+  // the match, or it was restored from RAM / SSD; carried the same way) and when last (use_clock_ of the last hit, 0 never).
+  uint64_t owner = 0;
+  uint32_t hits = 0;
+  uint64_t last_hit = 0;
+  mutable std::vector<uint64_t> bh;  // retention.h block_hashes(ids), filled when the retention rules first look at it (ids never change)
   // SPILL_ASYNC_PROMOTE: a checkpoint whose pages are still being filled by a host -> device copy on the I/O stream
   // (Model::spill_restore_begin). load_ev is recorded behind that copy and load_id is the spill_ entry it comes from.
   // INVARIANTS (docs/tiered-cache.md; enforced in model.cc / spill.cc, see the comment at the top of spill.cc):
@@ -137,8 +144,13 @@ struct Spilled {
   std::string path;
   std::vector<std::string> dnames;
   uint64_t manifest_bytes = 0;
+  uint32_t manifest_version = kManifestVersion;  // of that file (1: written before the retention fields)
   mutable std::vector<std::string> cnames;
   uint64_t last_use = 0;
+  uint64_t owner = 0;   // retention.h: as Checkpoint::owner / hits / last_hit (owner and hits are in the manifest; last_hit is per run)
+  uint32_t hits = 0;
+  uint64_t last_hit = 0;
+  mutable std::vector<uint64_t> bh;  // retention.h block_hashes(ids), filled when the retention rules first look at it
   int io_fails = 0;     // restores of its files that failed on an I/O error in a row (Model::spill_io_failed)
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
   bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
@@ -160,6 +172,9 @@ struct SpillStats {
   // SPILL_ASYNC_PROMOTE: restores finished (also counted in `restored`), failed ones (also in `failed` when the entry
   // was dropped), and the wall time / bytes of the finished ones (begin -> visible; bytes = kv + state).
   int64_t restored_async = 0, restore_failed = 0, restore_ns = 0, restore_bytes = 0;
+  // Restores by where the entry was: in memory / only on the SSD (also counted in `restored`). The reuse rate of a tier is these
+  // over the entries it received (spilled / written).
+  int64_t restored_ram = 0, restored_disk = 0;
 };
 
 struct CacheStats {

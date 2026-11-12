@@ -53,6 +53,7 @@ TIER_SETTINGS = {
     "spill_pinned_gib": ("SPILL_PINNED_GIB", 8, "num"),
     "spill_async_io": ("SPILL_ASYNC_IO", True, "flag"),
     "spill_async_promote": ("SPILL_ASYNC_PROMOTE", True, "flag"),
+    "spill_fair_agents": ("SPILL_FAIR_AGENTS", True, "flag"),  # a tier's victim comes from the agent using the most of it (retention)
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down

@@ -56,6 +56,9 @@ SIGNATURES = {
     "q27_spill_restore_poll": ([P, P, P, I, P], I),
     "q27_spill_release": ([P, ctypes.c_uint64, P], I),
     "q27_spill_sync_lookup": ([P, I], I),
+    "q27_set_owner": ([P, ctypes.c_uint64], I),
+    "q27_spill_meta": ([P, ctypes.c_char_p, I], I),
+    "q27_spill_agents": ([P, ctypes.c_char_p, I], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
@@ -470,7 +473,52 @@ class Engine:
             else:
                 e["path"] = f[6] if len(f) > 6 else ""
             out.append(e)
+        meta = self.spill_meta()
+        if meta is not None:
+            for e in out:
+                e.update(meta.get(e["id"], {"owner": 0, "hits": 0, "superseded": False}))
         return out
+
+    # ---- retention (docs/tiered-cache.md "Retention"; engine/src/retention.h)
+
+    @property
+    def has_retention(self):
+        """The library has the retention calls (set_owner, spill_meta, spill_agents); an older one never tags or ranks entries."""
+        l = lib()
+        return all(hasattr(l, n) for n in ("q27_set_owner", "q27_spill_meta", "q27_spill_agents"))
+
+    def set_owner(self, owner):
+        """The agent id (a stable non-zero integer; 0 unknown) of the next prefix_begin's sequence: the checkpoints it saves, and the
+        spilled entries made of them, are attributed to it. A no-op with an older library."""
+        if self.has_retention:
+            self._check(lib().q27_set_owner(self.h, int(owner) & 0xFFFFFFFFFFFFFFFF), "q27_set_owner")
+
+    def _text(self, fn, what):
+        n = 1 << 14
+        while True:
+            buf = ctypes.create_string_buffer(n)
+            size = fn(self.h, buf, n)
+            if size < 0:
+                self._check(1, what)
+            if size < n:
+                break
+            n = size + 1
+        return [ln.split("\t") for ln in buf.value.decode("utf-8", "replace").split("\n") if ln]
+
+    def spill_meta(self):
+        """{entry id: {"owner", "hits", "superseded"}} of the spilled entries, or None with a library without retention."""
+        if not self.has_retention:
+            return None
+        return {int(f[0]): {"owner": int(f[1]), "hits": int(f[2]), "superseded": f[3] == "1"}
+                for f in self._text(lib().q27_spill_meta, "q27_spill_meta") if len(f) >= 4}
+
+    def spill_agents(self):
+        """[{"owner", "ram_bytes", "ssd_bytes", "ram_entries", "ssd_entries"}] per agent with entries in a tier (bytes attributed
+        fractionally between the agents that share a chunk), or None with a library without retention."""
+        if not self.has_retention:
+            return None
+        return [{"owner": int(f[0]), "ram_bytes": int(f[1]), "ssd_bytes": int(f[2]), "ram_entries": int(f[3]),
+                 "ssd_entries": int(f[4])} for f in self._text(lib().q27_spill_agents, "q27_spill_agents") if len(f) >= 5]
 
     def spill_disk_usage(self):
         """{"physical_bytes", "logical_bytes", "chunk_files", "manifests", "pending_files"} of the SSD tier (each chunk file once;
@@ -526,7 +574,7 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 26)(*([-1] * 26))  # (an older engine writes the first 20 and leaves the rest -1)
+        out = (ctypes.c_int64 * 28)(*([-1] * 28))  # (an older engine writes the first 20 and leaves the rest -1)
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
@@ -534,7 +582,9 @@ class Engine:
                 "restoring", "restored_async", "restore_failed", "restore_ms_total", "restore_bytes_total",
                 # RAM dedup (docs/tiered-cache.md): the entries' logical size, what the RAM tier physically holds (ram_bytes
                 # is the same number), shared chunks resident, chunk hits / misses of spilled entries, logical - physical
-                "logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes")
+                "logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes",
+                # retention: restores of entries that were in memory / only on the SSD (the reuse rate of a tier)
+                "restored_ram", "restored_disk")
         # An engine built before RAM dedup never writes the last six: absent, not a misleading 0 (callers use .get()).
         return {k: v for k, v in zip(keys, out) if v != -1}
 

@@ -17,7 +17,7 @@
 // of all bytes before it):
 //   .kvc   ChunkHeader, n_ids int32 token ids, the payload ([slice][page in chunk][page_bytes], exactly the RAM chunk's HostKv
 //          bytes), u64 hash.
-//   .q27m  ManifestHeader, n_ids int32, n_chunks x 64-byte nul-padded names, state, tail ([slice][tail page][page_bytes]), u64 hash.
+//   .q27m  ManifestHeader, [ManifestMeta (version 2)], n_ids int32, n_chunks x 64-byte nul-padded names, state, tail ([slice][tail page][page_bytes]), u64 hash.
 //
 // Writes are crash safe: <path>.tmp, fflush + fsync, rename, (fsync of the directory). A leftover .tmp is deleted at start;
 // a chunk without a manifest ("stray") is deleted by DiskIndex::sweep once the index was built from the manifests.
@@ -293,6 +293,10 @@ bool write_file_atomic(const std::string& path, std::string* err, Fill&& fill,
 inline constexpr char kChunkMagic[8] = {'Q', '2', '7', 'C', 'H', 'K', '1', '\0'};
 inline constexpr char kManifestMagic[8] = {'Q', '2', '7', 'M', 'A', 'N', '1', '\0'};
 inline constexpr uint32_t kFileVersion = 1;
+// Manifest versions: 1 = ManifestHeader, ids, ...; 2 = ManifestHeader, ManifestMeta (retention: owner, hits), ids, ... Version 1 files
+// (written before the retention policy) are still read (owner 0, hits 0) and restored; new ones are version 2. A chunk file's
+// version stays kFileVersion.
+inline constexpr uint32_t kManifestVersion = 2;
 inline constexpr size_t kNameField = 64;  // a name, nul padded (a name is 49 characters)
 
 struct Geom {  // the KV geometry the files were written with (all of it is checked on read)
@@ -337,8 +341,11 @@ inline bool chunk_header_ok(const ChunkHeader& h, const ChunkHeader& want) {
 inline bool chunk_file_matches(const std::string& path, uint64_t fp, const ChunkId& id, const std::string& parent,
                                const int32_t* ids, size_t n_ids, const Geom& g);
 
+// adopt_existing: a rename that fails counts as success when the file already there is this chunk (header and ids; the payload is
+// not read). Pass false for a name whose old file was forgotten for a damaged payload and could not be deleted (DiskIndex::pending).
 inline bool write_chunk_file(const std::string& path, uint64_t fp, const ChunkId& id, const std::string& parent,
-                             const int32_t* ids, size_t n_ids, const Geom& g, const CPieces& payload, std::string* err) {
+                             const int32_t* ids, size_t n_ids, const Geom& g, const CPieces& payload, std::string* err,
+                             bool adopt_existing = true) {
   if (pieces_bytes(payload) != g.chunk_payload() || parent.size() >= kNameField || n_ids == 0) {
     if (err) *err = "chunk payload does not match its geometry";
     return false;
@@ -351,7 +358,7 @@ inline bool write_chunk_file(const std::string& path, uint64_t fp, const ChunkId
         for (const auto& [p, n] : payload) ok = ok && write_hashed(f, p, n, hh);
         return ok;
       },
-      [&] { return chunk_file_matches(path, fp, id, parent, ids, n_ids, g); });
+      [&] { return adopt_existing && chunk_file_matches(path, fp, id, parent, ids, n_ids, g); });
 }
 
 // The cheap check before an export skips an existing chunk file: size, header and token ids (the payload's hash is only
@@ -382,22 +389,40 @@ struct ManifestHeader {
 };
 static_assert(sizeof(ManifestHeader) == 72, "ManifestHeader layout (no padding: it is compared bytewise)");
 
+// Version 2: right after the header (inside the hashed bytes). What the retention policy needs to survive a restart.
+struct ManifestMeta {
+  uint64_t owner;     // the agent that saved the checkpoint (retention.h; 0 unknown)
+  uint32_t hits;      // how often it was reused before it was spilled (carried across spill / restore cycles)
+  uint32_t reserved;
+};
+static_assert(sizeof(ManifestMeta) == 16, "ManifestMeta layout");
+
+// What a restore does not need to know in advance: the retention fields of an entry.
+struct EntryMeta {
+  uint64_t owner = 0;
+  uint32_t hits = 0;
+};
+
 struct ManifestInfo {
   uint64_t fingerprint = 0;
   Geom g;
   bool ring = false;
   uint64_t state_bytes = 0, tail_bytes = 0;
+  uint32_t version = kManifestVersion;  // of the file (1: no ManifestMeta)
+  uint64_t owner = 0;
+  uint32_t hits = 0;
 };
 
-inline uint64_t manifest_file_bytes(uint64_t state_bytes, uint64_t tail_bytes, size_t n_ids, size_t n_chunks) {
-  return sizeof(ManifestHeader) + uint64_t(n_ids) * sizeof(int32_t) + uint64_t(n_chunks) * kNameField + state_bytes +
-         tail_bytes + 8;
+inline uint64_t manifest_file_bytes(uint64_t state_bytes, uint64_t tail_bytes, size_t n_ids, size_t n_chunks,
+                                    uint32_t version = kManifestVersion) {
+  return sizeof(ManifestHeader) + (version >= 2 ? sizeof(ManifestMeta) : 0) + uint64_t(n_ids) * sizeof(int32_t) +
+         uint64_t(n_chunks) * kNameField + state_bytes + tail_bytes + 8;
 }
 
 inline ManifestHeader make_manifest_header(const ManifestInfo& m, size_t n_ids, size_t n_chunks) {
   ManifestHeader h{};
   std::memcpy(h.magic, kManifestMagic, sizeof kManifestMagic);
-  h.version = kFileVersion, h.slices = m.g.slices, h.fingerprint = m.fingerprint, h.page_bytes = m.g.page_bytes;
+  h.version = m.version, h.slices = m.g.slices, h.fingerprint = m.fingerprint, h.page_bytes = m.g.page_bytes;
   h.page_tokens = m.g.page_tokens, h.chunk_pages = m.g.chunk_pages, h.ring = m.ring ? 1 : 0, h.n_ids = uint32_t(n_ids);
   h.n_chunks = uint32_t(n_chunks), h.state_bytes = m.state_bytes, h.tail_bytes = m.tail_bytes;
   return h;
@@ -428,7 +453,12 @@ inline bool write_manifest_file(const std::string& path, const ManifestInfo& m, 
     }
   const ManifestHeader h = make_manifest_header(m, ids.size(), names.size());
   return write_file_atomic(path, err, [&](std::FILE* f, Hash64& hh) {
-    bool ok = write_hashed(f, &h, sizeof h, hh) && write_hashed(f, ids.data(), ids.size() * sizeof(int32_t), hh);
+    bool ok = write_hashed(f, &h, sizeof h, hh);
+    if (ok && m.version >= 2) {
+      const ManifestMeta meta{m.owner, m.hits, 0};
+      ok = write_hashed(f, &meta, sizeof meta, hh);
+    }
+    ok = ok && write_hashed(f, ids.data(), ids.size() * sizeof(int32_t), hh);
     for (const auto& n : names) {
       char field[kNameField];
       put_name(field, n);
@@ -458,9 +488,16 @@ inline bool read_manifest_head(const std::string& path, ManifestHead& out) {
   FileCloser guard{f};
   ManifestHeader h{};
   if (!read_all(f, &h, sizeof h) || std::memcmp(h.magic, kManifestMagic, sizeof kManifestMagic) != 0 ||
-      h.version != kFileVersion || h.n_ids == 0 || h.n_ids > (1u << 28) || h.n_chunks > h.n_ids)
+      (h.version != 1 && h.version != kManifestVersion) || h.n_ids == 0 || h.n_ids > (1u << 28) || h.n_chunks > h.n_ids)
     return false;
-  if (size != manifest_file_bytes(h.state_bytes, h.tail_bytes, h.n_ids, h.n_chunks)) return false;
+  if (size != manifest_file_bytes(h.state_bytes, h.tail_bytes, h.n_ids, h.n_chunks, h.version)) return false;
+  out.info.version = h.version;
+  out.info.owner = 0, out.info.hits = 0;
+  if (h.version >= 2) {
+    ManifestMeta meta{};
+    if (!read_all(f, &meta, sizeof meta)) return false;
+    out.info.owner = meta.owner, out.info.hits = meta.hits;
+  }
   out.info.fingerprint = h.fingerprint;
   out.info.g = {h.slices, h.chunk_pages, h.page_tokens, h.page_bytes};
   out.info.ring = h.ring != 0;
@@ -577,7 +614,11 @@ struct DiskRead {
     Hash64 hh;
     ManifestHeader h{};
     const ManifestHeader want = make_manifest_header(info, ids.size(), names.size());
-    if (!rh(f, &h, sizeof h, hh) || std::memcmp(&h, &want, sizeof h) != 0) return false;
+    if (!rh(f, &h, sizeof h, hh) || std::memcmp(&h, &want, sizeof h) != 0) return false;  // (the version is part of `want`: info.version)
+    if (info.version >= 2) {
+      ManifestMeta meta{};  // (owner / hits: covered by the hash, nothing to compare: they are not an expectation of the reader)
+      if (!rh(f, &meta, sizeof meta, hh)) return false;
+    }
     std::vector<int32_t> got(ids.size());
     if (!rh(f, got.data(), got.size() * sizeof(int32_t), hh) || got != ids) return false;
     for (const auto& n : names) {
@@ -693,6 +734,7 @@ class DiskIndex {
     return n;
   }
   size_t pending_files() const { return pending_.size(); }
+  bool is_pending(const std::string& name) const { return pending_.count(name) != 0; }
   // Bytes on the SSD in chunk files: the believed-present ones and the ones whose removal is still pending.
   uint64_t physical_bytes() const {
     uint64_t n = 0;
@@ -770,7 +812,8 @@ class DiskIndex {
 template <class KvOf>
 uint64_t export_entry_files(DiskIndex& idx, uint64_t fp, const Geom& g, const std::string& path, bool ring,
                             const std::vector<int32_t>& ids, const char* state, uint64_t state_bytes, const HostKv& tail,
-                            size_t n_chunks, KvOf&& kv_of, std::string& cur_path, std::vector<std::string>& cur_names) {
+                            size_t n_chunks, KvOf&& kv_of, std::string& cur_path, std::vector<std::string>& cur_names,
+                            const EntryMeta& meta = {}) {
   const size_t ct = size_t(g.chunk_pages) * g.page_tokens;
   if (n_chunks * ct > ids.size()) throw std::runtime_error("more chunks than tokens");
   {
@@ -811,7 +854,8 @@ uint64_t export_entry_files(DiskIndex& idx, uint64_t fp, const Geom& g, const st
     CPieces pieces;
     all_pieces(kv_of(i), pieces);
     std::string err;
-    if (!write_chunk_file(idx.path(name), fp, chain[i], parent, cid, ct, g, pieces, &err)) throw std::runtime_error(err);
+    if (!write_chunk_file(idx.path(name), fp, chain[i], parent, cid, ct, g, pieces, &err, !idx.is_pending(name)))
+      throw std::runtime_error(err);
     idx.add(name, chunk_file_bytes(g, ct));
     fresh.push_back(name);
   }
@@ -820,12 +864,13 @@ uint64_t export_entry_files(DiskIndex& idx, uint64_t fp, const Geom& g, const st
   all_pieces(tail, tp);
   ManifestInfo mi;
   mi.fingerprint = fp, mi.g = g, mi.ring = ring, mi.state_bytes = state_bytes, mi.tail_bytes = tail.total;
+  mi.owner = meta.owner, mi.hits = meta.hits;
   std::string err;
   if (!write_manifest_file(path, mi, ids, names, state, tp, &err)) throw std::runtime_error(err);
   sync_dir(std::filesystem::path(path).parent_path().string());
   std::error_code ec;
   uint64_t mbytes = std::filesystem::file_size(path, ec);
-  if (ec) mbytes = manifest_file_bytes(state_bytes, tail.total, ids.size(), n_chunks);
+  if (ec) mbytes = manifest_file_bytes(state_bytes, tail.total, ids.size(), n_chunks, mi.version);
   cleanup.armed = false;
   // Commit: nothing below throws.
   for (const std::string& n : names) idx.ref(n);

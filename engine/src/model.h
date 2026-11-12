@@ -13,6 +13,7 @@
 #include "kernels.h"
 #include "memory.h"
 #include "prefix_cache.h"
+#include "retention.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -50,6 +51,9 @@ struct Options {
   // RAM dedup of spilled entries (spill.cc (H)-(K), chunk_store.h): full 4096-token chunks shared by content. false: every
   // entry keeps its whole KV (SPILL_DEDUP=0), as before.
   bool spill_dedup = true;
+  // Retention (retention.h, docs/tiered-cache.md): SPILL_FAIR_AGENTS (default on): spill_enforce_ram takes its victim from the agent
+  // that uses the most bytes of the RAM tier. false: the order within the whole tier (superseded, never hit, least recently used).
+  bool spill_fair_agents = true;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
@@ -169,7 +173,7 @@ class Model {
   // in progress, async restores finished, async restores that failed, their total wall time in ms and bytes (begin ->
   // visible); out[20..25] (appended, RAM dedup): logical bytes of the entries in memory (what they would take without
   // sharing), physical bytes (what the RAM tier holds: out[3]), shared chunks resident, chunk hits, chunk misses (full chunks
-  // of spilled entries found resident / copied), dedup_saved_bytes (logical - physical). kSpillStats = 26 values in all;
+  // of spilled entries found resident / copied), dedup_saved_bytes (logical - physical). kSpillStats = 28 values in all (restored_ram, restored_disk: restores of entries that were in memory / only on disk);
   // spill_list's ram_bytes stays the entry's LOGICAL size. spill_list's "live" column is 0 none, 1 an idle backup, 2 busy (being restored by
   // spill_restore_*: neither written out nor dropped meanwhile); the line format is unchanged.
   std::string spill_list() const;
@@ -184,11 +188,20 @@ class Model {
   // lists, and retries the chunk file deletions that failed earlier (Windows locks); returns how many.
   std::string spill_list_ex() const;
   void spill_disk_usage(int64_t* out, int n) const;
+  // Retention (retention.h). set_owner: the agent (a stable non-zero id the frontend derives from the agent's name; 0 unknown) of
+  // the NEXT prefix_begin's sequence; every checkpoint that sequence saves carries it (also while it is parked and resumed), and so
+  // does the spilled entry, its manifest and the checkpoint a restore brings back. spill_meta: one line per entry,
+  // "id\towner\thits\tsuperseded" (superseded: 0 / 1, retention.h). spill_agents: one line per agent with bytes in a tier,
+  // "owner\tram_bytes\tssd_bytes\tram_entries\tssd_entries" (bytes attributed fractionally between the agents sharing a chunk).
+  void set_owner(uint64_t owner) { owner_next_ = owner; }
+  std::string spill_meta() const;
+  std::string spill_agents() const;
+  std::map<uint64_t, double> spill_use(bool ssd) const;  // bytes per agent in the RAM (false) / SSD (true) tier (retention.h agent_use)
   int spill_sweep();
   void spill_export(uint64_t id, const std::string& path);
   void spill_drop(uint64_t id);
   uint64_t spill_import(const std::string& path);
-  static constexpr int kSpillStats = 26;
+  static constexpr int kSpillStats = 28;
   void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
@@ -296,12 +309,19 @@ class Model {
   void release_seq();                // returns the running sequence's pages
   void save_checkpoint(bool ring);   // at pos_ (nothing pending)
   // A checkpoint of tokens ids (pages: their KV pages) whose state is in a parking area (null: the running sequence's).
-  void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
-                            bool ring);
+  void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages, uint64_t owner,
+                            uint32_t hits, bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   bool evict_checkpoint(bool for_slot = false);           // the least recently used one (for_slot: a covered one first); false when there is none
   // Tiered cache (spill.cc).
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
+  // (retention.h) The superseded flags of every spilled entry, recomputed when an entry or a checkpoint was added / removed.
+  bool spill_superseded(uint64_t id) const;
+  void spill_retention_refresh() const;
+  mutable std::map<uint64_t, char> sup_;
+  mutable int64_t sup_key_[6] = {-1, -1, -1, -1, -1, -1};
+  uint64_t owner_next_ = 0, seq_owner_ = 0;  // set_owner; the running sequence's owner
+  uint32_t seq_hits_ = 0;                    // reuse count inherited from the checkpoint it resumed from (retention.h inherited_hits)
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
   bool ckpt_covered(const Checkpoint& c) const;  // a deeper, usable checkpoint of the same chain is in the pool and c is long
@@ -508,6 +528,7 @@ class Model {
     std::chrono::steady_clock::time_point t0;
     size_t bytes = 0;
     bool issued = false;
+    bool from_disk = false;  // the entry was only on the SSD when the restore began (stats: restored_disk)
     bool orphan = false;  // spill_release came before the checkpoint existed / completed: do not hold it
   };
   std::map<uint64_t, Restore> restoring_;
@@ -563,6 +584,8 @@ class Model {
     std::vector<MmSpan> mm;
     int32_t spec_last = -1;
     bool ring_valid = false;
+    uint64_t owner = 0;  // retention: Model::seq_owner_ / seq_hits_ of the parked sequence
+    uint32_t hits = 0;
     int ring_from = 0;
     SpecSampling smp{};
     int32_t scalars[kSeqScalars] = {};

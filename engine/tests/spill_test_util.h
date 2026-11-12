@@ -97,7 +97,7 @@ struct Exported {
 // Model::spill_write's file sequence (the real function: spill_files.h export_entry_files). cur_path / cur_names: the entry's existing
 // manifest when it is being replaced. false: it threw (err), the index and the files are as the function leaves them.
 inline bool export_entry(const Entry& e, DiskIndex& idx, const std::string& manifest, Exported* out, std::string* err = nullptr,
-                         std::string* cur_path = nullptr, std::vector<std::string>* cur_names = nullptr) {
+                         std::string* cur_path = nullptr, std::vector<std::string>* cur_names = nullptr, EntryMeta meta = {}) {
   std::string own_path;
   std::vector<std::string> own_names;
   std::string& cp = cur_path ? *cur_path : own_path;
@@ -112,7 +112,7 @@ inline bool export_entry(const Entry& e, DiskIndex& idx, const std::string& mani
   out->names.clear(), out->written.clear();
   try {
     export_entry_files(idx, e.fp, e.g, manifest, e.ring, e.ids, e.state.data(), e.state.size(), tail, e.n_chunks,
-                       [&](size_t i) -> const HostKv& { return kvs[i]; }, cp, cn);
+                       [&](size_t i) -> const HostKv& { return kvs[i]; }, cp, cn, meta);
   } catch (const std::exception& ex) {
     if (err) *err = ex.what();
     return false;
@@ -125,8 +125,10 @@ inline bool export_entry(const Entry& e, DiskIndex& idx, const std::string& mani
 
 // Fills a DiskRead for the entry's manifest; the destination is a private linear buffer (dst) of the entry's whole stream.
 inline void plan_read(DiskRead& d, const Entry& e, const DiskIndex& idx, const std::string& manifest,
-                      const std::vector<std::string>& names, std::vector<char>* state, HostKv* dst) {
+                      const std::vector<std::string>& names, std::vector<char>* state, HostKv* dst,
+                      uint32_t manifest_version = kManifestVersion) {
   d.manifest = manifest;
+  d.info.version = manifest_version;
   d.info.fingerprint = e.fp, d.info.g = e.g, d.info.ring = e.ring, d.info.state_bytes = e.state.size();
   d.info.tail_bytes = e.tail_pages * e.g.slices * e.g.page_bytes;
   d.ids = e.ids;

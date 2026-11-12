@@ -749,6 +749,15 @@ function drawTiers() {
   kids.push(el("div", { class: "kv", style: "margin-top:12px" },
     ...TIER_COUNTERS.map(([label, key]) => el("div", {},
       el("span", {}, label + " "), el("b", { style: key === "failed" && t.failed > 0 ? "color:var(--critical)" : "" }, n(t[key]))))));
+  // Retention: per tier the entries that were restored at least once vs never (and the superseded ones, evicted first), and the
+  // reuse rate = restored / entries received (RAM: spilled, SSD: written).
+  const pct = (v) => v == null ? "–" : `${(v * 100).toFixed(1)}%`;
+  const reuseRow = (label, p, rate, restored) => t[p + "_reused_entries"] == null ? [] : [kvRow(label,
+    `重用 ${n(t[p + "_reused_entries"])} 筆 ${fmtGiB(t[p + "_reused_bytes"])} · 未重用 ${n(t[p + "_never_entries"])} 筆 ${fmtGiB(t[p + "_never_bytes"])}` +
+    ` · 被取代 ${n(t[p + "_superseded_entries"])} 筆 ${fmtGiB(t[p + "_superseded_bytes"])} · 重用率 ${pct(t[rate])}${t[restored] == null ? "" : `（還原 ${n(t[restored])}）`}`)];
+  const reuse = [...reuseRow("RAM 重用", "ram", "ram_reuse_rate", "ram_restored"), ...reuseRow("SSD 重用", "disk", "ssd_reuse_rate", "ssd_restored")];
+  if (reuse.length) kids.push(el("div", { class: "kv", style: "margin-top:10px" }, ...reuse,
+    kvRow("公平淘汰 SPILL_FAIR_AGENTS", t.fair_agents == null ? "–" : t.fair_agents ? "on" : "off")));
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
     kvRow("保留 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 筆`),
@@ -763,7 +772,7 @@ function drawTiers() {
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
   "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
-  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE"];
+  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
   const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
@@ -834,7 +843,8 @@ function drawAgents() {
   for (const a of rows) tb.append(el("tr", {}, el("td", { style: "font-family:ui-monospace,monospace" }, a.agent),
     el("td", { class: "r" }, String(a.running)), el("td", { class: "r" }, String(a.waiting)), el("td", { class: "r" }, String(a.requests)),
     el("td", { class: "r" }, fmtTok(a.prompt_tokens)), el("td", { class: "r" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
-    el("td", { class: "r" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes)), el("td", { class: "r" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes))));
+    el("td", { class: "r" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
+    el("td", { class: "r" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
 }
 function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawDeploy(); drawSessions(); }
 
@@ -877,6 +887,7 @@ const TIER_OPTS = [
   { key: "spill_pinned_gib", label: "Pinned RAM", note: "SPILL_PINNED_GIB", help: "Pinned host memory for faster copies; counts against shared GPU memory on Windows. 0 is off.", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_async_io", label: "Async copies", note: "SPILL_ASYNC_IO", help: "KV copies on their own stream; use with pinned RAM. Test with scripts/tiered_cache_test.py first.", kind: "flag" },
   { key: "spill_async_promote", label: "Delay hits", note: "SPILL_ASYNC_PROMOTE", help: "A request that matches a spilled checkpoint waits for it to load while others run.", kind: "flag" },
+  { key: "spill_fair_agents", label: "Fair agents", note: "SPILL_FAIR_AGENTS", help: "When RAM or the SSD is full, evict from the agent using the most of it (then superseded, never-reused, oldest first). Off: that order over everything.", kind: "flag" },
   { key: "spill_dir", label: "SSD folder", note: "SPILL_DIR", help: "Where spilled checkpoints are written. Empty: RAM only.", kind: "path" },
 ];
 const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
