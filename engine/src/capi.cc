@@ -125,6 +125,19 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
   if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
   if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
+  // Tiered cache (docs/tiered-cache.md): SPILL_RAM_GIB (host memory for checkpoints the KV pool gives up; 0 / unset:
+  // off) and SPILL_DIR (where they are written when that is full; frontend/tiercache.py writes them out sooner).
+  if (const char* e = getenv("SPILL_RAM_GIB")) o.spill_ram_gib = atof(e);
+  if (const char* e = getenv("SPILL_DIR")) o.spill_dir = e;
+  // Tiered cache speed-ups, off by default (docs/tiered-cache.md): SPILL_PINNED_GIB (pinned host memory for spill entries,
+  // pinned while idle in slabs of SPILL_PINNED_SLAB_MIB; 0 / unset: pageable) and SPILL_ASYNC_IO (1: KV copies on their own
+  // stream, no stall of the compute stream).
+  if (const char* e = getenv("SPILL_PINNED_GIB")) o.spill_pinned_gib = std::max(0.0, atof(e));
+  if (const char* e = getenv("SPILL_PINNED_SLAB_MIB")) o.spill_pinned_slab_mib = std::max(16, atoi(e));
+  if (const char* e = getenv("SPILL_ASYNC_IO")) o.spill_async_io = atoi(e) != 0;
+  // SPILL_ASYNC_PROMOTE (1: the frontend may restore a spilled checkpoint in the background while other requests run;
+  // off by default, then spill_match / spill_restore_* do nothing).
+  if (const char* e = getenv("SPILL_ASYNC_PROMOTE")) o.spill_async_promote = atoi(e) != 0;
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
@@ -354,6 +367,75 @@ int q27_memory_report(void* m, char* buf, int cap) {
     buf[n] = 0;
   }
   return int(r.size());
+}
+
+// Tiered cache (Model::spill_list ...): the list is copied as q27_memory_report copies its report.
+int q27_spill_list(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->spill_list(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+int q27_spill_export(void* m, uint64_t id, const char* path) {
+  return guard([&] { static_cast<Model*>(m)->spill_export(id, path); });
+}
+
+int q27_spill_drop(void* m, uint64_t id) {
+  return guard([&] { static_cast<Model*>(m)->spill_drop(id); });
+}
+
+// *id: the entry, 0 when the file is not one of this model and KV type (the caller deletes it).
+int q27_spill_import(void* m, const char* path, uint64_t* id) {
+  return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
+}
+
+// Writes min(n, 20) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
+// entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
+// pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to pageable memory,
+// restores in progress, async restores finished, async restores failed, their wall time (ms) and bytes.
+int q27_spill_stats(void* m, int64_t* out, int n) {
+  return guard([&] { static_cast<Model*>(m)->spill_stats(out, n); });
+}
+
+// SPILL_ASYNC_PROMOTE (docs/tiered-cache.md). *found: 1 when a spilled entry deeper than the pool's match exists; out4 = {id,
+// pos, kv + state bytes, 1 if only on disk}. spec: only entries with the draft's ring count.
+int q27_spill_match(void* m, const int32_t* ids, int n, int spec, int64_t* out4, int* found) {
+  return guard([&] { *found = static_cast<Model*>(m)->spill_match(ids, n, spec != 0, out4); });
+}
+
+// *started: 1 queued (entry in memory), 2 a thread reads its file, 0 not started.
+int q27_spill_restore_begin(void* m, uint64_t id, int* started) {
+  return guard([&] { *started = static_cast<Model*>(m)->spill_restore_begin(id); });
+}
+
+// *n: how many restores that ended were written to done_ids[0..cap), done_ok[i] = 1 restored, 0 failed. Never blocks.
+int q27_spill_restore_poll(void* m, int64_t* done_ids, int32_t* done_ok, int cap, int* n) {
+  return guard([&] { *n = static_cast<Model*>(m)->spill_restore_poll(done_ids, done_ok, cap); });
+}
+
+// The request that waited for restore `id` gave up: its checkpoint is no longer held. *released: 1 if there was one.
+int q27_spill_release(void* m, uint64_t id, int* released) {
+  return guard([&] { *released = static_cast<Model*>(m)->spill_release(id); });
+}
+
+// on = 0: prefix_begin does not promote a spilled match synchronously (until on = 1).
+int q27_spill_sync_lookup(void* m, int on) {
+  return guard([&] { static_cast<Model*>(m)->spill_set_sync_lookup(on != 0); });
+}
+
+// *added: slabs of pinned host memory added to the spill pool (0: full, or off). Idle only: pinning is slow.
+int q27_spill_grow_pinned(void* m, int n, int* added) {
+  return guard([&] { *added = static_cast<Model*>(m)->spill_grow_pinned(n); });
+}
+
+// *done: 1 when a checkpoint was copied to host memory (it stays in the pool), 0 when none needed a copy.
+int q27_spill_backup_one(void* m, int* done) {
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(); });
 }
 
 // out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.

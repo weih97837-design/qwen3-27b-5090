@@ -8,10 +8,18 @@
 // reference count; the last, partial page is copied before the resumed sequence writes into it.
 #pragma once
 
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <set>
+#include <string>
 #include <vector>
+
+#include "host_kv.h"
 
 namespace q27 {
 
@@ -82,7 +90,53 @@ struct Checkpoint {
   int slot = -1;               // host state slot
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   uint64_t last_use = 0;
+  uint64_t backup = 0;         // the spill_ id of its host copy while the pool keeps it (idle backup); 0: none
+  // SPILL_ASYNC_PROMOTE: a checkpoint whose pages are still being filled by a host -> device copy on the I/O stream
+  // (Model::spill_restore_begin). load_ev is recorded behind that copy and load_id is the spill_ entry it comes from.
+  // INVARIANTS (docs/tiered-cache.md; enforced in model.cc / spill.cc, see the comment at the top of spill.cc):
+  // a loading checkpoint is invisible to every lookup / dedupe / backup / room count, never evicted, and any page
+  // move or copy that reads its pages first makes s_ wait for load_ev. Poll clears `loading` once load_ev completed.
+  bool loading = false;
+  cudaEvent_t load_ev = nullptr;
+  uint64_t load_id = 0;       // the spill_ entry it was restored from (kept after the copy completes: spill_release finds it)
+  // Set when a restore completes: the request that waited for it has not run prefix_begin yet, so evict_checkpoint takes
+  // any other checkpoint first (and cache_stats does not count its pages as room). Cleared by prefix_begin using it,
+  // by spill_release, or implicitly when only held / loading checkpoints remain (the oldest held one is then evicted).
+  bool held = false;
   int pos() const { return int(ids.size()); }
+};
+
+// Tiered cache (SPILL_RAM_GIB > 0): a checkpoint the KV pool had to give up is copied to host memory instead of
+// being dropped, and later written to a file (the frontend's policy, frontend/tiercache.py, or the RAM cap). Its
+// tokens stay in memory for the lookup; prefix_begin brings a spilled checkpoint back into the pool when it is
+// the deepest match. kv holds the pages slice-major ([kKvSlices][pages][kv_page_bytes]), state the host slot's
+// bytes (ssm | conv | draft ring).
+struct Spilled {
+  std::vector<int32_t> ids;
+  HostKv kv;                          // empty once the entry is only on disk (pinned segments, or one pageable segment)
+  std::unique_ptr<char[]> state;      // (same)
+  size_t kv_bytes = 0, state_bytes = 0;
+  bool ring = false;
+  std::string path;     // the file (empty: in memory only)
+  uint64_t last_use = 0;
+  bool busy = false;    // being restored: neither dropped nor written out meanwhile
+  bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
+  // SPILL_ASYNC_IO: the device -> host copy that fills kv (or the host -> device copy that reads it) is queued on the
+  // I/O stream and `done` was recorded behind it. While inflight the CPU must not touch kv / state / free them:
+  // Model::spill_wait first (cudaEventSynchronize). Never set with SPILL_ASYNC_IO=0.
+  cudaEvent_t done = nullptr;
+  bool inflight = false;
+  int pos() const { return int(ids.size()); }
+  bool in_ram() const { return kv.in_ram(); }
+  size_t ram_bytes() const { return in_ram() ? kv_bytes + state_bytes : 0; }
+};
+
+struct SpillStats {
+  int64_t spilled = 0, restored = 0, written = 0, dropped = 0, subsumed = 0, failed = 0, backed_up = 0;
+  int64_t pin_hits = 0, pin_misses = 0;  // entries given pinned memory / pageable memory although SPILL_PINNED_GIB > 0
+  // SPILL_ASYNC_PROMOTE: restores finished (also counted in `restored`), failed ones (also in `failed` when the entry
+  // was dropped), and the wall time / bytes of the finished ones (begin -> visible; bytes = kv + state).
+  int64_t restored_async = 0, restore_failed = 0, restore_ns = 0, restore_bytes = 0;
 };
 
 struct CacheStats {

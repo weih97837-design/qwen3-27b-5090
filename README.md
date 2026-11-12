@@ -96,13 +96,12 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose pull serve                   # the serving image from ghcr.io (45 MB download)
-docker compose up -d serve                  # serves 127.0.0.1:8000
+docker compose up -d --build serve          # builds the serving image from this checkout; serves 127.0.0.1:46320
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+curl -s http://127.0.0.1:46320/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
@@ -110,14 +109,14 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 To get a newer version later, see [Updating](#updating).
 
-The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
+The serving image ([Dockerfile](Dockerfile); this branch builds it locally and does not publish it) compiles the
 engine in the CUDA devel image and keeps only the result on a distroless base (glibc and libstdc++): the CUDA runtime library (the driver comes
 from the NVIDIA Container Toolkit), `libq27.so`, Python and the server's three packages (`frontend/requirements.txt`:
 tokenizers, jinja2, pillow). No compiler, PyTorch or transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
 time, then only the engine sources that changed), e.g. after changing the code.
 
 `scripts/serve.sh up` does the same and waits until the server answers (`up --idle`: the server only, no VRAM until
-the engine is started at `/ui`; `up --build`; `update`: pull first; `down`, `status`). From Windows, double-click
+the engine is started at `/ui`; `up --build`; `update`: the same as `up --build`; `down`, `status`). From Windows, double-click
 `\\wsl.localhost\<distro>\<path to the checkout>\scripts\windows\serve.cmd`, or put a shortcut to it on the desktop
 or in `shell:startup` (`serve.cmd idle` there, to start with the logon without taking the GPU). It starts the
 container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
@@ -130,12 +129,11 @@ Docker keeps using the image it already has until you ask for a newer one: `dock
 
 ```bash
 git pull                      # the newest compose.yaml and scripts
-docker compose pull serve     # download the newest image (45 MB at most)
-docker compose up -d serve    # replace the running container with one from the new image
+docker compose up -d --build serve   # rebuild the image from this checkout and replace the running container
 docker compose logs -f serve  # wait for "engine ready", then Ctrl+C (the server keeps running)
 ```
 
-`scripts/serve.sh update` does the last three steps in one and returns once the server answers; the engine may still be
+`scripts/serve.sh update` does the rebuild and the replacement in one step and returns once the server answers; the engine may still be
 loading then (`/health` turns 200 when it is ready). From Windows, run `serve.cmd update` the same way. Run `git pull`
 first in either case.
 
@@ -146,23 +144,15 @@ first in either case.
   `--build`.)
 
   ```bash
-  docker image inspect ghcr.io/mkyt/qwen3-27b-5090:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
-  ```
-
-- **Going back to another version:** set `SERVE_TAG` to a release version or `sha-<commit>` (the
-  [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them) on both commands. It only
-  applies to the command it is on, so a later `docker compose up -d serve` without it uses `latest` again.
-
-  ```bash
-  SERVE_TAG=0.1.0 docker compose pull serve
-  SERVE_TAG=0.1.0 docker compose up -d serve
+  docker image inspect local/qwen3-27b-5090-serve:tiered-kv-cache --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
   ```
 
 - **Freeing disk space:** each update leaves the previous image behind, without a name.
   `docker image prune` deletes such images, including those of other projects, and asks first.
 
-The [Windows package](#windows-native) has no image: run `update.cmd` in its folder (from v0.3.1), which downloads the
-latest [release](https://github.com/mkyt/qwen3-27b-5090/releases), quits the tray app and replaces the program. The
+The [Windows package](#windows-native) has no image. `update.cmd` downloads the latest release of the repository it
+names (`-Repo`, default this fork), quits the tray app and replaces the program. This fork has no Windows release yet,
+so it stops with a message until one is published (build the package with `scripts/windows/package.ps1`). The
 settings and the weights stay ([docs/configuration.md](docs/configuration.md#updating), also by hand).
 
 ### Windows (native)
@@ -182,7 +172,7 @@ server then takes no VRAM until the first request and frees it after 30 minutes 
 first start (compare the zip's SHA-256 with the release's).
 
 Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
-the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:8000
+the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:46320
 and the browser opens its stats page.
 
 The package is portable: its settings (`settings.ini`, see `settings.example.ini`), weights and log stay in its folder, so
@@ -193,7 +183,7 @@ faster natively (about 5.8 GB/s against 2.6–2.8 GB/s from WSL2's `/mnt`).
 
 ### Stats page
 
-http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
+http://127.0.0.1:46320/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
 activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
 with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
 restarts it with other settings (weights, KV cache type, speculative decoding, vision tower, requests at once,
@@ -202,13 +192,13 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 
 ## Clients
 
-- **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,
+- **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:46320/v1`, any API key,
   model `qwen3.8-27b`. Reasoning comes back in both `reasoning_content` and `reasoning`; `reasoning_effort` and
   `chat_template_kwargs.enable_thinking` are honored.
 - **Anthropic-compatible** (messages, count_tokens), e.g. Claude Code:
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:8000`, `ANTHROPIC_MODEL=qwen3.8-27b` (and the same for the small / fast model),
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:46320`, `ANTHROPIC_MODEL=qwen3.8-27b` (and the same for the small / fast model),
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`.
-- **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:8000/v1"` and `wire_api = "responses"`.
+- **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:46320/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
 - Images as data URLs or http(s) URLs. No video.
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
@@ -251,13 +241,13 @@ to change it. The most useful ones:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TOKENS` | 262144 | Context limit of one request |
-| `MAX_SEQS` | 8 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
+| `MAX_SEQS` | 4 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
 | `SPEC` | `dflash2` | `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
-[docs/configuration.md](docs/configuration.md) lists every setting. By default the server accepts connections from this PC
+[docs/configuration.md](docs/configuration.md) lists every setting. The RAM and SSD tiers for evicted KV checkpoints are in [docs/tiered-cache.md](docs/tiered-cache.md). By default the server accepts connections from this PC
 only; [Using it from other machines](docs/configuration.md#using-it-from-other-machines) says how to open it to your network.
 
 ### Other checkpoints
@@ -347,7 +337,7 @@ scripts/      weight download, end-to-end tests, benchmarks, quality evaluations
 windows/tray/ the tray app of the Windows package (Win32, C++)
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
-Dockerfile    the serving image (libq27.so, the server and three Python packages; 180 MB, ghcr.io/mkyt/qwen3-27b-5090)
+Dockerfile    the serving image (libq27.so, the server and three Python packages; 180 MB, local/qwen3-27b-5090-serve:tiered-kv-cache)
 dev/          the development image (CUDA, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks

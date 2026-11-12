@@ -88,7 +88,7 @@ async def run_point(client, model, prompt, thinking, c, max_tokens, extra):
 
 async def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--label", default="run")
     ap.add_argument("--prompts", default="reason,code")
     ap.add_argument("--concurrency", default="1,2,4")

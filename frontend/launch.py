@@ -28,16 +28,33 @@ GiB = 1 << 30
 # Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
 # unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
-# cache keeps 4 GiB of pinned state checkpoints.
-ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4"}
+# cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): a 512K-token KV pool, and
+# 32 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
+# Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
+# variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
+ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4", "KV_POOL_TOKENS": "524288",
+                       "SPILL_RAM_GIB": "32", "SPILL_DIR": "/cache/kv"}
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
              "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB"}
 
 
+def spill_dir_default(platform=os.name, env=os.environ):
+    """SPILL_DIR when unset: the compose volume on Linux; on Windows (the tray app, no Docker) a folder of the user."""
+    if platform != "nt":
+        return ENGINE_ENV_DEFAULTS["SPILL_DIR"]
+    return os.path.join(env.get("LOCALAPPDATA") or os.path.expanduser("~"), "qwen3-27b-5090", "kvcache")
+
+
+def engine_env_defaults(platform=os.name, env=os.environ):
+    """ENGINE_ENV_DEFAULTS with the platform's SPILL_DIR."""
+    return dict(ENGINE_ENV_DEFAULTS, SPILL_DIR=spill_dir_default(platform, env))
+
+
 def set_engine_env(root):
-    """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package)."""
-    for k, v in ENGINE_ENV_DEFAULTS.items():
+    """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package).
+    Called before the engine process is spawned (it copies os.environ) and before TierPolicy.from_env reads it."""
+    for k, v in engine_env_defaults().items():
         os.environ.setdefault(k, v)
     vocab = root / "bench/draft-vocab/vocab-128k.txt"
     if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
@@ -49,7 +66,7 @@ def env_settings():
     env = os.environ.get
     budget = env("VRAM_BUDGET_GIB")
     return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
-            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
+            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 
 

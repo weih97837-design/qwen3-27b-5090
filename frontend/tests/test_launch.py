@@ -179,3 +179,54 @@ def test_tokenizer_template_of_other_weights():
     with pytest.raises(Exception, match="System message must be at the beginning"):
         Tokenizer(own).render(msgs)
     assert mixed.encode("na\u0308ive text") == Tokenizer(own).encode("na\u0308ive text")  # (a combining mark)
+
+
+ENGINE_KEYS = ("KV_POOL_TOKENS", "SPILL_RAM_GIB", "SPILL_DIR", "MAX_TOKENS_FIT", "STATE_HOST_CACHE", "Q27_DRAFT_VOCAB")
+
+
+def _clean_engine_env(monkeypatch):
+    # setenv then delenv: monkeypatch restores the variables after the test, whatever set_engine_env writes.
+    for k in ENGINE_KEYS:
+        monkeypatch.setenv(k, "x")
+        monkeypatch.delenv(k)
+
+
+def test_engine_defaults_applied_when_unset(monkeypatch, tmp_path):
+    _clean_engine_env(monkeypatch)
+    launch.set_engine_env(tmp_path)
+    assert os.environ["KV_POOL_TOKENS"] == "524288"
+    assert os.environ["SPILL_RAM_GIB"] == "32"
+    assert os.environ["SPILL_DIR"] == ("/cache/kv" if os.name != "nt" else launch.spill_dir_default())
+    assert os.environ["MAX_TOKENS_FIT"] == "1" and os.environ["STATE_HOST_CACHE"] == "4"
+
+
+def test_engine_defaults_do_not_override_set_values(monkeypatch, tmp_path):
+    _clean_engine_env(monkeypatch)
+    monkeypatch.setenv("KV_POOL_TOKENS", "0")
+    monkeypatch.setenv("SPILL_RAM_GIB", "0")
+    monkeypatch.setenv("SPILL_DIR", "/elsewhere")
+    launch.set_engine_env(tmp_path)
+    assert os.environ["KV_POOL_TOKENS"] == "0"
+    assert os.environ["SPILL_RAM_GIB"] == "0"
+    assert os.environ["SPILL_DIR"] == "/elsewhere"
+
+
+def test_spill_dir_on_windows_is_a_user_folder():
+    local = r"C:\Users\someone\AppData\Local"
+    assert launch.spill_dir_default("nt", {"LOCALAPPDATA": local}) == os.path.join(local, "qwen3-27b-5090", "kvcache")
+    home_only = launch.spill_dir_default("nt", {})  # no LOCALAPPDATA: the home folder
+    assert home_only == os.path.join(os.path.expanduser("~"), "qwen3-27b-5090", "kvcache")
+    assert launch.spill_dir_default("posix", {"LOCALAPPDATA": local}) == "/cache/kv"
+    assert launch.engine_env_defaults("nt", {"LOCALAPPDATA": local})["SPILL_DIR"].endswith(
+        os.path.join("qwen3-27b-5090", "kvcache"))
+    assert launch.engine_env_defaults("posix", {})["SPILL_DIR"] == "/cache/kv"
+
+
+def test_tier_policy_sees_the_defaults(monkeypatch, tmp_path):
+    from tiercache import TierPolicy
+
+    _clean_engine_env(monkeypatch)
+    launch.set_engine_env(tmp_path)
+    tiers = TierPolicy.from_env(object(), log=lambda *a: None)  # (the worker's read, after set_engine_env)
+    assert tiers is not None and tiers.directory == pathlib.Path(launch.spill_dir_default())
+    assert tiers.budget == 100 * (1 << 30) and tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)

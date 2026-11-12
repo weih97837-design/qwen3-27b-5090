@@ -62,7 +62,7 @@ port to the internet.
 private networks. If you closed that prompt, add a rule in an administrator PowerShell:
 
 ```powershell
-New-NetFirewallRule -DisplayName "Qwen3.8-27B" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+New-NetFirewallRule -DisplayName "Qwen3.8-27B" -Direction Inbound -Protocol TCP -LocalPort 46320 -Action Allow
 ```
 
 **Linux firewalls:** Docker publishes ports with its own iptables rules, ahead of `ufw` and `firewalld`'s usual rules, so
@@ -75,18 +75,18 @@ the port opens without a firewall rule and those tools' rules do not close it. T
   run `wsl --shutdown`, and allow the port in an administrator PowerShell:
 
   ```powershell
-  New-NetFirewallHyperVRule -Name "Qwen3.8-27B" -DisplayName "Qwen3.8-27B" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 8000
+  New-NetFirewallHyperVRule -Name "Qwen3.8-27B" -DisplayName "Qwen3.8-27B" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 46320
   ```
 
 - A port proxy, in an administrator PowerShell, plus the Windows Firewall rule above. The WSL address can change when WSL
   restarts; run it again then.
 
   ```powershell
-  netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=8000 connectaddress=(wsl hostname -I).Trim()
+  netsh interface portproxy add v4tov4 listenport=46320 listenaddress=0.0.0.0 connectport=46320 connectaddress=(wsl hostname -I).Trim()
   ```
 
-**On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:8000/v1` (Anthropic
-clients: `http://<address>:8000`) and the stats page at `http://<address>:8000/ui`. With another `PORT`, change the port
+**On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:46320/v1` (Anthropic
+clients: `http://<address>:46320`) and the stats page at `http://<address>:46320/ui`. With another `PORT`, change the port
 everywhere above.
 
 ## Serving
@@ -94,11 +94,11 @@ everywhere above.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
-| `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
+| `PORT` | 46320 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 46320 |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
-| `MAX_SEQS` | 8 | Requests the engine can run at once (1–8); more wait in a queue. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs about 0.25 GiB of fixed per-request buffers. KV pool with gdnfp4 and NVFP4 KV: 620,096 tokens with 4, 605,504 with 8 |
+| `MAX_SEQS` | 4 | Requests the engine can run at once (1–8); more wait in a queue. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs about 0.25 GiB of fixed per-request buffers. KV pool with gdnfp4 and NVFP4 KV: 620,096 tokens with 4, 605,504 with 8 |
 | `ADMIT_KV` | 1 | 1: a waiting request starts only when the KV pool can take it: free pages plus pages held only by prefix-cache checkpoints must cover the remaining prompts of the running requests, `KV_RESERVE_TOKENS` of output per request, and one more parking area. With nothing running a request always starts. 0: start by count only (a request that later runs out of KV is suspended) |
 | `KV_RESERVE_TOKENS` | 4096 | Output tokens per request that `ADMIT_KV` keeps room for (or the request's remaining `max_tokens`, if smaller) |
 | `MIN_SEQ_TPS` | 0 | Lower bound of tokens per second per request; 0 disables it. Another request does not start if it would push each below this. The prediction uses the measured speed at each number of running requests (decode turns, about the last 10 s); unmeasured counts are scaled from smaller ones by the step time |
@@ -112,7 +112,19 @@ everywhere above.
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
 | `STATE_HOST_CACHE` | 4 | GiB of pinned host memory for prefix-cache checkpoints (4 = 21 checkpoints; 0 disables the cache; the server sets 4 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning 4 GiB takes about 1.8 s on WSL2): one by one while the server is idle, or when a checkpoint needs one |
-| `KV_POOL_TOKENS` | 0 | KV pool size in tokens (0 = all the VRAM budget leaves). When set, it is the KV cache with every parking area in use; the pool is that plus the parking areas (P7-13) |
+| `KV_POOL_TOKENS` | 524288 | KV pool size in tokens: the default is 512K (about 9 GiB of VRAM with NVFP4 KV). 0 = all the VRAM budget leaves. When set, it is the KV cache with every parking area in use; the pool is that plus the parking areas (P7-13). Checkpoints evicted from the pool go to the spill tiers ([tiered-cache.md](tiered-cache.md)). With MAX_TOKENS_FIT=1 (the default) a pool the VRAM budget cannot hold is lowered to what fits (logged), and MAX_TOKENS with it if needed. |
+| `SPILL_RAM_GIB` | 32 | Host RAM for KV checkpoints evicted from the GPU pool, in GiB. 0: off (the evicted checkpoints are dropped). Counts against the WSL2 VM's memory ([tiered-cache.md](tiered-cache.md#wsl2-注意事項)) |
+| `SPILL_PINNED_GIB` | 0 | Pinned host memory (GiB) for spill entries, pinned in 1 GiB slabs while the server is idle (`SPILL_PINNED_SLAB_MIB`). Faster copies. An entry is stored in segments (each inside one slab), so entries larger than a slab are pinned too; an entry the pool cannot hold completely uses normal memory. Part of the `SPILL_RAM_GIB` budget: the whole pinned pool counts toward it (reserved host memory, even when unused), and the value is clamped at startup to below it, leaving room for one checkpoint (at least 0.25 GiB). 0: off (default). Counts against Windows shared GPU memory ([tiered-cache.md](tiered-cache.md#加速選項預設關閉)). Turn on only after `scripts/tiered_cache_test.py` passes on your GPU |
+| `SPILL_ASYNC_IO` | 0 | 1: checkpoint pages are copied on a separate CUDA stream, so a spill or restore no longer stalls the GPU and the engine thread. The CPU is only freed for entries in pinned memory (copies to/from pageable memory block the CPU), so enable it together with `SPILL_PINNED_GIB`. 0: off (default). Turn on only after `scripts/tiered_cache_test.py` passes on your GPU |
+| `SPILL_ASYNC_PROMOTE` | 0 | 1: a request whose prompt matches a checkpoint spilled to RAM or SSD waits in state `restoring` while the engine loads it in the background (a thread reads the file, the copy runs on the I/O stream), and the requests behind it keep running; with 0 the match is promoted synchronously inside `prefix_begin`, stalling the engine for the whole load. A load starts only when it is clearly faster than computing the prompt again (estimated load time < 0.8 × recompute time) and gives up waiting after 30 s. Needs `SPILL_RAM_GIB` > 0; use with `SPILL_PINNED_GIB` and `SPILL_ASYNC_IO=1` (without async I/O the copy itself is synchronous). 0: off (default). Turn on only after `scripts/tiered_cache_test.py` (scenario g) passes on your GPU |
+| `SPILL_DIR` | `/cache/kv` | Directory in the container where spilled checkpoints are written. `compose.yaml` mounts the named volume `kvcache` there |
+| `SPILL_RAM_RETENTION_S` | 3600 | Seconds a checkpoint stays in RAM before `frontend/tiercache.py` writes it to SSD (only when idle) |
+| `SPILL_SSD_GIB` | 100 | Cap of the SSD tier in GiB; the oldest files are deleted first |
+| `SPILL_SSD_MIN_FREE_GIB` | 10 | The SSD tier never fills the disk below this much free space |
+| `SPILL_TTL_DAYS` | 7 | Files not reused for this many days are deleted |
+| `SPILL_TICK_S` | 30 | Seconds between the tier maintenance passes |
+| `VRAM_BACKUP_IDLE_S` | 60 | Seconds the engine must be idle before it copies VRAM checkpoints to RAM while keeping them in VRAM (idle backup, [tiered-cache.md](tiered-cache.md#閒置時預先備份vram-保留)). Needs `SPILL_RAM_GIB` above 0. 0: off |
+| `SPILL_FLUSH_ON_STOP_S` | 8 | Seconds a stop (idle unload, restart, shutdown) may spend backing up VRAM checkpoints (half of it) and writing RAM entries to `SPILL_DIR`. Cut to 8: `server.py` gives the engine 15 s to exit on an unload or restart and 10 s on shutdown, then terminates it. 0: off |
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
@@ -121,7 +133,7 @@ everywhere above.
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
-| `SERVE_TAG` | `latest` | Tag of the serving image `ghcr.io/mkyt/qwen3-27b-5090` (compose): `latest` (main), a version such as `1.0.0`, or `sha-<commit>`. `docker compose pull serve` fetches it; `--build` builds it from the checkout instead |
+| `SERVE_TAG` | — | Not a setting on this branch. The serve image is the local `local/qwen3-27b-5090-serve:tiered-kv-cache` (compose: `pull_policy: build`), built from this checkout by `scripts/serve.sh up --build`. Do not `docker compose pull`: the upstream image `ghcr.io/mkyt/qwen3-27b-5090` has no tiered cache |
 | `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use). Requests get 503 until it is started at `/ui` or with `POST /admin/engine`; with `ENGINE_IDLE_UNLOAD_S` above 0, the first generation request loads it instead |
 | `ENGINE_IDLE_UNLOAD_S` | 0 | Seconds without a request after which the engine stops and frees its VRAM; the next generation request loads it again and waits for it ([Unloading when idle](#unloading-when-idle)). 0: off, the engine stays ready |
 | `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
@@ -146,13 +158,13 @@ everywhere above.
   and the state (running, waiting, why requests wait, measured tok/s per number of running requests);
   `POST /admin/concurrency` changes `target_seqs` (1 to `MAX_SEQS`; lowering it does not stop running requests),
   `min_seq_tps`, `admit_kv` and `kv_reserve`. Changes survive an engine restart, not a service restart.
-  Example: `curl -s -X POST localhost:8000/admin/concurrency -d '{"target_seqs": 4}'`.
+  Example: `curl -s -X POST localhost:46320/admin/concurrency -d '{"target_seqs": 4}'`.
 - `/metrics` (Prometheus): among others `q27:target_seqs`, `q27:admission_blocked{reason=...}`,
   `q27:admission_waits_total{reason=...}`, `q27:cached_tokens_total`, `q27:reusable_tokens_total`.
 
 ## Stats page
 
-`http://localhost:8000/ui` shows the server live in the browser (no authentication, like the admin API):
+`http://localhost:46320/ui` shows the server live in the browser (no authentication, like the admin API):
 
 - GPU utilization, power against the limit, clocks and temperature (NVML), and the aggregate decode and prefill
   tokens per second, over the last 1 to 10 minutes.
@@ -173,7 +185,7 @@ The page also starts, stops and restarts the engine (a start takes about 3.3 s w
 reading them from a Windows drive under WSL2: see `Q27_LOAD_THREADS`). The engine process holds all the VRAM; the HTTP server
 holds none, so stopping the engine frees the GPU for other work while the service and the page stay up. Requests in
 flight fail with 503, and so do new ones until the engine is started again. The prefix cache is lost. The same from
-a script: `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'`
+a script: `curl -s -X POST localhost:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'`
 (`start`, `stop` or `restart`; `GET /admin/engine` returns the state: `stopped`, `loading`, `ready`, `restarting`
 after a crash, `stopping`). The JSON content type is required, so that another web page cannot send the action as a
 form.
@@ -197,7 +209,7 @@ a request and does not keep the engine loaded.
 - The stats page tells these states apart (`engine unloaded`: the first request loads it; `engine stopped`: requests get
   503 until a start), shows the time left before an unload and why a load was refused, and changes the time under
   **Unload when idle** in the start settings. From a script:
-  `curl -s -X POST localhost:8000/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
+  `curl -s -X POST localhost:46320/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
   (0: off). It applies at once, the time running from then, and lasts until the service restarts.
 
 ### Too little VRAM
@@ -210,11 +222,11 @@ happens depends on the settings:
 | Setting | Effect |
 | --- | --- |
 | Default | The KV pool takes what is left. If it cannot hold `MAX_TOKENS`, `MAX_TOKENS` is lowered as well (`MAX_TOKENS_FIT=1`) |
-| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4) |
+| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4, `KV_POOL_TOKENS=0`) |
 | `MAX_TOKENS_FIT=0` | The engine does not start if the KV pool cannot hold `MAX_TOKENS` |
 
-For scale, with the defaults (gdnfp4, nvfp4, `MAX_SEQS=8`), by the memory other programs use: nothing, a KV pool of about 610K
-tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower.
+For scale, uncapped (`KV_POOL_TOKENS=0`) with gdnfp4, nvfp4, `MAX_SEQS=8`, by the memory other programs use: nothing, a KV pool of about 610K
+tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower. This fork's defaults cap the pool at 524,288 tokens (`KV_POOL_TOKENS=524288`) with `MAX_SEQS=4`.
 
 An engine that does not start allocates no pools. With `ENGINE_IDLE_UNLOAD_S` set, the requests waiting for it get 503 with the
 reason (also `refused` in `GET /admin/engine`), and the next request tries again; there are no retries in between. Without it,
@@ -265,7 +277,7 @@ The same from a script:
   fit (HTTP 400 otherwise; 409 for `start` while the engine runs). With `"action": "save"` (the page's **Save for the
   next load**) they only stay for the next load, while the engine is stopped or unloaded (409 otherwise): it does not
   load, and whether they fit is decided when it does. Example:
-  `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
+  `curl -s -X POST localhost:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
 
 ## Prefix cache
 

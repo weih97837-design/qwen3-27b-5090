@@ -6,8 +6,8 @@
 # 456 MB of it the forward-compatibility driver package, which GeForce GPUs cannot use; on ubuntu:24.04 with numpy, 350 MB.)
 # Nothing is stripped: the standalone Python and the wheels' libraries were edited after linking (patchelf), and
 # strip, which trusts the section headers, broke the interpreter (empty dynamic symbol names).
-# Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
-# `docker compose up -d --build serve`.
+# Built locally as local/qwen3-27b-5090-serve:tiered-kv-cache (compose.yaml: pull_policy: build) by
+# `scripts/serve.sh up --build`. The upstream ghcr.io/mkyt image has no tiered cache: never pull it.
 
 FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
 
@@ -49,10 +49,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
  && rm -rf PIL/_imagingtk.* \
  && find . -depth -type d -name tests -exec rm -rf {} + \
  && find . -name '*.pyi' -delete
+# The SSD tier's directory (compose.yaml mounts the kvcache volume here). A new named volume takes its ownership from
+# this directory in the image; created only in the final stage it would be root-owned and the server could not write.
+RUN mkdir -p /cache/kv
 
 FROM gcr.io/distroless/cc-debian13@sha256:58e12be899275afaa05f1b03051ab19037ed7f252528e57a3a9ad7e220a62578
 COPY --from=python /opt/python /opt/python
 COPY --from=python /opt/venv /opt/venv
+COPY --from=python --chown=1000:1000 /cache/kv /cache/kv
 COPY --from=build /usr/local/cuda/lib64/libcudart.so.13* /opt/q27/
 # (what the nvidia/cuda images set for the container runtime: all GPUs, the compute and nvidia-smi libraries)
 ENV NVIDIA_VISIBLE_DEVICES=all \
@@ -70,5 +74,5 @@ COPY bench/draft-vocab bench/draft-vocab
 COPY reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/image_tokens.py reference/qwen27b/
 COPY engine/python engine/python
 COPY frontend frontend
-EXPOSE 8000
+EXPOSE 46320
 CMD ["python", "frontend/server.py"]

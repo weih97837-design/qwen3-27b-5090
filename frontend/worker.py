@@ -22,6 +22,13 @@ parking area), and one more request would not slow each one below MIN_SEQ_TPS (m
 for each number of requests decoding together). With nothing running, the first waiting request always
 starts. A request waiting for room rather than one suspended later keeps its turn and its KV.
 
+Delay hits (SPILL_ASYNC_PROMOTE=1, off by default; docs/tiered-cache.md): when a waiting request's prompt matches a
+checkpoint the tiered cache holds in host RAM or on the SSD, the engine restores it in the background
+(Engine.spill_restore_begin) and the request waits in state "restoring" (keeping its place in the queue) while the
+requests behind it are admitted and the engine goes on. Each loop iteration polls the restores; a finished one makes the
+request admissible, and its prefix_begin hits the restored checkpoint. A restore is started only when loading is clearly
+faster than computing the prompt again (RESTORE_MARGIN); after RESTORE_TIMEOUT_S the request stops waiting.
+
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per id (logprob, [(id, logprob)])]), ("done", rid, finish, info),
 ("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
@@ -46,6 +53,21 @@ RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages ov
 STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
 STATS_IDLE = 5.0      # s between them while idle
 
+# ---- delay-hit scheduling (SPILL_ASYNC_PROMOTE): when loading a spilled checkpoint beats computing it again
+RESTORE_TIMEOUT_S = 30.0   # a request waits at most this long for its checkpoint, then it is admitted (prefix_begin falls back)
+RESTORE_MARGIN = 0.8       # restore only if the estimated load time is below this fraction of the recompute time
+RESTORE_OVERHEAD_S = 0.05  # fixed cost of a restore: thread start, slot and page allocation, the polls that notice the end
+# Load speeds in bytes/s until measured (a finished restore: bytes / seconds, begin to visible, smoothed). A RAM entry is
+# a host -> device copy (pinned memory is about twice as fast as pageable); an SSD entry is a file read plus that copy.
+RESTORE_BW_RAM_PINNED, RESTORE_BW_RAM_PAGEABLE, RESTORE_BW_SSD = 12e9, 6e9, 2e9
+RESTORE_BW_CLAMP = (0.25, 4.0)  # a measurement counts within these multiples of the default (a stalled loop must not lock restores out)
+RESTORE_BW_SMOOTH = 0.3         # weight of a new measurement
+# Prompt tokens/s until a prefill chunk was measured: docs/architecture.md measures 11,295 tok/s at 19K and 5,875 tok/s at
+# 194K context; this is in between and leans toward loading.
+PREFILL_TPS_DEFAULT = 8000.0
+PREFILL_TPS_SMOOTH = 0.2        # weight of a new prefill chunk's speed
+RESTORE_POLL_S = 0.005          # the loop's wait for a message while only restores are pending
+
 
 def step_ms(n):
     """Time of a batched step for n requests (short contexts, gdnfp4 + KV nvfp4, P7-11: 12.40 / 13.76 / 16.39 /
@@ -59,6 +81,21 @@ class ImageError(Exception):
 
 def log(msg):
     print(f"[sched] {msg}", file=sys.stderr, flush=True)
+
+
+def _env_flag(name):
+    """An engine switch as capi.cc reads it: atoi(value) != 0."""
+    try:
+        return int(os.environ.get(name) or 0) != 0
+    except ValueError:
+        return False
+
+
+def _env_float(name):
+    try:
+        return float(os.environ.get(name))
+    except (TypeError, ValueError):
+        return None
 
 
 class Seq:
@@ -110,6 +147,11 @@ class Seq:
         self.held = False        # kept waiting by the admission (counted once)
         self._bytes = None
         self.begun = None        # time of the first prefix_begin
+        self.restoring = None    # the restore record this request waits for (Scheduler.maybe_restore), or None
+        self.restore_checked = False  # spill_match asked for this stay in the queue
+        self.restore_id = None   # the spilled entry whose restore it waited for (engine.spill_release after begin)
+        self.restore_pos = 0     # tokens of its prompt that entry covers (their pages are counted in its need, not as room)
+        self.no_sync = False     # recompute chosen over loading: prefix_begin must not promote a spilled match itself
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
         self.steps = 0           # decode steps (speculative: verify steps)
@@ -130,6 +172,22 @@ class Seq:
 
 
 class Scheduler:
+    # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
+    tiers = None
+    last_active = 0.0
+    backup_done = False
+    pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
+    # Delay hits (SPILL_ASYNC_PROMOTE): off unless the engine was started with it and has the calls.
+    async_promote = False
+    restores = None       # spilled entry id -> record {"t0", "bytes", "on_disk", "seqs", "late"} while it loads
+    restore_bw = None     # kind ("ram" / "ssd") -> measured bytes/s
+    restore_pinned = False
+    prefill_tps = None    # measured prompt tokens/s (smoothed)
+    restore_released = 0  # requests a poll released (count, for the logs and tests)
+    restore_completed = 0  # restores a poll saw end (any outcome; _guarded retries a KvFull turn when it grew)
+    last_restore_poll = 0.0
+    last_poll_error = 0.0  # (monotonic) when a failing restore poll was last logged
+
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
 
@@ -141,7 +199,17 @@ class Scheduler:
                 os.environ[k] = v
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
+        from tiercache import TierPolicy  # (tiered cache: SPILL_RAM_GIB; the frontend dir is on sys.path)
+        self.tiers = TierPolicy.from_env(self.engine, log)
+        if self.tiers is not None:
+            self.tiers.start()
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
+        self.restores, self.restore_bw = {}, {}
+        self.async_promote = (self.tiers is not None and getattr(self.engine, "has_spill_async", False)
+                              and _env_flag("SPILL_ASYNC_PROMOTE"))
+        self.restore_pinned = (_env_float("SPILL_PINNED_GIB") or 0.0) > 0
+        if self.async_promote:
+            log("delay hits: spilled checkpoints are restored in the background (SPILL_ASYNC_PROMOTE=1)")
         # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
         self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
@@ -159,6 +227,7 @@ class Scheduler:
         self.im_start = cfg["im_start"]
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
+        self.slot_lanes = {}     # rid -> UI lane (1-based) in the last stats snapshot (slot_rows keeps lanes still)
         self.by_id = {}
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
@@ -168,20 +237,26 @@ class Scheduler:
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
         self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
+        self.last_active = time.monotonic()  # the idle backup (touch, backup_due)
 
     # ------------------------------------------------------------ messages
 
     def send(self, *msg):
         self.conn.send(msg)
 
-    def poll(self, block):
+    def poll(self, block, wait=STATS_IDLE):
         # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
-        # then wake up now and then for a stats snapshot.
+        # then wake up now and then for a stats snapshot (wait seconds at most: less when a backup is due).
         if block and not self.cache_full:
             self.cache_full = self.engine.cache_grow(1) == 0
             block = self.cache_full
-        if block:
-            self.conn.poll(STATS_IDLE)
+        # Same for the pinned pool of the tiered cache (SPILL_PINNED_GIB, off by default): one slab per idle pass, since
+        # pinning is slow (other CUDA calls wait) and must never happen under load.
+        if block and not self.pin_full:
+            self.pin_full = self.grow_pinned() == 0
+            block = self.pin_full
+        if block and wait > 0:
+            self.conn.poll(RESTORE_POLL_S if self.restores else wait)  # (restores pending: never a long wait)
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
@@ -192,9 +267,71 @@ class Scheduler:
                 self.configure(msg[1])
                 self.send("config", self.settings(), msg[2])
             elif msg[0] == "stop":
+                self.flush_on_stop()
                 raise SystemExit(0)
 
+    def grow_pinned(self):
+        """Pins one more slab of the engine's spill pool; 0 when it is full or off, the engine predates it, or it failed."""
+        if self.tiers is None or not hasattr(self.engine, "spill_grow_pinned"):
+            return 0
+        try:
+            return self.engine.spill_grow_pinned(1)
+        except Exception as e:  # noqa: BLE001 - the pool is an optimisation: the entries stay pageable
+            log(f"pinned spill pool: {e}")
+            return 0
+
+    def touch(self):
+        """Activity (a request in or out, a turn): the idle clock restarts and the idle backup starts over."""
+        self.last_active = time.monotonic()
+        self.backup_done = False
+
+    def backup_ready(self):
+        """Whether the idle backup may run at all now: tiers on, not exhausted, the engine can back up, and idle."""
+        t = self.tiers
+        return (t is not None and t.backup_idle_s > 0 and not self.backup_done and not self.alive and not self.waiting
+                and hasattr(self.engine, "spill_backup_one"))
+
+    def backup_due(self):
+        return self.backup_ready() and time.monotonic() - self.last_active >= self.tiers.backup_idle_s
+
+    def backup_wait(self):
+        """Seconds the idle wait may last before a backup is due (STATS_IDLE when none is coming)."""
+        if not self.backup_ready():
+            return STATS_IDLE
+        return min(STATS_IDLE, max(0.0, self.tiers.backup_idle_s - (time.monotonic() - self.last_active)))
+
+    def backup_one(self):
+        """One idle backup: the least recently used VRAM checkpoint without a RAM copy is copied to RAM, and stays in
+        VRAM. False when there is nothing left or it failed; the backup then waits for the next activity."""
+        try:
+            if self.engine.spill_backup_one():
+                return True
+            log("idle backup: every checkpoint is backed up")
+        except Exception as e:  # noqa: BLE001 - the backup must not stop the engine
+            log(f"idle backup: {e}")
+        self.backup_done = True
+        return False
+
+    def flush_on_stop(self):
+        """On a stop (idle unload, restart, shutdown): the VRAM checkpoints without a RAM copy are backed up, then the
+        RAM entries are written to SSD, within SPILL_FLUSH_ON_STOP_S (at most half of it for the backups, which take
+        0.3-1 s each). Only with an SSD directory: nothing else survives the stop. Never raises."""
+        t = self.tiers
+        if t is None or t.directory is None or t.flush_on_stop_s <= 0:
+            return
+        t0 = time.monotonic()
+        try:
+            if hasattr(self.engine, "spill_backup_one"):
+                backed = 0
+                while time.monotonic() - t0 < t.flush_on_stop_s / 2 and self.engine.spill_backup_one():
+                    backed += 1
+                log(f"stop: backed up {backed} VRAM checkpoints")
+            t.flush(max(0.0, t.flush_on_stop_s - (time.monotonic() - t0)))
+        except Exception as e:  # noqa: BLE001 - the stop must go on
+            log(f"stop flush: {e}")
+
     def submit(self, rid, req):
+        self.touch()
         s = Seq(rid, req, time.time())
         if s.grammar is not None:
             try:
@@ -297,7 +434,9 @@ class Scheduler:
         reason = None
         if self.alive:
             # (a suspended request waits for room even without ADMIT_KV: let in at once, it would run out again)
-            if (self.admit_kv or s.preempted) and not self.kv_room(s):
+            # (a request whose restore has finished still holds its restored prefix: that is no extra need)
+            cached = s.restore_pos if s.restore_id is not None else 0
+            if (self.admit_kv or s.preempted) and not self.kv_room(s, cached=cached):
                 reason = "kv"
             elif self.min_tps > 0 and self.predicted_rate(len(self.alive) + 1) < self.min_tps:
                 reason = "speed"
@@ -310,26 +449,223 @@ class Scheduler:
         self.held_until = (s, time.time() + ADMIT_RECHECK) if reason else (None, 0.0)
         return reason is None
 
+    def head(self):
+        """The waiting request the admission looks at: the first one that is not waiting for a restore (the one admit()
+        keeps its held_until / blocked bookkeeping for). Without delay hits that is waiting[0]."""
+        return next((q for q in self.waiting if getattr(q, "restoring", None) is None), None)
+
+    def admit_waiting(self):
+        """Moves the waiting requests that may start into alive, in arrival order. Without SPILL_ASYNC_PROMOTE only the
+        head is ever looked at. With it, a request whose checkpoint is loading (state "restoring") is skipped: the
+        next ones are admitted meanwhile (Strata's delay hit), and the first one the admission does not let in stops
+        the pass, as before."""
+        if not self.async_promote:
+            while self.waiting and len(self.alive) < self.max_seqs and self.admit(self.waiting[0]):
+                self.alive.append(self.waiting.popleft())
+            return
+        if self.restores is None:
+            self.restores, self.restore_bw = {}, {}
+        self.poll_restores()
+        for s in list(self.waiting):
+            if len(self.alive) >= self.max_seqs:
+                break
+            if s.restoring is not None:
+                continue
+            if self.maybe_restore(s):
+                continue
+            if not self.admit(s):
+                break
+            self.waiting.remove(s)
+            self.alive.append(s)
+
+    # ------------------------------------------------------------ delay hits (SPILL_ASYNC_PROMOTE)
+
+    def bandwidth(self, on_disk):
+        """Bytes/s a restore is expected to load at: measured (within RESTORE_BW_CLAMP of the default), else the default."""
+        default = RESTORE_BW_SSD if on_disk else RESTORE_BW_RAM_PINNED if self.restore_pinned else RESTORE_BW_RAM_PAGEABLE
+        got = (self.restore_bw or {}).get("ssd" if on_disk else "ram")
+        if got is None:
+            return default
+        lo, hi = RESTORE_BW_CLAMP
+        return min(max(got, default * lo), default * hi)
+
+    def est_load_s(self, match):
+        return match["bytes"] / self.bandwidth(match["on_disk"]) + RESTORE_OVERHEAD_S
+
+    def est_recompute_s(self, tokens):
+        return tokens / (self.prefill_tps or PREFILL_TPS_DEFAULT)
+
+    def measure_prefill(self, tokens, dt):
+        """A prefill chunk of `tokens` took dt seconds in the engine."""
+        if tokens < 256 or dt <= 0:
+            return
+        tps = tokens / dt
+        self.prefill_tps = tps if self.prefill_tps is None else (
+            (1 - PREFILL_TPS_SMOOTH) * self.prefill_tps + PREFILL_TPS_SMOOTH * tps)
+
+    def worth_loading(self, match):
+        """Load only if it is clearly quicker than computing the matched prefix again."""
+        return self.est_load_s(match) < RESTORE_MARGIN * self.est_recompute_s(match["pos"])
+
+    def maybe_restore(self, s):
+        """Before s is admitted: starts the background restore of a spilled checkpoint that matches its prompt and puts
+        s in state "restoring" (True). False: nothing to wait for (no match, not worth it, or it could not start); s is
+        admitted as usual, and prefix_begin does what it did before (a match judged not worth loading is not promoted)."""
+        if s.restore_checked:
+            return False
+        s.restore_checked = True
+        try:
+            m = self.engine.spill_match(s.eng_ids, self.spec)
+            if m is None:
+                return False
+            rec = self.restores.get(m["id"])
+            if rec is not None:  # (another request already waits for this entry; a late one is still loading: not waited for)
+                if rec["late"]:
+                    return False
+                rec["seqs"].append(s)
+                s.restoring, s.restore_id, s.restore_pos = rec, rec["id"], m["pos"]
+                return True
+            if not self.worth_loading(m):
+                s.no_sync = True
+                log(f"{s.rid}: spilled checkpoint of {m['pos']} tokens not loaded (load ~{self.est_load_s(m):.2f} s, "
+                    f"recompute ~{self.est_recompute_s(m['pos']):.2f} s)")
+                return False
+            # (the restored pages must fit next to what the running requests still need: else nothing is started, the
+            # request is admitted as usual and prefix_begin recomputes or promotes as it did without delay hits)
+            if not self.kv_room(s, cached=m["pos"], extra=-(-m["pos"] // PAGE)):
+                log(f"{s.rid}: spilled checkpoint of {m['pos']} tokens not loaded (the KV pool has no room for it)")
+                return False
+            if not self.engine.spill_restore_begin(m["id"]):
+                return False
+        except Exception as e:  # noqa: BLE001 - delay hits are an optimisation: the request takes the synchronous path
+            log(f"{s.rid}: spilled checkpoint lookup failed ({e})")
+            return False
+        rec = {"id": m["id"], "t0": time.time(), "bytes": m["bytes"], "on_disk": m["on_disk"], "pos": m["pos"],
+               "seqs": [s], "late": False}
+        self.restores[m["id"]] = rec
+        s.restoring, s.restore_id, s.restore_pos = rec, m["id"], m["pos"]
+        self.m["q27:restores_started_total"] += 1
+        log(f"{s.rid}: loading a spilled checkpoint of {m['pos']} tokens ({m['bytes'] / 1e9:.2f} GB from "
+            f"{'SSD' if m['on_disk'] else 'RAM'}, ~{self.est_load_s(m):.2f} s vs ~{self.est_recompute_s(m['pos']):.2f} s to compute)")
+        self.send("event", s.rid, "restore", f"loading a cached prefix of {m['pos']} tokens in the background")
+        return True
+
+    def release(self, rec, why):
+        n = 0
+        for q in rec["seqs"]:
+            if q.restoring is rec:
+                q.restoring = None
+                n += 1
+        self.restore_released += n
+        return n
+
+    def engine_release(self, entry_id):
+        """Tells the engine nobody waits for the restored checkpoint of `entry_id` any more (it stops being held against
+        eviction). An older engine build has no such call; failures are not worth stopping for."""
+        if not entry_id or not hasattr(self.engine, "spill_release"):
+            return
+        try:
+            self.engine.spill_release(entry_id)
+        except Exception as e:  # noqa: BLE001 - an optimisation hint
+            log(f"spill_release: {e}")
+
+    def release_restored(self, s):
+        """s no longer needs the checkpoint restored for it (it began, or ended before): released in the engine unless the
+        restore is still loading for another request, or another request that shares it has not begun yet."""
+        eid = getattr(s, "restore_id", None)
+        if eid is None:
+            return
+        s.restore_id, s.restore_pos = None, 0
+        if any(q is not s and not q.dead and getattr(q, "restore_id", None) == eid for q in self.alive + list(self.waiting)):
+            return
+        self.engine_release(eid)
+
+    def detach_restore(self, s):
+        """s stops waiting for its restore (cancelled, finished, preempted). The last one to leave a restore that is still
+        loading releases it in the engine, which then does not hold the checkpoint for nobody."""
+        rec = getattr(s, "restoring", None)
+        if rec is None:
+            return
+        s.restoring, s.restore_id, s.restore_pos = None, None, 0
+        if s in rec["seqs"]:
+            rec["seqs"].remove(s)
+        if not rec["seqs"] and not rec["late"]:
+            rec["late"] = True  # (no new request waits for it either; the engine goes on loading it)
+            self.engine_release(rec["id"])
+
+    def poll_restores(self):
+        """Advances the engine's restores; requests whose checkpoint is visible (or failed, or took longer than
+        RESTORE_TIMEOUT_S) become admissible. Never blocks. Returns how many requests it released. A failing engine poll
+        is logged (at most once a second) and tried again by the next call: the restores stay queued, and the timeout
+        still releases their requests."""
+        if not self.restores:
+            return 0
+        now = time.time()
+        freed = 0
+        try:
+            done = self.engine.spill_restore_poll()
+        except Exception as e:  # noqa: BLE001 - the restores stay; a fatal engine error kills the worker at its next call
+            done = []
+            if time.monotonic() - self.last_poll_error > 1.0:
+                self.last_poll_error = time.monotonic()
+                log(f"restore poll failed ({e}); trying again")
+        self.restore_completed += len(done)
+        for sid, ok in done:
+            rec = self.restores.pop(sid, None)
+            if rec is None:
+                continue
+            dt = now - rec["t0"]
+            if ok and not rec["late"] and dt > 0:  # (only a restore that worked, and that was waited for, teaches the speed)
+                kind = "ssd" if rec["on_disk"] else "ram"
+                bw = rec["bytes"] / dt
+                old = self.restore_bw.get(kind)
+                self.restore_bw[kind] = bw if old is None else (1 - RESTORE_BW_SMOOTH) * old + RESTORE_BW_SMOOTH * bw
+            log(f"restore of {rec['pos']} tokens ended after {dt:.2f} s" + ("" if ok else " (failed)"))
+            freed += self.release(rec, "done")
+        for rec in self.restores.values():
+            if not rec["late"] and now - rec["t0"] > RESTORE_TIMEOUT_S:
+                rec["late"] = True  # (the engine goes on loading it; nobody waits for it any more)
+                self.m["q27:restore_timeouts_total"] += 1
+                log(f"restore of {rec['pos']} tokens took over {RESTORE_TIMEOUT_S:.0f} s: its requests start without it")
+                freed += self.release(rec, "timeout")
+                self.engine_release(rec["id"])  # (its checkpoint must not stay held for nobody)
+        return freed
+
+    def restore_due(self):
+        """For the decode loops: whether a restore ended and released a request, so the turn should end and let the admission
+        run (cheap and false without SPILL_ASYNC_PROMOTE)."""
+        if not self.restores:
+            return False
+        now = time.monotonic()
+        if now - self.last_restore_poll < RESTORE_POLL_S:
+            return False
+        self.last_restore_poll = now
+        return self.poll_restores() > 0
+
     def live_prefix(self, s):
         """Tokens of s's prompt whose KV pages a running request holds already (a shared prefix)."""
         p = s.ids_bytes()
         n = max((lcp_bytes(p, o.ids_bytes()[:4 * o.fed]) for o in self.alive if o.started and o is not s), default=0)
         return n // PAGE * PAGE
 
-    def kv_room(self, s):
+    def kv_room(self, s, cached=0, extra=0):
         """Whether the KV pool holds s next to the running requests: the free pages and the pages only
         checkpoints hold (evicted when needed) cover the rest of each prompt, kv_reserve tokens of output of
-        each request, and the parking areas of one more request."""
+        each request, and the parking areas of one more request. For a restore (maybe_restore): `cached` tokens of s's
+        prompt come from the restored checkpoint, whose `extra` pages are taken from the pool first."""
         st = self.engine.cache_stats()
         room = st["free_pages"] + st["checkpoint_only_pages"]
         parked = sum(1 for o in self.alive if o.area is not None)
         room -= max(0, len(self.alive) - parked) * st["park_pages"]  # (n + 1 requests park n at most)
         need = 0
         for o in self.alive + [s]:
-            prompt = len(o.eng_ids) - (o.fed if o.started else self.live_prefix(o))
+            done = o.fed if o.started else self.live_prefix(o)
+            if o is s and cached:
+                done = max(done, cached)
+            prompt = len(o.eng_ids) - done
             out = min(max(0, o.max_new - len(o.out)), self.kv_reserve)
             need += -(-max(0, prompt) // PAGE) + -(-out // PAGE)
-        return need <= room
+        return need + extra <= room
 
     def predicted_rate(self, n):
         """tok/s per request with n requests decoding together: measured, or scaled from the largest measured
@@ -395,16 +731,27 @@ class Scheduler:
             f"{'DFlash2' if self.spec else 'no speculative decoding'}, "
             f"{'batched decode steps' if self.batch else 'decode in turns'}")
         while True:
-            self.poll(block=not self.alive and not self.waiting)
-            if not self.waiting or self.held_until[0] is not self.waiting[0]:
+            idle = not self.alive and not self.waiting and not self.restores
+            # A backup due now is one copy per iteration, so the poll does not wait (a request is admitted after it).
+            self.poll(block=idle, wait=0.0 if self.backup_due() else self.backup_wait())
+            head = self.head()
+            if head is None or self.held_until[0] is not head:
                 self.blocked = None
-            while self.waiting and len(self.alive) < self.max_seqs and self.admit(self.waiting[0]):
-                self.alive.append(self.waiting.popleft())
+            self.admit_waiting()
             job = self.pick()
             if job:
                 self.guarded(*job)
+            elif self.restores:  # (only restores to wait for: a message wakes this up early)
+                self.conn.poll(RESTORE_POLL_S)
+            elif self.backup_due():  # (still idle after the poll: no request arrived)
+                self.backup_one()
             # (stats also once more when the work is done, and after each idle wait)
             self.report(force=not (self.alive or self.waiting))
+            if self.tiers is not None:
+                try:
+                    self.tiers.tick(idle=not self.alive and not self.waiting)
+                except Exception as e:  # noqa: BLE001 - the cache policy must not stop the engine
+                    log(f"tiered cache: {e}")
 
     def report(self, force=False):
         """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
@@ -442,9 +789,11 @@ class Scheduler:
     def guarded(self, kind, s):
         """Runs a turn; KV pool full: preempts another request and retries; engine errors end the request."""
         t0 = time.time()
+        self.touch()
         try:
             return self._guarded(kind, s)
         finally:
+            self.touch()
             self.m["q27:engine_busy_seconds_total"] += time.time() - t0
 
     def _guarded(self, kind, s):
@@ -462,6 +811,15 @@ class Scheduler:
             except self.KvFull:
                 if kind != "batch" and s.started and s is self.cur:
                     s.fed = self.engine.pos  # (a prompt may have run part of the way)
+                # A restore that completed meanwhile makes its checkpoint visible: poll once, and retry the turn without
+                # preempting anyone if any ended. (The engine evicts a loading checkpoint only when nothing else can go:
+                # evict_checkpoint takes non-held ones first, then the oldest held, then finishes the oldest loading one
+                # synchronously and evicts it.)
+                if self.restores:
+                    before = self.restore_completed
+                    self.poll_restores()
+                    if self.restore_completed > before:
+                        continue
                 # The latest request gives way, also when it is the one that ran out: suspending an earlier
                 # one instead lets the two take turns suspending each other (P7-14).
                 started = [o for o in self.alive if o.started and not o.dead]
@@ -518,7 +876,14 @@ class Scheduler:
     def begin(self, s):
         """prefix_begin: restores the deepest cached prefix (the engine's state is reset first)."""
         self.cur = None  # (prefix_begin drops whatever the engine held)
-        cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
+        if s.no_sync:  # (loading its spilled match was judged slower than computing it: prefix_begin must not load it)
+            self.engine.spill_sync_lookup(False)
+        try:
+            cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
+        finally:
+            if s.no_sync:
+                self.engine.spill_sync_lookup(True)
+        self.release_restored(s)  # (a hit has cleared it; if prefix_begin took another checkpoint, release this one)
         self.cur = s
         s.started, s.fed = True, cached
         if s.cached is None:
@@ -558,6 +923,7 @@ class Scheduler:
         rest = s.eng_ids[s.fed:]
         if len(rest) > self.chunk:
             s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
+            self.measure_prefill(s.fed - fed0, time.time() - t0)
         else:
             left = s.max_new - len(s.out)
             seed = s.rng.getrandbits(63)
@@ -609,7 +975,7 @@ class Scheduler:
         step, n0 = 0.0, len(s.out)
         while not s.dead and s.phase == DECODE:  # (a forced output makes it a prefill again)
             now = time.time()
-            last = (others and now + step >= t0 + turn) or self.conn.poll(0)
+            last = (others and now + step >= t0 + turn) or self.conn.poll(0) or self.restore_due()
             ts = time.time()
             if self.spec:
                 if s.gm is not None:
@@ -658,7 +1024,8 @@ class Scheduler:
                 s.steps += 1
                 self.count_draft(s, toks)
                 self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
-            if any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
+            if (any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0)
+                    or self.restore_due()):
                 break
         dt = time.time() - t0
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)
@@ -765,11 +1132,18 @@ class Scheduler:
             v.area = None
         v.eng_ids = v.prompt + v.out  # (ids_bytes follows the new length)
         v.started, v.fed, v.phase = False, 0, PREFILL
+        # (its own checkpoint is in the pool now; a deeper spilled one would be new: ask again, and let prefix_begin load)
+        v.restore_checked = v.no_sync = False
+        self.detach_restore(v)
+        v.restore_id, v.restore_pos = None, 0  # (a preempted request has begun: released then)
 
     def finish(self, s, reason, save=True, notify=True):
+        self.touch()
         if s.dead:
             return
         s.dead = True
+        self.detach_restore(s)
+        self.release_restored(s)  # (it never began: the checkpoint restored for it is not held for nothing)
         self.drop_decoding(s)
         if s in self.alive:
             self.alive.remove(s)
@@ -808,19 +1182,32 @@ class Scheduler:
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
+        if self.tiers is not None:
+            sp, ts = self.engine.spill_stats(), self.tiers.status()
+            out.update({"q27:tier_ram_bytes": sp["ram_bytes"], "q27:tier_in_ram": sp["in_ram"],
+                        "q27:tier_on_disk": sp["on_disk"], "q27:tier_spilled": sp["spilled"],
+                        "q27:tier_restored": sp["restored"], "q27:tier_written": sp["written"],
+                        "q27:tier_dropped": sp["dropped"], "q27:tier_subsumed": sp["subsumed"],
+                        "q27:tier_failed": sp["failed"], "q27:tier_restoring": sp.get("restoring", 0),
+                        "q27:tier_restored_async": sp.get("restored_async", 0),
+                        "q27:tier_restore_failed": sp.get("restore_failed", 0), "q27:tier_ssd_bytes": ts["ssd_bytes"],
+                        "q27:tier_ssd_budget_bytes": ts["ssd_budget_bytes"]})
         return out
 
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
+        from stats import slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
+        if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
+            self.slot_lanes = {}
         st = self.engine.cache_stats()
-        seqs = []
+        seqs, lanes = [], []
         for s in self.alive + list(self.waiting):
             if s.dead:
                 continue
-            state = "waiting" if s not in self.alive else ("running" if s is self.cur else
-                                                          "parked" if s.area is not None else "admitted")
+            state = ("restoring" if s.restoring is not None else "waiting") if s not in self.alive else (
+                "running" if s is self.cur else "parked" if s.area is not None else "admitted")
             seqs.append({"rid": s.rid, "state": state, "phase": s.phase, "prompt": len(s.prompt),
                          "cached": s.cached if s.cached is not None else s.est_cached,
                          "fed": min(s.fed, len(s.prompt)) if s.started else 0, "out": len(s.out),
@@ -832,10 +1219,19 @@ class Scheduler:
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "marks": s.marks})
+            if s.restoring is not None:
+                rec = s.restoring
+                seqs[-1]["restore"] = {"tokens": rec["pos"], "bytes": rec["bytes"], "on_disk": rec["on_disk"],
+                                       "elapsed": now - rec["t0"]}
+            if state not in ("waiting", "restoring"):
+                lanes.append((state, s.area, seqs[-1]))
         return {"t": now, "seqs": seqs, "cache": st, "device": self.engine.device_memory(),
                 "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
+                "restoring": sum(1 for q in seqs if q["state"] == "restoring"),
                 "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
-                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
+                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
+                "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
+                "tiers": tiers_block(self.engine, getattr(self, "tiers", None))}
 
 
 def allows(m, t, eos):

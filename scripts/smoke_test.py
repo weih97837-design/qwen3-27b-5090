@@ -4,7 +4,7 @@
 Checks: server health, chat (thinking off), reasoning parser (thinking on),
 tool-call parser, and a second turn that feeds a tool result back.
 
-    python3 scripts/smoke_test.py [--base-url http://127.0.0.1:8000]
+    python3 scripts/smoke_test.py [--base-url http://127.0.0.1:46320]
 """
 
 import argparse
@@ -58,7 +58,7 @@ def check(name, ok, detail=""):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--wait", type=int, default=1800, help="seconds to wait for /health")
     args = ap.parse_args()
     base = args.base_url.rstrip("/")

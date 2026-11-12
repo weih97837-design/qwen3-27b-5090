@@ -197,9 +197,27 @@ Model::Model(const Options& opt) : opt_(opt) {
     opt_.max_tokens = fit;
     max_pages_ = int(ceil_div(fit + kSpecBlock, kPageTokens));
   }
+  // A fixed pool (KV_POOL_TOKENS) is kept as given, but with MAX_TOKENS_FIT a pool the budget cannot hold is lowered:
+  // the parking areas and the block rounding of kv_pages come on top of the pool (kv_total = kv_pages + park_all).
+  int pool_tokens = opt.kv_pool_tokens;
+  if (opt.fit_max_tokens && pool_tokens > 0) {
+    const int room = left_pages - park_all - kv_block_;
+    if (std::max<int64_t>(max_pages_, ceil_div(pool_tokens, kPageTokens)) > room) {  // (the pool holds max_tokens at least)
+      const int fit = std::max(0, room) * kPageTokens / 1024 * 1024;
+      if (fit < opt.prefill_chunk) fail("not enough VRAM: the VRAM budget leaves no room for KV_POOL_TOKENS (MAX_TOKENS_FIT)");
+      log("KV_POOL_TOKENS %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.kv_pool_tokens, fit);
+      pool_tokens = fit;
+      if (max_pages_ > ceil_div(fit, kPageTokens)) {
+        const int new_max = (fit - kSpecBlock) / 1024 * 1024;
+        log("max_tokens %d does not fit the lowered KV pool: lowered to %d (MAX_TOKENS_FIT)", opt.max_tokens, new_max);
+        opt_.max_tokens = new_max;
+        max_pages_ = int(ceil_div(new_max + kSpecBlock, kPageTokens));
+      }
+    }
+  }
   int pool_pages = max_pages_;
   if (opt.kv_pool_tokens > 0)
-    pool_pages = std::max(max_pages_, int(ceil_div(opt.kv_pool_tokens, kPageTokens)));
+    pool_pages = std::max(max_pages_, int(ceil_div(pool_tokens, kPageTokens)));
   else if (cache_on_)
     pool_pages = std::max(max_pages_, left_pages);
   // Whole blocks: with the prefix cache the pool takes what the budget leaves rounded down to blocks.
@@ -244,6 +262,27 @@ Model::Model(const Options& opt) : opt_(opt) {
     Q27_CUDA(cudaEventCreateWithFlags(&stage_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_in_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
+    if (opt.spill_async_io && opt.spill_ram_gib > 0) {  // (invariants: top of spill.cc)
+      Q27_CUDA(cudaStreamCreateWithFlags(&io_s_, cudaStreamNonBlocking));
+      Q27_CUDA(cudaEventCreateWithFlags(&io_ev_, cudaEventDisableTiming));
+      log("tiered cache: asynchronous KV copies on their own stream (SPILL_ASYNC_IO)");
+    }
+    if (opt.spill_pinned_gib > 0 && opt.spill_ram_gib > 0) {
+      // The whole pinned pool counts toward the RAM tier (spill_host_use), and the state checkpoints (ckpt_bytes_)
+      // need room under the same cap too: pinned stays below SPILL_RAM_GIB minus one checkpoint (at least 0.25 GiB).
+      const double reserve_gib = std::max(double(ckpt_bytes_) / double(size_t(1) << 30), 0.25);
+      const double room_gib = opt.spill_ram_gib - reserve_gib;
+      const double clamped_gib = room_gib > 0 ? std::min(opt.spill_pinned_gib, room_gib) : 0;
+      if (clamped_gib < opt.spill_pinned_gib) {
+        log("tiered cache: SPILL_PINNED_GIB %.1f leaves no room under SPILL_RAM_GIB %.1f next to a %.2f GiB checkpoint "
+            "(the pinned pool counts toward it); using %.1f GiB",
+            opt.spill_pinned_gib, opt.spill_ram_gib, reserve_gib, clamped_gib);
+        opt_.spill_pinned_gib = clamped_gib;
+      }
+      if (opt_.spill_pinned_gib > 0)
+        log("tiered cache: up to %.1f GiB of pinned host memory for spill entries (pinned while idle, slabs of %d MiB)",
+            opt_.spill_pinned_gib, opt.spill_pinned_slab_mib);
+    }
     log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
   }
@@ -414,6 +453,22 @@ Model::~Model() {
   if (host_io_) cudaFreeHost(host_io_);
   if (lp_) cudaFreeHost(lp_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
+  // Tiered cache: in-flight copies finish before their host buffers (spill_, retired_) and the pinned slabs go.
+  restoring_.clear();  // (joins the threads that read files into the entries' buffers: before any of them is freed)
+  if (io_s_) cudaStreamSynchronize(io_s_);
+  for (auto& c : ckpts_)  // (loading checkpoints: their copies are complete now)
+    if (c.load_ev) cudaEventDestroy(c.load_ev);
+  for (auto& kv : spill_)  // (the events of in-flight entries are complete now)
+    if (kv.second.done) cudaEventDestroy(kv.second.done);
+  for (Retired& r : retired_)
+    if (r.done) cudaEventDestroy(r.done);
+  spill_.clear();
+  retired_.clear();
+  for (char* slab : pin_pool_.slab_bases()) cudaFreeHost(slab);
+  pin_pool_.forget_slabs();
+  for (cudaEvent_t e : ev_free_) cudaEventDestroy(e);
+  if (io_s_) cudaStreamDestroy(io_s_);
+  if (io_ev_) cudaEventDestroy(io_ev_);
   for (char* m : slot_mem_)
     if (m) cudaFreeHost(m);
   for (auto e : {stage_ev_, stage_in_ev_})
@@ -559,9 +614,37 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
 }
 
 bool Model::evict_checkpoint() {
-  if (ckpts_.empty()) return false;
-  auto it = std::min_element(ckpts_.begin(), ckpts_.end(),
-                             [](const Checkpoint& a, const Checkpoint& b) { return a.last_use < b.last_use; });
+  // (SPILL_ASYNC_PROMOTE; spill.cc (F)) The least recently used checkpoint that is neither loading (its host -> device
+  // copy is still queued) nor held (restored, its request has not run yet); else the oldest held one; else, with only
+  // loading ones left, the oldest of those is finished synchronously (a rare stall instead of KvFull) and evicted.
+  auto oldest = [&](bool held) {
+    auto it = ckpts_.end();
+    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c)
+      if (!c->loading && c->held == held && (it == ckpts_.end() || c->last_use < it->last_use)) it = c;
+    return it;
+  };
+  auto it = oldest(false);
+  if (it == ckpts_.end()) it = oldest(true);
+  if (it == ckpts_.end()) {
+    for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c)
+      if (c->loading && (it == ckpts_.end() || c->last_use < it->last_use)) it = c;
+    if (it == ckpts_.end()) return false;
+    Q27_CUDA(cudaEventSynchronize(it->load_ev));
+    spill_loading_done(*it);
+  }
+  // Tiered cache: its idle backup (if any) is the only copy now; otherwise a copy to host memory instead of gone.
+  // (Before its pages go back.)
+  const auto b = it->backup ? spill_.find(it->backup) : spill_.end();
+  if (b != spill_.end() && spill_subsumed(*it, it->backup)) {
+    // Another checkpoint (deeper, in the pool, or spilled) now covers it: the backup is not needed.
+    spill_erase(b, true);
+    sstats_.subsumed++;
+  } else if (b != spill_.end()) {
+    b->second.live = false;
+    b->second.last_use = it->last_use;
+  } else if (spill_on()) {
+    spill_checkpoint(*it);
+  }
   for (int32_t p : it->pages) pool_.unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
@@ -591,7 +674,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   const int pos = int(ids.size());
   if (!cache_on_ || pos == 0) return;
   for (auto& c : ckpts_)
-    if (c.pos() == pos && c.ring >= ring && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
+    if (!c.loading && c.pos() == pos && c.ring >= ring && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
       c.last_use = ++use_clock_;
       return;
     }
@@ -630,15 +713,17 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
   cstats_.lookups++;
   cstats_.prompt_tokens += n;
   if (!cache_on_) return 0;
+  if (spill_on()) spill_lookup(ids, n, spec);  // a deeper match in host memory or on disk comes back into the pool first
   const Checkpoint* best = nullptr;
   for (auto& c : ckpts_)
-    if (c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
+    if (!c.loading && c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
         std::equal(c.ids.begin(), c.ids.end(), ids))
       best = &c;
   int cached = 0;
   if (best) {
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
+    const_cast<Checkpoint*>(best)->held = false;  // (its owner is here)
     // The state from its host slot (after its device -> host copy), before anything can evict it.
     Q27_CUDA(cudaStreamSynchronize(cs_));
     const char* src = slot_mem_[best->slot];
@@ -675,6 +760,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     Q27_CUDA(cudaMemcpyAsync(pos_dev_, &pos_, 4, cudaMemcpyHostToDevice, s_));
     if (hist_) copy_hist(hist_, ids, cached);
     Q27_CUDA(cudaStreamSynchronize(s_));
+    spill_reap();  // (a promoted entry's host-to-device copy is done: s_ waited for it)
     cstats_.hits++;
     cstats_.cached_tokens += cached;
   }
@@ -707,13 +793,15 @@ void Model::checkpoint() {
 
 void Model::cache_stats(int64_t* out) const {
   out[0] = cstats_.lookups, out[1] = cstats_.hits, out[2] = cstats_.prompt_tokens, out[3] = cstats_.cached_tokens;
-  out[4] = cstats_.saved, out[5] = cstats_.evicted, out[6] = int64_t(ckpts_.size()), out[7] = pool_.free_pages();
+  out[4] = cstats_.saved, out[5] = cstats_.evicted, out[6] = int64_t(std::count_if(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& c) { return !c.loading; })),
+  out[7] = pool_.free_pages();
   // A page only checkpoints hold has as many references as checkpoints listing it (the scheduler counts these
   // as room for a new request, P7-14).
   std::vector<int32_t> n(pool_.pages(), 0);
   int64_t ckpt_only = 0;
   for (const auto& c : ckpts_)
-    for (int32_t p : c.pages) ckpt_only += ++n[p] == pool_.refs(p);
+    if (!c.loading && !c.held)  // (a loading checkpoint cannot be evicted yet, a held one is kept for its request: no room to count on)
+      for (int32_t p : c.pages) ckpt_only += ++n[p] == pool_.refs(p);
   out[8] = ckpt_only, out[9] = pool_.pages() - 1, out[10] = park_pages_;
   out[11] = int64_t(std::count_if(slot_mem_.begin(), slot_mem_.end(), [](char* m) { return m != nullptr; }));
 }
@@ -1858,6 +1946,12 @@ void Model::reserve_area(int a) {
   if (!moved.empty()) {
     batch_exit();  // (the lanes' page tables are uploaded when a batch starts)
     std::vector<std::pair<int32_t, int32_t>> to;
+    // (SPILL_ASYNC_PROMOTE) The page copies below read the old pages: a loading checkpoint's host -> device copy (io_s_)
+    // must have written them first, so s_ waits for its event (GPU side only; rare: the area must overlap such pages).
+    // This is before the first copy is queued. The checkpoint stays loading and is remapped like any other.
+    for (const Checkpoint& c : ckpts_)
+      if (c.loading && std::any_of(c.pages.begin(), c.pages.end(), [&](int32_t p) { return p >= lo && p < hi; }))
+        Q27_CUDA(cudaStreamWaitEvent(s_, c.load_ev));
     for (int32_t p : moved) {
       const int q = pool_.alloc_outside(lo, hi);
       pool_.move(p, q);

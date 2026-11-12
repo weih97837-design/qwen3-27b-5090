@@ -44,6 +44,7 @@ add_library(q27 SHARED
   src/draft.cc
   src/vision.cu
   src/model.cc
+  src/spill.cc
   src/capi.cc
 )
 target_include_directories(q27 PRIVATE src)

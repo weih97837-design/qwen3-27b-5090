@@ -72,7 +72,7 @@ async def measure(nvml, coro):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--decode-reps", type=int, default=3)
     ap.add_argument("--concurrency", default="1,4,8")
     ap.add_argument("--conc-max-tokens", type=int, default=2048)

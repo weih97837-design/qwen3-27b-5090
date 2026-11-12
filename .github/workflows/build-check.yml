@@ -1,0 +1,26 @@
+# Compiles the engine (the Dockerfile's build stage: libq27.so with cmake and Ninja) to check that a branch builds.
+# Nothing is pushed or loaded, and the image is not published. No GPU is needed to compile the engine.
+name: build-check
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: false
+          # (the same limit as image.yml: the largest CUDA files need a few GB of RAM each; the runner has 16 GB)
+          build-args: BUILD_JOBS=3

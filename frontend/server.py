@@ -14,7 +14,7 @@ is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If
 dies (a CUDA error), requests in flight fail with 503, /health answers 503 and a new engine is started.
 Requests are cancelled when the client disconnects or a stop string matches.
 
-    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|none]
+    python frontend/server.py [--port 46320] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|none]
 """
 
 import argparse
@@ -1600,7 +1600,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
     ap.add_argument("--host", default=env("HOST", "0.0.0.0"))
-    ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
+    ap.add_argument("--port", type=int, default=int(env("PORT", 46320)))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
@@ -1608,7 +1608,7 @@ def main():
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
-    ap.add_argument("--max-seqs", type=int, default=int(env("MAX_SEQS", 8)),
+    ap.add_argument("--max-seqs", type=int, default=int(env("MAX_SEQS", 4)),
                     help="requests the engine can run at once (1..8); fewer run while the KV pool is short")
     ap.add_argument("--min-seq-tps", type=float, default=float(env("MIN_SEQ_TPS", 0)),
                     help="start another request only if each one keeps this many tok/s (0: off)")

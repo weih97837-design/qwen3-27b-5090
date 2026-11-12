@@ -319,7 +319,7 @@ async def scenario_longctx(client, model, args, tokens):
 
 async def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--label", default="run")
     ap.add_argument("--scenarios", default="decode,agent,longctx")
     ap.add_argument("--seed", type=int, default=0)

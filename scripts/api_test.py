@@ -14,7 +14,7 @@ alone.
 Server: requests run at once give the same greedy text as one at a time (switching sequences is exact), a
 closed connection cancels its request, /v1/models and /metrics.
 
-    python3 scripts/api_test.py [--base-url http://127.0.0.1:8000] [--only concurrency]
+    python3 scripts/api_test.py [--base-url http://127.0.0.1:46320] [--only concurrency]
 """
 
 import argparse
@@ -492,7 +492,7 @@ def controls_tests(cl):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--only", default="openai,anthropic,tool_choice,structured,controls,concurrency,cancel")
     args = ap.parse_args()
     cl = Client(args.base_url)

@@ -51,7 +51,7 @@ def same(a, b):
 
 async def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--model", default="qwen3.8-27b")
     ap.add_argument("--label", required=True)
     ap.add_argument("--n", type=int, default=300)

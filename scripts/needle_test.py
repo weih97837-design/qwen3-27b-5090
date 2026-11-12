@@ -47,7 +47,7 @@ def build(rng, approx_tokens, needles):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--base-url", default="http://127.0.0.1:46320")
     ap.add_argument("--tokens", default="32000,100000,180000", help="approximate prompt sizes in tokens")
     ap.add_argument("--needles", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)

@@ -1,7 +1,9 @@
 // Model runner, Phase 1: one sequence, chunked prefill and decode through the same path.
 #pragma once
 
+#include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +32,21 @@ struct Options {
   double state_cache_gib = 0;
   int kv_pool_tokens = 0;
   int checkpoint_interval = 8192;
+  // Tiered cache (needs the prefix cache): GiB of host memory for checkpoints the KV pool gives up (0: off, they are
+  // dropped as before), and the folder they are written to when that is full (empty: the oldest is dropped then).
+  double spill_ram_gib = 0;
+  std::string spill_dir;
+  // Tiered cache speed-ups, both OFF by default (docs/tiered-cache.md, "加速選項"). spill_pinned_gib: pinned host memory
+  // (in slabs of spill_pinned_slab_mib, pinned while idle by spill_grow_pinned) that spill entries are stored in when
+  // it has room, else they use pageable memory as before (0: off). spill_async_io: copy checkpoint pages on a
+  // dedicated I/O stream instead of the compute stream, and do not stall the compute stream or the CPU for them.
+  double spill_pinned_gib = 0;
+  int spill_pinned_slab_mib = 1024;
+  bool spill_async_io = false;
+  // SPILL_ASYNC_PROMOTE (OFF by default; needs spill_ram_gib > 0): the frontend may restore a spilled checkpoint in the
+  // background (spill_match / spill_restore_begin / spill_restore_poll) while other requests keep running, instead of
+  // prefix_begin promoting it synchronously. With it off those calls do nothing and every code path is unchanged.
+  bool spill_async_promote = false;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
@@ -137,6 +154,52 @@ class Model {
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
+  // Tiered cache (Options::spill_ram_gib > 0). Only the frontend's policy calls these, between engine steps.
+  // spill_list: one line per entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tlive\tpath" (live: 1 = an idle backup whose
+  // checkpoint is still in the pool). spill_export writes an entry
+  // that is in memory to `path` and frees the memory (it stays found by the lookup). spill_drop forgets an entry and
+  // deletes its file. spill_import indexes a file another run wrote (0 when it is not a file of this model and KV
+  // type, or unreadable: the caller deletes it). spill_stats writes min(n, kSpillStats) values to out: entries, in memory, on disk, memory bytes,
+  // spilled, restored, written, dropped, subsumed (a deeper checkpoint of the same tokens was kept), failed, backed_up;
+  // out[11..14] (appended): pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to
+  // pageable memory (both only counted when SPILL_PINNED_GIB > 0); out[15..19] (appended, SPILL_ASYNC_PROMOTE): restores
+  // in progress, async restores finished, async restores that failed, their total wall time in ms and bytes (begin ->
+  // visible). kSpillStats = 20 values in all. spill_list's "live" column is 0 none, 1 an idle backup, 2 busy (being restored by
+  // spill_restore_*: neither written out nor dropped meanwhile); the line format is unchanged.
+  std::string spill_list() const;
+  void spill_export(uint64_t id, const std::string& path);
+  void spill_drop(uint64_t id);
+  uint64_t spill_import(const std::string& path);
+  static constexpr int kSpillStats = 20;
+  void spill_stats(int64_t* out, int n) const;
+  // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
+  // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
+  // takes ~0.45 s per GiB on WSL2 and other CUDA calls wait meanwhile, so only the idle frontend calls this.
+  int spill_grow_pinned(int chunks);
+  // Idle backup: copies the least recently used pool checkpoint that has no valid backup to host memory and keeps it
+  // in the pool too. Its eviction then only marks the copy as the sole one (no copy stall). 1: one was copied, 0: none
+  // needed it (or no tiered cache). Called by the frontend while the engine is idle, repeatedly until 0.
+  int spill_backup_one();
+  // SPILL_ASYNC_PROMOTE (Options::spill_async_promote; delay-hit scheduling: the frontend admits other requests while
+  // an entry loads). All three run on the engine thread between steps and never block on the GPU or the disk.
+  // spill_match: the best spilled entry (not an idle backup) deeper than the pool's best visible match, by spill_lookup's
+  // criteria (tokens ids[0..n) start with the entry's tokens, pos < n, ring when spec). A restoring entry is returned
+  // too (so a second request waits for the same load). out4 = {id, pos, kv_bytes + state_bytes, 1 if it is only on disk}.
+  // 1: found. Read-only.
+  int spill_match(const int32_t* ids, int n, bool spec, int64_t* out4) const;
+  // Starts restoring the entry into the pool. 1: its host -> device copy was queued (RAM entry), 2: a thread reads its
+  // file (disk entry), 0: not started (flag off, unknown / live / busy entry, no room for its pages, no memory for its
+  // buffers; a damaged entry is dropped). The finished id comes out of spill_restore_poll, from when prefix_begin finds it.
+  int spill_restore_begin(uint64_t id);
+  // Advances every restore (a finished file read gets its pages and copy queued; a finished copy makes its checkpoint
+  // visible) and writes the ids that ended, whether they succeeded or not, to done_ids[0..cap). Returns how many.
+  // done_ok[i]: 1 restored, 0 failed (the entry is gone or back on disk only); a null done_ok is allowed.
+  int spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap);
+  // The request that waited for restore `id` no longer needs it (timeout, cancel): its checkpoint stops being held (or, if
+  // it is still loading, will not be). 1: something was released.
+  int spill_release(uint64_t id);
+  // false: prefix_begin does not promote a spilled match synchronously (the frontend decided to compute it instead).
+  void spill_set_sync_lookup(bool on) { spill_sync_lookup_ = on; }
   // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
   // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
   // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
@@ -209,6 +272,41 @@ class Model {
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   bool evict_checkpoint();           // the least recently used one; false when there is none
+  // Tiered cache (spill.cc).
+  bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
+  void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
+  bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
+  uint64_t spill_copy(const Checkpoint& c, bool live);  // the copy of c's pages and state as a new entry; 0: no memory
+  uint64_t spill_add(const Checkpoint& c, Spilled&& s, bool live);  // s (copied from c) becomes entry spill_next_; its id
+  void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's
+  // The best spilled entry deeper than the pool's visible match (0: none); *depth its pos. with_busy: restoring ones too.
+  uint64_t spill_best(const int32_t* ids, int n, bool spec, bool with_busy, int* depth) const;
+  bool spill_room(int npages) const;  // free pages + pages only visible checkpoints hold cover npages
+  // A state slot and npages pages (evicting checkpoints as needed); false: nothing is held.
+  bool spill_acquire(int npages, int* slot, std::vector<int32_t>* pages);
+  int spill_restore_issue(uint64_t id);  // entry in memory + busy: slot, pages, copy. 0 no room, 1 loading checkpoint, 2 done
+  void spill_restore_finish(uint64_t id);  // counters; the entry is erased
+  void spill_loading_done(Checkpoint& c);  // a loading checkpoint's copy is complete: visible, held (unless orphaned), reported ok
+  bool spill_promote(uint64_t id);               // a spilled entry -> a checkpoint in the pool
+  void spill_enforce_ram();                      // over spill_ram_gib: write out (or drop) the least recently used
+  // Host bytes the tiered cache holds: spill_ram_ counts the entries (a pinned entry's KV included), and adding the
+  // pool's free part makes it pageable + state + the whole pinned pool.
+  size_t spill_host_use() const { return spill_ram_ + (pin_pool_.total() - pin_pool_.used()); }
+  void spill_write(Spilled& s, const std::string& path);
+  bool spill_load(Spilled& s);                   // the file's pages and state into memory
+  void spill_erase(std::map<uint64_t, Spilled>::iterator it, bool remove_file);
+  // pages' K / V slices <-> host [kKvSlices][pages][kv_page_bytes_] (runs of adjacent pages in one copy)
+  void copy_pages(const std::vector<int32_t>& pages, const HostKv& host, bool to_host);  // on s_, then waits for the copy
+  void copy_pages_on(const std::vector<int32_t>& pages, const HostKv& host, bool to_host, cudaStream_t st);  // queues only
+  // SPILL_ASYNC_IO (io_s_ exists): see the invariants at the top of spill.cc.
+  bool spill_async() const { return io_s_ != nullptr; }
+  void io_begin();                       // io_s_ waits for everything queued on s_ so far (before it reads or writes pool pages)
+  void spill_wait(Spilled& s);           // CPU: the entry's in-flight copy has completed (no-op unless inflight)
+  void spill_reap();                     // frees the host memory of promoted entries whose host -> device copy is done
+  HostKv spill_alloc_kv(size_t bytes);   // pinned segments if the pool holds ALL of it (SPILL_PINNED_GIB > 0), else one new char[]
+  cudaEvent_t spill_event();             // a recycled / new event (no timing)
+  void spill_event_put(cudaEvent_t ev);
+  uint64_t spill_fingerprint() const;
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
   cudaGraphExec_t capture(const std::function<void()>& body);
@@ -309,9 +407,45 @@ class Model {
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
+  // SPILL_ASYNC_IO only (null otherwise): the I/O stream of the tiered cache (KV pages <-> host entries, both
+  // directions on this one stream, so they run in the order they were queued) and the event that orders it behind s_.
+  // Not cs_: prefix_begin / spill_copy synchronize cs_ for the state slots and must not wait behind GiBs of KV.
+  cudaStream_t io_s_ = nullptr;
+  cudaEvent_t io_ev_ = nullptr;
+  PinnedPool pin_pool_;              // declared before spill_ / retired_: their buffers release into it
+  bool pin_failed_ = false;          // cudaHostAlloc of a slab failed: no more attempts
+  std::vector<cudaEvent_t> ev_free_;  // recycled events
+  struct Retired {                    // a promoted entry's host memory, until its host -> device copy is done
+    HostKv kv;
+    cudaEvent_t done;
+    bool async = false;               // an async restore's: s_ did NOT wait for it, so spill_reap only frees it once complete
+  };
+  std::vector<Retired> retired_;
+  // SPILL_ASYNC_PROMOTE: restores in progress (entry id -> state). disk: the thread that reads the file (until it ends);
+  // issued: the pages and the host -> device copy exist (the checkpoint is loading). Engine thread only; the thread
+  // inside `disk` touches nothing but its buffers (DiskRead in host_kv.h).
+  struct Restore {
+    std::unique_ptr<DiskRead> disk;
+    std::chrono::steady_clock::time_point t0;
+    size_t bytes = 0;
+    bool issued = false;
+    bool orphan = false;  // spill_release came before the checkpoint existed / completed: do not hold it
+  };
+  std::map<uint64_t, Restore> restoring_;
+  // Restores that ended outside spill_restore_poll (inside begin, or finished by evict_checkpoint), with their outcome;
+  // reported by the next poll. Capacity is reserved when a restore starts (<= one result per restoring entry), so
+  // pushing never throws after state has changed.
+  std::vector<std::pair<uint64_t, bool>> restore_results_;
+  bool spill_sync_lookup_ = true;
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
+  std::map<uint64_t, Spilled> spill_;  // (a map: entries stay put while others come and go)
+  uint64_t spill_next_ = 1;
+  mutable uint64_t fingerprint_ = 0;   // spill_fingerprint(), once computed
+  mutable bool fingerprint_set_ = false;
+  size_t spill_ram_ = 0;               // host bytes the entries in memory hold
+  SpillStats sstats_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
   float* conv_ = nullptr;            // [48][10240][3]
   float* ssm_ = nullptr;             // [48][48][128][128]: the current buffer (ssm_buf_[sbuf_host_])

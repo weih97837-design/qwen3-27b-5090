@@ -379,7 +379,7 @@ gate without an explicit decision, recorded below with its numbers.
 - **`MAX_TOKENS_FIT`.** Before P7-13, `MAX_SEQS=8` with 262K did not fit and the server kept failing to start; the
   server now lowers `MAX_TOKENS` to what fits (in multiples of 1,024) and reports it in `/v1/models`. The engine
   library still fails instead, so measurements never change conditions silently.
-- **P7-14: deciding the number of running requests while running.** `MAX_SEQS=8` is the default since P7-13 made
+- **P7-14: deciding the number of running requests while running.** `MAX_SEQS=8` is the default since P7-13 (this fork lowers the default to 4): P7-13 made
   it nearly free (the lanes' fixed buffers, about 2.4% of the KV pool). A request waits instead of starting when
   the KV pool cannot hold the running prompts plus 4,096 tokens of output each: waiting wastes nothing, while
   suspending a half-computed request costs its recomputation. On a small KV pool (142K tokens, eight 12K prompts)

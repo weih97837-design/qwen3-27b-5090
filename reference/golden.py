@@ -201,7 +201,7 @@ def main():
     p.add_argument("--prompts", default="bench/golden/prompts.jsonl")
     p.add_argument("--out", required=True)
     p.add_argument("--api", choices=["sglang", "openai"], default="sglang")
-    p.add_argument("--base-url", default="http://127.0.0.1:8000")
+    p.add_argument("--base-url", default="http://127.0.0.1:46320")
     p.add_argument("--model", default="qwen3.8-27b")
     p = sub.add_parser("compare")
     p.add_argument("a")
