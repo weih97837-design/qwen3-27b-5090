@@ -66,11 +66,16 @@ Remove-Item -Recurse -Force (Join-Path $app "frontend\tests")
 New-Item -ItemType Directory -Force "$app\reference\qwen27b", "$app\scripts", "$app\engine\build" | Out-Null
 foreach ($f in "__init__.py", "paths.py", "image_tokens.py") { Copy-Item "reference\qwen27b\$f" "$app\reference\qwen27b\" }
 Copy-Item scripts\download_weights.py, scripts\windows\start_package.py, scripts\windows\update.ps1 "$app\scripts\"
+# The tiered cache tests and timings (test.cmd, bench.cmd; native_env.py sets HF_HOME and Q27_LIB for them) and their golden prompts
+Copy-Item scripts\tiered_cache_test.py, scripts\tiered_cache_bench.py, scripts\native_env.py "$app\scripts\"
+New-Item -ItemType Directory -Force "$app\bench\golden" | Out-Null
+Copy-Item bench\golden\prompts.jsonl "$app\bench\golden\"
 Copy-Item engine\build\q27.dll "$app\engine\build\"
 Set-Content -Encoding ascii -NoNewline -Path (Join-Path $app "VERSION") -Value $Version  # (update.ps1 compares it with the release)
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
 Copy-Item scripts\windows\start.cmd, scripts\windows\update.cmd, scripts\windows\settings.example.ini $dst
+Copy-Item scripts\windows\test.cmd, scripts\windows\bench.cmd $dst
 Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 
 $zip = Join-Path $Out "qwen3-27b-5090-$Version-windows-x64.zip"

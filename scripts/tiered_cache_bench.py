@@ -41,6 +41,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 sys.path.insert(0, str(ROOT / "scripts"))
+import native_env  # noqa: E402 - before q27lib and qwen27b (HF_HOME, Q27_LIB; see native_env.py)
+DEFAULT_WEIGHTS = native_env.apply()
 
 OPS = ("evict_spill", "promote_ram", "backup_idle", "evict_backup", "export_ssd", "import_ssd", "promote_ssd")
 SUFFIX = ".q27kv"
@@ -104,7 +106,7 @@ def grow_pinned(eng):
 
 def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
     from q27lib import Engine
-    from qwen27b.weights import engine_target
+    from qwen27b.paths import engine_target
     from tiered_cache_test import make_prompt
 
     A, B, C = (make_prompt(docs, size, i) for i in (0, 1, 2))
@@ -228,7 +230,8 @@ def print_table(title, cols):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
+    ap.add_argument("--weights", default=DEFAULT_WEIGHTS,
+                    help="weight profile: nvidia | gdnfp4 | quasar | a model directory (default: %(default)s)")
     ap.add_argument("--kv-dtype", default="nvfp4", choices=["bf16", "fp8", "nvfp4"])
     ap.add_argument("--sizes", default="32768,131072,262144", help="checkpoint sizes in tokens, comma-separated")
     ap.add_argument("--spill-dir", help="where the SSD files go (default: a temp dir; use the kvcache volume to measure it)")

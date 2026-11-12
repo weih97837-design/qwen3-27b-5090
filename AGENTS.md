@@ -10,6 +10,8 @@ Guidance for AI agents working in this repository. / 給在此 repo 工作的 AI
   不可提交 `.env`、`hf/` 內的權重或 `dist/`。提交前檢查 `git status`；只在使用者要求時才 commit。
 - Config overrides go in `.env` (gitignored). Do not change the defaults in `compose.yaml` to override a setting.
   設定覆寫寫在 `.env`（已被 gitignore）。不要為了覆寫而改 `compose.yaml` 的預設值。
+- Native Windows package, no WSL/Docker (`test.cmd`, `bench.cmd`): `docs/deploy-windows.md`.
+  原生 Windows 程式包，不用 WSL/Docker（`test.cmd`、`bench.cmd`）：`docs/deploy-windows.md`。
 - Tiered KV cache (RAM and SSD spill) settings: `docs/tiered-cache.md`. Its SSD volume `kvcache` holds the spilled checkpoints.
   分層 KV 快取（RAM 與 SSD）的設定見 `docs/tiered-cache.md`。SSD 層是具名磁碟區 `kvcache`。
 - Frontend tests: `cd frontend && python -m pytest tests -q`.
