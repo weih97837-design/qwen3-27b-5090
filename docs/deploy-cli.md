@@ -290,7 +290,7 @@ README 也明確提醒這一點。
 | 容器內看不到 GPU | `docker info --format '{{json .Runtimes}}'`；`nvidia-smi`（主機） | 安裝或修復 NVIDIA Container Toolkit（**未驗證** 確切步驟） |
 | 46320 埠被佔用 | `docker ps --filter "publish=46320"` | `serve.sh` 會列出佔用者；先停止它。只能同時執行一個模型 |
 | `/health` 長時間 503 | `curl -s http://127.0.0.1:46320/health`；`docker compose logs --tail 100 serve` | 看狀態字串與日誌中的錯誤。`restart: on-failure:3`（`compose.yaml:108`）會自動重啟最多 3 次 |
-| 引擎拒絕載入（VRAM 不足） | `curl -s http://127.0.0.1:46320/admin/engine`（看 `refused` 欄位）；`nvidia-smi` | 關閉其他 GPU 程式；降低 `MAX_TOKENS` 或 `VRAM_BUDGET_GIB`；`python3 tools/recommend_config.py` 取得建議 |
+| 引擎拒絕載入（VRAM 不足） | `curl -s http://127.0.0.1:46320/admin/engine`（看 `refused` 欄位）；`nvidia-smi` | 關閉其他 GPU 程式；降低 `MAX_TOKENS`，或調低 `VRAM_RESERVE_GIB`（保留的 VRAM 越少，引擎可用越多，但接近 WDDM 把 GPU 記憶體換到系統 RAM 的臨界點）；`python3 tools/recommend_config.py` 取得建議 |
 | 權重缺失或載入失敗 | `ls -la hf/hub` | 重跑 `scripts/download-weights.sh`（會續傳） |
 | `/metrics` 沒有 `q27:tier_*` | 第 6.4 節的 `docker inspect` 指令 | `SPILL_RAM_GIB` 為 0 時分層關閉；確認 image 為本分支建置 |
 | SSD 層佔滿磁碟 | `docker volume inspect qwen3-27b-5090_kvcache --format '{{.Mountpoint}}'`；`curl -s .../metrics \| grep tier_ssd` | 引擎會自動刪除最舊的檔案（`SPILL_SSD_GIB` 上限、`SPILL_SSD_MIN_FREE_GIB` 保留）。要調整就改 `.env` 後 `scripts/serve.sh up` |

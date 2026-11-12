@@ -1,14 +1,15 @@
 """Start settings of the engine (the stats page, POST /admin/engine): the weights, KV cache type, speculative
-decoding, vision tower, number of sequences, context limit and VRAM budget an engine process starts with, and what
+decoding, vision tower, number of sequences, context limit and VRAM reserve an engine process starts with, and what
 each setting leaves for the context before the engine starts.
 
 The plans come from the engine's own memory planner (q27lib.Engine.plan: the pools of the engine's constructor for a
 device with the given free memory, without CUDA; a plan takes 10 to 80 ms), in a helper process: it sets the
-environment the engine reads (VISION, MAX_SEQS, VRAM_BUDGET_GIB, ...) for each plan, which the server's own process
+environment the engine reads (VISION, MAX_SEQS, VRAM_RESERVE_GIB, ...) for each plan, which the server's own process
 must not change while it starts engines (a spawned engine copies it).
 """
 
 import json
+import math
 import multiprocessing as mp
 import os
 import threading
@@ -19,10 +20,10 @@ from tokenizer import fingerprint
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
-MIN_BUDGET_GIB = 4.0
+DEFAULT_RESERVE_GIB = 1.5   # VRAM_RESERVE_GIB when unset (memory.cc budget_for)
 # The values the page shows a plan for, besides the current one.
 VARIANTS = {"max_seqs": tuple(range(1, MAX_SEQS + 1)), "max_tokens": (32768, 65536, 131072, 196608, 262144),
-            "vram_budget_gib": (None, 20.0, 22.0, 24.0, 26.0, 28.0)}  # (gdnfp4 needs about 19 GiB without a KV pool)
+            "vram_reserve_gib": (None, 0.5, 1.0, 2.0, 3.0, 4.0)}  # (None: the default, 1.5)
 LM_HEAD_ENV = os.environ.get("Q27_LM_HEAD_CKPT", "")  # (engine_target("quasar") sets it in this process)
 GiB = 1 << 30
 # Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
@@ -36,7 +37,7 @@ ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4", "KV_POOL_
                        "SPILL_RAM_GIB": "32", "SPILL_DIR": "/cache/kv"}
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
-             "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB"}
+             "max_tokens": "MAX_TOKENS", "vram_reserve_gib": "VRAM_RESERVE_GIB"}
 
 
 def spill_dir_default(platform=os.name, env=os.environ):
@@ -64,20 +65,17 @@ def set_engine_env(root):
 def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
-    budget = env("VRAM_BUDGET_GIB")
+    reserve = env("VRAM_RESERVE_GIB")
     return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
-            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
+            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": float(reserve) if reserve else None}
 
 
-def margin_gib():
-    return float(os.environ.get("WDDM_MARGIN_GIB", 0.6))
-
-
-def auto_budget(free, total):
-    """The engine's budget without VRAM_BUDGET_GIB (memory.cc budget_for), in bytes."""
-    used = (total - free) / GiB
-    return int(max(0.0, min(free / GiB - margin_gib(), 30.3 - used)) * GiB)
+def auto_budget(free, total=None, reserve=None):
+    """The engine's budget (memory.cc budget_for: free memory minus the reserve, `reserve` GiB or the default), in
+    bytes; without the legacy VRAM_BUDGET_GIB, which can only lower it."""
+    reserve = DEFAULT_RESERVE_GIB if reserve is None else reserve
+    return int(max(0.0, free / GiB - reserve) * GiB)
 
 
 def model_dir(weights):
@@ -92,7 +90,7 @@ class Launch:
     """The settings the next engine start uses (changed with a start, restart or save from the admin API; they last
     until the server restarts, which starts from the variables again) and their plans."""
 
-    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_budget_gib")
+    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_reserve_gib")
 
     def __init__(self, base, settings, tokenizer=None):
         self.base = base            # the rest of the engine's configuration (prefill chunk, scheduling, ...)
@@ -148,14 +146,13 @@ class Launch:
             v = s[k]
             if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
                 raise ValueError(f"{k}: an integer from {lo} to {hi}")
-        b = s["vram_budget_gib"]
+        b = s["vram_reserve_gib"]
         if b is not None:
-            if isinstance(b, bool) or not isinstance(b, (int, float)) or b < MIN_BUDGET_GIB:
-                raise ValueError(f"vram_budget_gib: null (automatic) or at least {MIN_BUDGET_GIB:g} GiB")
-            s["vram_budget_gib"] = round(float(b), 2)
-            if check_budget and device is not None and s["vram_budget_gib"] * GiB > auto_budget(*device) + GiB // 100:
-                raise ValueError(f"vram_budget_gib: at most the automatic budget, {auto_budget(*device) / GiB:.2f} GiB "
-                                 f"(free memory minus {margin_gib():g} GiB, at most 30.3 GiB for the process)")
+            if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or b < 0:
+                raise ValueError("vram_reserve_gib: null (the default, 1.5) or a number of GiB, 0 or more")
+            s["vram_reserve_gib"] = round(float(b), 2)
+            if check_budget and device is not None and s["vram_reserve_gib"] * GiB > device[1]:
+                raise ValueError(f"vram_reserve_gib: at most the device's memory, {device[1] / GiB:.2f} GiB")
         return s
 
     def config(self, s):
@@ -164,7 +161,7 @@ class Launch:
         draft = snapshot(*DFLASH2) if s["spec"] == "dflash2" else None
         eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
-               "VRAM_BUDGET_GIB": None if s["vram_budget_gib"] is None else f"{s['vram_budget_gib']:g}",
+               "VRAM_RESERVE_GIB": None if s["vram_reserve_gib"] is None else f"{s['vram_reserve_gib']:g}",
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
         return dict(self.base, model=str(path), weights=s["weights"], draft=str(draft) if draft else None,
                     max_tokens=s["max_tokens"], kv_dtype=s["kv_dtype"], max_seqs=s["max_seqs"],

@@ -128,7 +128,7 @@
 - **第一次**：不需要手動建立。按 **Apply** 或 **Open settings.ini** 時，托盤程式會自行建立 `settings.ini`。
 - 視窗分為三組（群組與欄位名稱即視窗上的文字，對應變數在括號內）：
   - **Server: changing these restarts it**（改動會重新啟動伺服器）：**Address**（`HOST`，預設 `127.0.0.1`）、**Port**（`PORT`，預設 `46320`）、**Weights folder (HF_HOME)**（權重的資料夾）。
-  - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM budget (GiB)**（`VRAM_BUDGET_GIB`）。
+  - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM reserve (GiB)**（`VRAM_RESERVE_GIB`：至少保留不用的 VRAM，預設 1.5；預算 = 可用 VRAM 減去它。保留給桌面與其他程式，並避免 Windows WDDM 把 GPU 記憶體換到系統 RAM 而使推論大幅變慢；調低可讓 KV 池更大，每 1 GiB 約多 58K tokens（NVFP4 KV，18 KiB/token），但有被換出的風險）。
   - **When it holds the VRAM**：**Load the engine**（`ENGINE_AUTOSTART`）、**Unload when idle (seconds)**（`ENGINE_IDLE_UNLOAD_S`，閒置多久後釋放 VRAM）、**Smallest KV pool (tokens)**（`MIN_KV_TOKENS`）。
 - 按鈕：**Browse...**（選擇權重資料夾）、**Open settings.ini**（用文字編輯器開啟檔案）、**Apply**（儲存並套用）、**Close**。
 - **Apply** 會先告訴你會發生什麼。若會中斷進行中的請求或清空前綴快取，會先詢問。
@@ -183,7 +183,7 @@ SPILL_TTL_DAYS=7
 | vision | `VISION` | `host`、`fp8`、`bf16`、`off` |
 | max_seqs | `MAX_SEQS` | 1 到 8 |
 | max_tokens | `MAX_TOKENS` | 2,048 到 262,144 |
-| vram_budget_gib | `VRAM_BUDGET_GIB` | 留空（自動）或 4 GiB 到自動預算 |
+| vram_reserve_gib | `VRAM_RESERVE_GIB` | 留空（預設 1.5 GiB）或 0 到裝置記憶體的 GiB 數 |
 
 對話框的按鈕：
 
@@ -215,7 +215,7 @@ SPILL_TTL_DAYS=7
 
 | 你看到的 | 原因與處理 |
 | --- | --- |
-| 提示文字是 `Not enough VRAM to load the model` | VRAM 不夠。關閉其他使用 GPU 的程式（遊戲、其他 AI 工具），或在 Settings 降低 `MAX_TOKENS`、設定 `VRAM_BUDGET_GIB`。 |
+| 提示文字是 `Not enough VRAM to load the model` | VRAM 不夠。關閉其他使用 GPU 的程式（遊戲、其他 AI 工具），或在 Settings 降低 `MAX_TOKENS`、調低 `VRAM_RESERVE_GIB`。 |
 | 視窗或記錄顯示 `Port 46320 is in use by another server.` | 46320 埠已被其他伺服器佔用（托盤程式不會啟動第二個）。在 Settings 改 **Port**，或先停止另一個伺服器。 |
 | Windows 跳出安全性警告 | 程式未簽章，README 說明 Windows 可能會警告。自行建置的 zip 沒有上游 Release 的 SHA-256 可比對，請確認是你自己建置的檔案。 |
 | `The weights could not be downloaded. The log has the reason.` | 下載失敗。看 **Show log**，中斷後重新啟動即可續傳。 |

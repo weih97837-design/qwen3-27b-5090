@@ -114,7 +114,8 @@ def request_meta(path, headers, body):
 
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
-                   "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS")
+                   "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS",
+                   "VRAM_RESERVE_GIB")
 DAY_S = 86400.0
 
 

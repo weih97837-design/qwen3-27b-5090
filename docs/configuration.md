@@ -27,7 +27,7 @@ What it takes for a setting to change depends on who reads it, and when:
 | At once | `ENGINE_IDLE_UNLOAD_S` | Stats page, `POST /admin/engine/idle` | The file |
 | At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS` | `POST /admin/concurrency` | The file |
 | At once | `target_seqs` | `POST /admin/concurrency` | Cannot be kept: there is no variable (`MAX_SEQS` is the upper limit that can) |
-| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
+| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
 | When the server restarts | Everything else, such as `HOST`, `PORT`, `HF_HOME`, `ENGINE_AUTOSTART`, `MIN_KV_TOKENS`, `MAX_TOKENS_FIT`, `STATE_HOST_CACHE`, `PREFILL_CHUNK` | Not possible | The file |
 
 - Restarting the engine reloads the weights, fails the requests in flight and empties the prefix cache. Restarting the
@@ -129,7 +129,7 @@ everywhere above.
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
 | `IMAGE_TOKENS` | 16384 | Image tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB) |
-| `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget and the margin kept free for the display driver. The budget is never above the automatic one (free − margin, at most 30.3 GiB for the process): beyond it the driver moves memory to system RAM without an error, about 7 times slower. A higher `VRAM_BUDGET_GIB` is lowered, with a line in the log |
+| `VRAM_RESERVE_GIB` | 1.5 | The minimum VRAM to keep unused, in GiB: the budget of the engine is the free VRAM minus this. It is for the desktop and other programs, and to stay below the point where Windows (WDDM) starts to page GPU memory to system RAM without an error, which slows inference about 7 times. 1.5 GiB is what the automatic budget was on an RTX 5090. Lowering it gives the KV pool more room (each 1 GiB is about 58K tokens of NVFP4 KV at 18 KiB per token) at the risk of that paging; a negative or unreadable value counts as 0. The log shows `reserve R GiB, budget B GiB`. The old `VRAM_BUDGET_GIB` (legacy, prefer `VRAM_RESERVE_GIB`) still works as an upper bound that can only lower the budget |
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
@@ -252,7 +252,7 @@ variables:
 | `vision` | `VISION` | `host`, `fp8`, `bf16`, `off` |
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
-| `vram_budget_gib` | `VRAM_BUDGET_GIB` | `null` (automatic) or 4 GiB up to the automatic budget |
+| `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.5 GiB) or a number of GiB from 0 up to the device's memory |
 
 Under every choice the page shows the longest context of one request and the KV pool all requests share if only that
 setting changed, and for the settings as chosen the device pools against the budget. These come from the engine's own
@@ -375,7 +375,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
-| Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
+| Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |
 

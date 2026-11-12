@@ -87,7 +87,7 @@ def load_draft(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--budget", type=float, default=30.3, help="VRAM budget of the engine process, GiB")
+    ap.add_argument("--budget", type=float, default=32 - 1.5, help="VRAM budget of the engine process, GiB (default: a 32 GiB card minus the 1.5 GiB VRAM_RESERVE_GIB)")
     ap.add_argument("--weights", choices=["nvidia", "allfp4"], default="nvidia")
     ap.add_argument("--kv", choices=["bf16", "fp8", "fp8k_nvfp4v", "nvfp4"], default="fp8")
     ap.add_argument("--gdn-state", choices=["fp32", "bf16", "fp16"], default="bf16")

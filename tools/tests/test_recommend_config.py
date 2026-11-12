@@ -47,8 +47,7 @@ def test_96_gib_gpu_pool_capped_but_budget_is_real():
     rec = rc.recommend(detected(vram_total_gib=96.0, vram_used_gib=0.5))
     assert rec["env"]["KV_POOL_TOKENS"] == "524288"  # still capped at POOL_CAP_TOKENS
     assert rec["env"]["MAX_TOKENS"] == "262144"
-    assert "預算 94.90 GiB" in rec["reasons"]["KV_POOL_TOKENS"]  # 96 - 0.5 - 0.6, no 30.3 cap
-    assert "上限" not in rec["reasons"]["KV_POOL_TOKENS"]
+    assert "預算 94.00 GiB" in rec["reasons"]["KV_POOL_TOKENS"]  # 96 - 0.5 - 1.5 reserve
 
 
 def test_wsl_hint_rounds_host_ram_before_reserve():
@@ -71,9 +70,15 @@ def test_spill_ram_is_clamped():
 
 def test_24_gib_gpu_lowers_pool_and_max_tokens_with_warning():
     rec = rc.recommend(detected(vram_total_gib=24.0, vram_used_gib=0.0))
-    assert rec["env"]["KV_POOL_TOKENS"] == "131072"  # 23.4 - 19.9 - 0.57 = 2.93 GiB -> 2 steps
-    assert rec["env"]["MAX_TOKENS"] == "131072"
+    assert rec["env"]["KV_POOL_TOKENS"] == "65536"  # 24 - 1.5 - 19.9 - 0.57 = 2.03 GiB -> 1 step
+    assert rec["env"]["MAX_TOKENS"] == "65536"
     assert any("262,144" in w for w in rec["warnings"])
+
+
+def test_budget_is_total_minus_used_minus_the_reserve():
+    rec = rc.recommend(detected(vram_total_gib=32.0, vram_used_gib=0.5))
+    assert f"預算 {32.0 - 0.5 - rc.VRAM_RESERVE_GIB:.2f} GiB" in rec["reasons"]["KV_POOL_TOKENS"]
+    assert rc.VRAM_RESERVE_GIB == 1.5
 
 
 def test_gpu_too_small_warns_and_never_emits_zero():
