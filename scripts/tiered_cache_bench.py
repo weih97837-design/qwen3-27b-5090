@@ -93,7 +93,7 @@ def set_env(size):
     os.environ["STATE_HOST_CACHE"] = os.environ.get("STATE_HOST_CACHE", "1")
     os.environ["SPILL_RAM_GIB"] = os.environ.get("SPILL_RAM_GIB", "40")
     os.environ["KV_POOL_TOKENS"] = str(size + size // 4 + 4096)
-    os.environ["CHECKPOINT_INTERVAL"] = str(2 * size)  # (only the explicit checkpoints)
+    os.environ["CHECKPOINT_INTERVAL"] = str(-(-2 * size // 64) * 64)  # (only the explicit checkpoints; a multiple of 64)
     os.environ["VRAM_BACKUP_IDLE_S"] = "0"
 
 
