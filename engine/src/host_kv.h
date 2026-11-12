@@ -4,8 +4,9 @@
 // An entry's KV bytes are one linear stream, slice-major: the page (slice sl, index i) of an n-page entry is at
 // byte (sl * n + i) * page_bytes. In host memory the stream is stored in segments (HostKv): either ONE pageable
 // segment (new char[total]), or segments carved out of the PinnedPool, each inside one slab and each a multiple of
-// page_bytes long, so no page ever straddles two segments. An entry is fully pinned or fully pageable, never a
-// mix. The file format is the same linear stream (spill_write / spill_load go segment by segment).
+// page_bytes long, so no page ever straddles two segments. One HostKv is fully pinned or fully pageable, but an entry
+// of the RAM tier is several (its tail and its shared chunks, spill.cc "RAM dedup"), each allocated on its own, so an
+// entry can be partly pinned and partly pageable. The file format is the same linear stream (spill_write / spill_load go segment by segment).
 #pragma once
 
 #include <algorithm>

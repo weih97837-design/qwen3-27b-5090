@@ -12,10 +12,14 @@
 //    is not a contiguous slice of it; copy_runs (host_kv.h) is called once per chunk with that chunk's pages.)
 //  * Key chain: key[0] = seed(fingerprint, chunk_pages); key[c] = H128(key[c - 1] || the token ids of chunk c). A
 //    chunk's KV depends on every token before it, and so does its key. 128 bits come from two independent 64-bit
-//    lanes; a hit is VERIFIED against the stored ids of that chunk, and the chain continues from the STORAGE key
-//    (which differs from the nominal one after a collision), so a collision can only cost a miss, never wrong KV.
-//  * Collisions: find() probes nominal, nominal + 1 (in b), ... until a key is absent (miss; that free key is where
-//    the new chunk goes) or holds the same ids (hit).
+//    lanes. A hit is VERIFIED, not trusted: the chunk's stored ids must equal the requested ones AND its parent (the
+//    previous chunk of the chain, by the store's unique serial `uid`, 0 for the first chunk) must be the chunk the walk
+//    just hit / registered. By induction a hit has the same ids in every chunk up to it, i.e. the same whole prefix, so
+//    a 128-bit collision can never give another prefix's KV (exact, not just "a miss").
+//  * Collisions: the store is a multimap keyed by the nominal key; chunks that collide simply coexist under one key and
+//    find() checks every candidate of that key (ids + parent uid). There is no probing, so removing a chunk never
+//    leaves a hole that hides another one. A chunk whose parent was freed and re-registered has a new uid and is a
+//    miss (never stale KV).
 //  * Refcounts are explicit: ref() / unref(), taken by the entries that list the chunk. A chunk with refs == 0 is an
 //    "orphan": it stays resident (so a deeper checkpoint that replaces its shallower predecessor re-finds it) until
 //    the owner reclaims it (extract). The store knows nothing of events or copies: `done` / `inflight` are the
@@ -27,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -98,9 +103,11 @@ inline Key128 chunk_next(const Key128& prev, const int32_t* ids, size_t n) {
 
 template <class Ev>
 struct Chunk {
-  Key128 skey;                // the key it is stored under (find's probing may have moved it off the nominal one)
+  Key128 key;                 // the nominal key it is registered under
+  uint64_t uid = 0;           // unique among all chunks the store ever registered (> 0)
+  uint64_t parent = 0;        // uid of the previous chunk of its chain (0: the first chunk)
   HostKv kv;                  // [kChunkPages-page layout]: slice-major within the chunk
-  std::vector<int32_t> ids;   // the chunk's tokens (verification of a hit)
+  std::vector<int32_t> ids;   // the chunk's tokens (verification of a hit, with `parent`)
   int refs = 0;               // entries that list it (+ an entry under construction)
   Ev done{};                  // owner's: the copy that last wrote / read kv (null: none)
   bool inflight = false;      // owner's: `done` may not have completed yet
@@ -112,31 +119,25 @@ class ChunkStore {
  public:
   using C = Chunk<Ev>;
 
-  // The chunk of nominal key `nominal` whose ids equal ids[0, n) (a hit), else nullptr. *skey: where it is / where a
-  // new one for this chain position goes.
-  C* find(Key128 nominal, const int32_t* ids, size_t n, Key128* skey) {
-    Key128 k = nominal;
-    for (;;) {
-      auto it = m_.find(k);
-      if (it == m_.end()) {
-        *skey = k;
-        return nullptr;
-      }
-      if (it->second.ids.size() == n && std::equal(ids, ids + n, it->second.ids.begin())) {
-        *skey = k;
+  // The chunk of nominal key `nominal` whose parent is `parent` (uid; 0 for the first chunk of a chain) and whose ids
+  // equal ids[0, n) (a hit), else nullptr. Every chunk registered under the key is a candidate (a collision).
+  C* find(const Key128& nominal, uint64_t parent, const int32_t* ids, size_t n) {
+    auto r = m_.equal_range(nominal);
+    for (auto it = r.first; it != r.second; ++it)
+      if (it->second.parent == parent && it->second.ids.size() == n && std::equal(ids, ids + n, it->second.ids.begin()))
         return &it->second;
-      }
-      k.b++;  // (a collision: the next probe)
-    }
+    return nullptr;
   }
 
   // Registers a new chunk (refs 0: an orphan until ref()) holding kv. Throws bad_alloc with nothing changed (kv stays
   // with the caller's HostKv only if the throw happens before the move: it is moved last).
-  C* add(const Key128& skey, const int32_t* ids, size_t n, HostKv&& kv) {
+  C* add(const Key128& key, uint64_t parent, const int32_t* ids, size_t n, HostKv&& kv) {
     C c;
-    c.skey = skey;
+    c.key = key;
+    c.parent = parent;
     c.ids.assign(ids, ids + n);
-    auto it = m_.emplace(skey, std::move(c)).first;  // (a node allocation: the only other throw)
+    auto it = m_.emplace(key, std::move(c));  // (a node allocation: the only other throw)
+    it->second.uid = ++next_uid_;
     it->second.kv = std::move(kv);
     bytes_ += it->second.kv.total;
     orphans_++;
@@ -155,10 +156,14 @@ class ChunkStore {
 
   // Removes the chunk (whatever its refs) and returns it: its HostKv is the caller's to free or park.
   C extract(C* c) {
+    auto r = m_.equal_range(c->key);
+    auto it = r.first;
+    while (it != r.second && &it->second != c) ++it;
+    if (it == r.second) return C{};  // (not registered: nothing to do)
     if (c->refs <= 0) orphans_--;
     bytes_ -= c->kv.total;
-    C out = std::move(*c);
-    m_.erase(out.skey);
+    C out = std::move(it->second);
+    m_.erase(it);
     return out;
   }
 
@@ -182,21 +187,28 @@ class ChunkStore {
   size_t orphan_count() const { return orphans_; }
 
  private:
-  std::map<Key128, C> m_;  // (node-based: a chunk never moves while it is registered)
+  std::multimap<Key128, C> m_;  // (node-based: a chunk never moves while it is registered)
   size_t bytes_ = 0, orphans_ = 0;
+  uint64_t next_uid_ = 0;  // (never reused, not even after clear())
 };
 
-// The key chain of the n_full chunks of ids (chunk_tokens each): fn(c, hit, skey, ids_of_chunk) per chunk, hit being the
-// verified resident chunk or nullptr; false from fn stops. A miss continues from the key it would be stored under.
+// Marks "the chain has no resident chunk here": a miss's children cannot hit (their parent does not exist).
+inline constexpr uint64_t kNoParent = ~uint64_t(0);
+
+// The key chain of the n_full chunks of ids (chunk_tokens each): fn(c, hit, key, parent_uid, ids_of_chunk) per chunk, hit
+// being the verified resident chunk or nullptr. fn returns the chunk now at that position (the hit, or one it
+// registered) or nullptr (a dry run): the next position's parent is that chunk, and after nullptr no later chunk can hit.
 template <class Store, class Fn>
 void chunk_walk(Store& st, Key128 seed, const int32_t* ids, size_t n_full, size_t chunk_tokens, Fn&& fn) {
   Key128 prev = seed;
+  uint64_t parent = 0;
   for (size_t c = 0; c < n_full; c++) {
     const int32_t* p = ids + c * chunk_tokens;
-    Key128 skey;
-    auto* hit = st.find(chunk_next(prev, p, chunk_tokens), p, chunk_tokens, &skey);
-    if (!fn(c, hit, skey, p)) return;
-    prev = skey;
+    const Key128 key = chunk_next(prev, p, chunk_tokens);
+    auto* hit = parent == kNoParent ? nullptr : st.find(key, parent, p, chunk_tokens);
+    auto* cur = fn(c, hit, key, parent, p);
+    parent = cur ? cur->uid : kNoParent;
+    prev = key;
   }
 }
 
@@ -205,10 +217,11 @@ template <class Store>
 size_t chunk_missing_bytes(Store& st, Key128 seed, const int32_t* ids, size_t n_full, size_t chunk_tokens,
                            size_t chunk_bytes) {
   size_t miss = 0;
-  chunk_walk(st, seed, ids, n_full, chunk_tokens, [&](size_t, auto* hit, const Key128&, const int32_t*) {
-    if (!hit) miss += chunk_bytes;
-    return true;
-  });
+  chunk_walk(st, seed, ids, n_full, chunk_tokens,
+             [&](size_t, typename Store::C* hit, const Key128&, uint64_t, const int32_t*) -> typename Store::C* {
+               if (!hit) miss += chunk_bytes;
+               return hit;
+             });
   return miss;
 }
 
@@ -222,16 +235,44 @@ void chunk_acquire(Store& st, Key128 seed, const int32_t* ids, size_t n_full, si
                    std::vector<std::pair<size_t, typename Store::C*>>& fresh) {
   refd.reserve(refd.size() + n_full);
   fresh.reserve(fresh.size() + n_full);
-  chunk_walk(st, seed, ids, n_full, chunk_tokens, [&](size_t c, auto* hit, const Key128& skey, const int32_t* p) {
-    if (!hit) {
-      HostKv kv = alloc(chunk_bytes);
-      hit = st.add(skey, p, chunk_tokens, std::move(kv));
-      fresh.emplace_back(c, hit);  // (reserved: no throw from here)
+  chunk_walk(st, seed, ids, n_full, chunk_tokens,
+             [&](size_t c, typename Store::C* hit, const Key128& key, uint64_t parent,
+                 const int32_t* p) -> typename Store::C* {
+               if (!hit) {
+                 HostKv kv = alloc(chunk_bytes);
+                 hit = st.add(key, parent, p, chunk_tokens, std::move(kv));
+                 fresh.emplace_back(c, hit);  // (reserved: no throw from here)
+               }
+               st.ref(hit);
+               refd.push_back(hit);
+               return hit;
+             });
+}
+
+// Frees a chunk that reached 0 refs, WITHOUT waiting for its copy (spill.cc invariant (I)). An inflight chunk (a copy that
+// fills or reads it may still run) is parked in `retired` (a vector of {HostKv kv; Ev done; bool async}) with its own
+// event, async = true, and the owner's reap frees it once the event completed. The capacity is reserved before the chunk
+// leaves the store; if that fails (bad_alloc) the only way left is wait(chunk), the old synchronous fallback. A chunk
+// that is not inflight is extracted and its memory goes back at once; put_event(done) recycles its (complete) event.
+template <class Store, class Retired, class Wait, class PutEvent>
+void chunk_free(Store& st, typename Store::C* c, std::vector<Retired>& retired, Wait&& wait, PutEvent&& put_event) {
+  if (c->inflight) {
+    bool reserved = true;
+    try {
+      retired.reserve(retired.size() + 1);
+    } catch (const std::bad_alloc&) {
+      reserved = false;
     }
-    st.ref(hit);
-    refd.push_back(hit);
-    return true;
-  });
+    if (reserved) {
+      typename Store::C out = st.extract(c);
+      retired.push_back(Retired{std::move(out.kv), out.done, true});  // (reserved: no throw)
+      return;
+    }
+    wait(c);
+    c->inflight = false;
+  }
+  typename Store::C out = st.extract(c);
+  put_event(out.done);  // (complete: not inflight)
 }
 
 // The entry's linear slice-major stream (the .q27kv payload: page i of slice sl at (sl * n + i) * page_bytes, n =
@@ -252,10 +293,12 @@ void linear_pieces(const std::vector<C*>& chunks, const HostKv& tail, int slices
 
 // Which entry spill_enforce_ram evicts: the one that frees the most host memory, the least recently used among those
 // within a factor 2 of the best (so an entry whose chunks are shared with others, which frees almost nothing, is kept
-// in favour of one that gives real memory back, without always sacrificing the newest big entry).
+// in favour of one that gives real memory back, without always sacrificing the newest big entry). `state`: the part of
+// `freed` that is the recurrent state alone (an entry whose KV is shared or pinned frees only that).
 struct VictimCand {
   uint64_t last_use = 0;
   size_t freed = 0;
+  size_t state = 0;
 };
 inline int pick_victim(const std::vector<VictimCand>& v) {
   size_t best = 0;
@@ -264,6 +307,28 @@ inline int pick_victim(const std::vector<VictimCand>& v) {
   for (size_t i = 0; i < v.size(); i++)
     if (v[i].freed * 2 >= best && (pick < 0 || v[i].last_use < v[size_t(pick)].last_use)) pick = int(i);
   return pick;
+}
+
+// The two classes of victims of spill_enforce_ram: pass 0 the idle backups (their checkpoint is still in the pool, so
+// dropping one loses nothing and writes nothing), pass 1 the sole copies (written to the SSD, or dropped). Pass 0 goes
+// first (pick_victim inside it: most bytes freed first), EXCEPT when the best backup frees nothing beyond its state
+// while the best sole copy frees at least 4x as much: then the sole copy goes (it lands on the SSD), instead of
+// sacrificing backups one by one for the state bytes only. Every call removes one candidate from memory, so the loop
+// that calls it ends.
+struct VictimChoice {
+  int pass = -1;  // 0 / 1; -1: no candidate
+  int idx = -1;
+};
+inline VictimChoice choose_victim(const std::vector<VictimCand>& backups, const std::vector<VictimCand>& sole) {
+  const int k0 = pick_victim(backups), k1 = pick_victim(sole);
+  if (k0 >= 0) {
+    const VictimCand& b = backups[size_t(k0)];
+    size_t best_sole = 0;
+    for (const VictimCand& c : sole) best_sole = std::max(best_sole, c.freed);
+    if (k1 >= 0 && b.freed <= b.state && best_sole > 0 && best_sole >= 4 * b.freed) return {1, k1};
+    return {0, k0};
+  }
+  return k1 >= 0 ? VictimChoice{1, k1} : VictimChoice{};
 }
 
 }  // namespace q27
