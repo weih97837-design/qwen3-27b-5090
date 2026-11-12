@@ -115,7 +115,7 @@ def request_meta(path, headers, body):
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
                    "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS",
-                   "VRAM_RESERVE_GIB")
+                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "VRAM_BACKUP_IDLE_S")
 DAY_S = 86400.0
 
 
@@ -262,6 +262,7 @@ class Hub:
         self.log_n = 0
         self.engine_state = "loading"
         self.device = None                  # (free at the start, total) of the last engine (cudaMemGetInfo)
+        self.deploy_env = None              # the variables the engine was started with (server.py: Launch.config's env)
         self.engine_idle = None             # the unload when idle: EngineClient.idle_state
         self.ready_t = None                 # when the engine became ready
         self.engine_overhead = None         # NVML used beyond the engine's allocations, soon after it became ready
@@ -517,7 +518,15 @@ class Hub:
                     "slots": snap.get("slots", []) if snap else [],
                     "tiers": snap.get("tiers") if snap else None,
                     "host": host_info(self.started),
-                    "deploy": deploy_info(self.started, self.engine_state)}
+                    "deploy": deploy_info(self.started, self.engine_state, self.deploy_environ())}
+
+    def deploy_environ(self):
+        """The server's environment with the engine's start settings over it (they change from the page or the tray)."""
+        try:
+            applied = self.deploy_env() if self.deploy_env else {}
+        except Exception:  # noqa: BLE001 - the stats must not fail over a setting
+            applied = {}
+        return dict(os.environ, **{k: v for k, v in applied.items() if v is not None})
 
     def init(self):
         with self.lock:

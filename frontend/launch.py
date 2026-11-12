@@ -12,6 +12,8 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
+import sys
 import threading
 
 from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
@@ -35,9 +37,28 @@ GiB = 1 << 30
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
 ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4", "KV_POOL_TOKENS": "524288",
                        "SPILL_RAM_GIB": "64", "SPILL_DIR": "/cache/kv"}
+# The tiered cache settings (docs/tiered-cache.md): key -> (variable, default, kind). They are start settings like the
+# rest: the engine process reads the engine's (SPILL_RAM_GIB, SPILL_PINNED_GIB, SPILL_ASYNC_*) and worker.TierPolicy
+# the policy's (retention, SSD cap and free space, TTL, VRAM backup) from its environment when it loads, so a change
+# takes effect with an engine restart. The defaults are those of compose.yaml and TierPolicy (tests/test_launch.py).
+# kind: "num" (a number, 0 or more; no upper limit: the machine decides), "flag" (0 or 1) or "path".
+TIER_SETTINGS = {
+    "spill_ram_gib": ("SPILL_RAM_GIB", 64, "num"),                # 0: no tiered cache at all
+    "spill_ram_retention_s": ("SPILL_RAM_RETENTION_S", 3600, "num"),
+    "spill_ssd_gib": ("SPILL_SSD_GIB", 100, "num"),
+    "spill_ssd_min_free_gib": ("SPILL_SSD_MIN_FREE_GIB", 10, "num"),
+    "spill_ttl_days": ("SPILL_TTL_DAYS", 7, "num"),
+    "vram_backup_idle_s": ("VRAM_BACKUP_IDLE_S", 60, "num"),
+    "spill_pinned_gib": ("SPILL_PINNED_GIB", 0, "num"),
+    "spill_async_io": ("SPILL_ASYNC_IO", False, "flag"),
+    "spill_async_promote": ("SPILL_ASYNC_PROMOTE", False, "flag"),
+    "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
+}
+TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
-             "max_tokens": "MAX_TOKENS", "vram_reserve_gib": "VRAM_RESERVE_GIB"}
+             "max_tokens": "MAX_TOKENS", "vram_reserve_gib": "VRAM_RESERVE_GIB",
+             **{k: v[0] for k, v in TIER_SETTINGS.items()}}
 
 
 def spill_dir_default(platform=os.name, env=os.environ):
@@ -62,11 +83,48 @@ def set_engine_env(root):
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
 
 
+def tier_number(value):
+    """A tier setting's number as stored: an int when it has no fraction, else rounded to 3 places."""
+    v = round(float(value), 3)
+    return int(v) if v == int(v) else v
+
+
+def tier_env_value(key, value):
+    """A tier setting as its variable has it ("1" / "0" for a flag)."""
+    return ("1" if value else "0") if TIER_SETTINGS[key][2] == "flag" else str(value)
+
+
+def atoi(text):
+    """C's atoi: leading white space, an optional sign, then the digits ("1.0" is 1, "true" and "" are 0)."""
+    m = re.match(r"[ \t\n\v\f\r]*([+-]?)([0-9]+)", text)
+    return 0 if not m else (-1 if m.group(1) == "-" else 1) * int(m.group(2))
+
+
+def parse_tier(key, text, warn=None):
+    """The tier setting `key` from the text of its variable (unset or empty: the default). A text TierPolicy or the
+    engine would refuse (not a number, or negative) gives the default, with a warning."""
+    var, default, kind = TIER_SETTINGS[key]
+    if kind == "path":
+        return spill_dir_default() if text is None else text
+    if text is None or not text.strip():
+        return default
+    if kind == "flag":
+        return atoi(text) != 0  # (capi.cc: atoi(value) != 0)
+    try:
+        v = float(text)
+        if math.isfinite(v) and v >= 0:
+            return tier_number(v)
+    except ValueError:
+        pass
+    (warn or (lambda m: print(m, file=sys.stderr, flush=True)))(f"{var}={text!r} is not a number of 0 or more: using {default}")
+    return default
+
+
 def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     reserve = env("VRAM_RESERVE_GIB")
-    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
+    return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": parse_reserve(reserve)}
 
@@ -101,7 +159,7 @@ class Launch:
     """The settings the next engine start uses (changed with a start, restart or save from the admin API; they last
     until the server restarts, which starts from the variables again) and their plans."""
 
-    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_reserve_gib")
+    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_reserve_gib", *TIER_SETTINGS)
 
     def __init__(self, base, settings, tokenizer=None):
         self.base = base            # the rest of the engine's configuration (prefill chunk, scheduling, ...)
@@ -135,12 +193,15 @@ class Launch:
 
     def env_changes(self):
         """{variable: value} that would start the server with the settings changed since it started ("": automatic)."""
-        return {ENV_NAMES[k]: "" if self.settings[k] is None else str(self.settings[k])
+        return {ENV_NAMES[k]: tier_env_value(k, self.settings[k]) if k in TIER_SETTINGS
+                else "" if self.settings[k] is None else str(self.settings[k])
                 for k in self.KEYS if self.settings[k] != self.at_start[k]}
 
     def validate(self, changes, base=None, device=None, check_budget=True):
         """The settings with `changes` applied; ValueError names a bad one."""
         s = dict(base or getattr(self, "settings", {}), **changes)
+        for k, (_, default, kind) in TIER_SETTINGS.items():  # (settings made without the tier ones: the defaults)
+            s.setdefault(k, spill_dir_default() if kind == "path" else default)
         unknown = set(changes) - set(self.KEYS)
         if unknown:
             raise ValueError(f"unknown setting {sorted(unknown)[0]!r} (settings: {', '.join(self.KEYS)})")
@@ -164,6 +225,19 @@ class Launch:
             s["vram_reserve_gib"] = round(float(b), 2)
             if check_budget and device is not None and s["vram_reserve_gib"] * GiB > device[1]:
                 raise ValueError(f"vram_reserve_gib: at most the device's memory, {device[1] / GiB:.2f} GiB")
+        for k, (_, _, kind) in TIER_SETTINGS.items():
+            v = s[k]
+            if kind == "num":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                    raise ValueError(f"{k}: a number, 0 or more")
+                s[k] = tier_number(v)
+            elif kind == "flag":
+                if not isinstance(v, bool):
+                    raise ValueError(f"{k}: true or false")
+            elif not isinstance(v, str) or "\0" in v or len(v) > 4096 or v.strip() != v:
+                raise ValueError(f"{k}: a folder path, without spaces around it (empty: no SSD tier)")
+            elif check_budget and v and os.path.exists(v) and not os.path.isdir(v):  # (not for the server's own start)
+                raise ValueError(f"{k}: {v!r} is a file, not a folder")
         return s
 
     def config(self, s):
@@ -175,6 +249,8 @@ class Launch:
                "VRAM_RESERVE_GIB": None if s["vram_reserve_gib"] is None else f"{s['vram_reserve_gib']:g}",
                # (a legacy VRAM_BUDGET_GIB inherited from settings.ini would cap the budget unseen: the reserve rules)
                "VRAM_BUDGET_GIB": None,
+               # (the tiered cache: the engine and worker.TierPolicy read these when the engine process loads)
+               **{TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS},
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
         return dict(self.base, model=str(path), weights=s["weights"], draft=str(draft) if draft else None,
                     max_tokens=s["max_tokens"], kv_dtype=s["kv_dtype"], max_seqs=s["max_seqs"],
@@ -196,7 +272,8 @@ class Launch:
                     out[i] = {"error": str(e)}
                     continue
                 job = {"model": cfg["model"], "draft": cfg["draft"], "max_tokens": s["max_tokens"],
-                       "prefill_chunk": cfg["prefill_chunk"], "kv_dtype": s["kv_dtype"], "env": cfg["env"],
+                       "prefill_chunk": cfg["prefill_chunk"], "kv_dtype": s["kv_dtype"],
+                       "env": {k: v for k, v in cfg["env"].items() if k not in TIER_ENV},  # (no pool depends on them)
                        "free": free, "total": total}
                 key = json.dumps(job, sort_keys=True)
                 if key in self.plans_cache:

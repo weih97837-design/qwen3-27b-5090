@@ -126,17 +126,18 @@
 選單的 **Settings...** 會編輯資料夾內的 `settings.ini`，不需要開瀏覽器。
 
 - **第一次**：不需要手動建立。按 **Apply** 或 **Open settings.ini** 時，托盤程式會自行建立 `settings.ini`。
-- 視窗分為三組（群組與欄位名稱即視窗上的文字，對應變數在括號內）：
+- 視窗分為四組（群組與欄位名稱即視窗上的文字，對應變數在括號內）：
   - **Server: changing these restarts it**（改動會重新啟動伺服器）：**Address**（`HOST`，預設 `127.0.0.1`）、**Port**（`PORT`，預設 `46320`）、**Weights folder (HF_HOME)**（權重的資料夾）。
   - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM reserve (GiB)**（`VRAM_RESERVE_GIB`：至少保留不用的 VRAM，預設 1.5；預算 = 可用 VRAM 減去它。保留給桌面與其他程式，並避免 Windows WDDM 把 GPU 記憶體換到系統 RAM 而使推論大幅變慢；調低可讓 KV 池更大，每 1 GiB 約多 58K tokens（NVFP4 KV，18 KiB/token），但有被換出的風險）。
   - **When it holds the VRAM**：**Load the engine**（`ENGINE_AUTOSTART`）、**Unload when idle (seconds)**（`ENGINE_IDLE_UNLOAD_S`，閒置多久後釋放 VRAM）、**Smallest KV pool (tokens)**（`MIN_KV_TOKENS`）。
+  - **Tiered cache (RAM and SSD): changing these reloads the engine**：**RAM tier (GiB)**（`SPILL_RAM_GIB`，`0` 關閉分層快取）、**RAM retention (seconds)**（`SPILL_RAM_RETENTION_S`）、**SSD cap (GiB)**（`SPILL_SSD_GIB`）、**SSD minimum free (GiB)**（`SPILL_SSD_MIN_FREE_GIB`）、**File lifetime (days)**（`SPILL_TTL_DAYS`）、**VRAM backup idle (seconds)**（`VRAM_BACKUP_IDLE_S`）、**Pinned RAM (GiB)**（`SPILL_PINNED_GIB`）、**Asynchronous copies**（`SPILL_ASYNC_IO`）、**Delay hits (async restore)**（`SPILL_ASYNC_PROMOTE`）、**SSD folder**（`SPILL_DIR`，留空表示只用 RAM）。數值必須是 0 或以上的數字，大小沒有人為上限。
 - 按鈕：**Browse...**（選擇權重資料夾）、**Open settings.ini**（用文字編輯器開啟檔案）、**Apply**（儲存並套用）、**Close**。
 - **Apply** 會先告訴你會發生什麼。若會中斷進行中的請求或清空前綴快取，會先詢問。
   - **Apply 會重新啟動伺服器的情況**：只有 **Server: changing these restarts it** 群組（Address、Port、Weights folder）有變動、且伺服器執行中時，Apply 會重新啟動伺服器（訊息 `Saved. The server is restarting.`）。
-  - **Engine 群組**（Weights、KV cache type 等）的變動：引擎已載入時會重新載入引擎（會中斷進行中的請求並清空前綴快取，所以會先詢問）；未載入時於下次載入時生效。
+  - **Engine 與 Tiered cache 群組**（Weights、KV cache type、RAM tier 等）的變動：引擎已載入時會重新載入引擎（會中斷進行中的請求並清空前綴快取，所以會先詢問）；未載入時於下次載入時生效。
   - **`[env]` 區段的變數不在這個視窗中**，按 Apply 不會重新啟動伺服器，見第 4a 節。
 
-**注意**：分層快取的設定（`SPILL_*`）不在視窗的欄位中。要改它們，按 **Open settings.ini** 直接編輯 `[env]` 區段，參見 `docs/tiered-cache.md`。
+**注意**：分層快取的主要設定（`SPILL_*`、`VRAM_BACKUP_IDLE_S`）在 **Tiered cache** 群組，按 **Apply** 會寫入 `settings.ini` 並重新載入引擎（引擎未載入時，下次載入才生效）。其餘的（例如 `SPILL_TICK_S`）仍要按 **Open settings.ini** 直接編輯 `[env]` 區段，參見 `docs/tiered-cache.md`。
 
 **要讓其他程式連線**，`Address` 維持 `127.0.0.1` 即可（同一台電腦上的用戶端）。
 
@@ -144,7 +145,7 @@
 
 ## 4a. 調整分層快取與上下文池
 
-分層快取（RAM 與 SSD）與上下文池的設定不在設定視窗的欄位中。直接在 `settings.ini` 的 `[env]` 區段加入變數即可，**任何環境變數名稱都可以**（名稱不分大小寫）。`settings.ini` 的值優先於程式的環境變數。
+分層快取（RAM 與 SSD）的主要設定已在設定視窗的 **Tiered cache** 群組（見第 4 節），也可在 /ui 的 Start settings 修改；上下文池（`KV_POOL_TOKENS`）與其他變數不在視窗的欄位中。直接在 `settings.ini` 的 `[env]` 區段加入變數即可，**任何環境變數名稱都可以**（名稱不分大小寫）。`settings.ini` 的值優先於程式的環境變數。
 
 ```ini
 [env]
@@ -158,7 +159,7 @@ SPILL_TTL_DAYS=7
 ```
 
 - **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
-- **生效方式**：`[env]` 的變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
+- **生效方式**：視窗沒有欄位的 `[env]` 變數，變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
 ---
