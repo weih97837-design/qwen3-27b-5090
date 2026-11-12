@@ -410,7 +410,7 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
     for k in [k for k in env if k.startswith("SPILL_") or k in CACHE_VARS]:
         del env[k]
     env["KV_POOL_TOKENS"] = str(pool)
-    env["CHECKPOINT_INTERVAL"] = str(2 * max_tokens)  # (no interval checkpoints: only the explicit ones)
+    env["CHECKPOINT_INTERVAL"] = str(-(-2 * max_tokens // 64) * 64)  # (no interval checkpoints: only the explicit ones; the engine needs a multiple of 64)
     if mode == "ref":
         env["STATE_HOST_CACHE"] = "0"
     else:
