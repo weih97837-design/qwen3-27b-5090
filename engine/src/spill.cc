@@ -313,7 +313,7 @@ bool Model::spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const {
 // spill_subsumed). The deeper one resumes everything c would, except a retry that branches off before c's end. Not
 // loading ones: they are not usable yet.
 bool Model::ckpt_covered(const Checkpoint& c) const {
-  if (c.pos() <= kKeepShort) return false;
+  if (c.pos() <= kKeepShort || c.share_until > use_clock_) return false;  // (a sibling-share one: its waiter has not used it)
   const Checkpoint* deepest = nullptr;
   for (const auto& o : ckpts_)
     if (&o != &c && !o.loading && o.ids.size() > c.ids.size() && covers(o.ids, o.ring, c.ids, c.ring) &&
@@ -413,6 +413,9 @@ int Model::spill_backup_one(int victims) {
   // backup): only among the first `victims` of those in the order evict_checkpoint takes them (not held, then the ones
   // a deeper checkpoint covers (never needing a copy: subsumed), then least recently used), so the RAM tier holds
   // copies of what is about to leave the pool, not of everything. victims <= 0 (the stop flush): all of them.
+  // (Page-pressure eviction, evict_checkpoint without for_slot, is plain LRU; this order puts covered ones first. The two
+  // nearly agree all the same: a covered checkpoint is mostly skipped below as subsumed, never needing a copy, so the
+  // ranking among the rest is LRU in both.)
   std::vector<Checkpoint*> order;
   for (auto& c : ckpts_)
     if (!c.loading) order.push_back(&c);  // (C) a loading one's pages are still being filled

@@ -234,6 +234,10 @@ class Model {
   // uncut prefill bit for bit, prefix_begin); the caller also keeps it more than 64 before the end of that prompt
   // (the engine does not know it). True also when it is planned already; false, with nothing changed, when it cannot be.
   bool add_checkpoint_at(int a, int pos);
+  // Marks pos (rounded down to 64) as a position a waiting request shares (add_checkpoint_at does it itself; the frontend
+  // calls this for one it put in the plan of a request that has not begun). The checkpoint saved there next is kept from
+  // the covered-first eviction until a prefix_begin uses it or kShareTtl further uses of the cache have passed.
+  void share_mark(int pos);
 
   // Batched speculative steps (P6-10). One step of each of n (2..4) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
@@ -447,6 +451,10 @@ class Model {
   bool spill_sync_lookup_ = true;
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
   uint64_t use_clock_ = 0;
+  struct ShareMark { int pos; uint64_t until; };
+  std::vector<ShareMark> share_marks_;  // positions planned for a waiting sibling, not saved yet (share_mark)
+  static constexpr uint64_t kShareTtl = 512;  // (use_clock_ ticks: saves and lookups)
+  bool share_take(int pos);  // erases the live mark at pos (and the expired ones); whether there was one
   CacheStats cstats_;
   std::map<uint64_t, Spilled> spill_;  // (a map: entries stay put while others come and go)
   uint64_t spill_next_ = 1;

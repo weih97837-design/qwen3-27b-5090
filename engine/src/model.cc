@@ -686,6 +686,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   for (auto& c : ckpts_)
     if (!c.loading && c.pos() == pos && c.ring >= ring && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
       c.last_use = ++use_clock_;
+      if (share_take(pos)) c.share_until = use_clock_ + kShareTtl;
       return;
     }
   // A free allocated slot; else allocate another one; else evict the least recently used checkpoint.
@@ -703,6 +704,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   ck.slot = slot;
   ck.ring = ring;
   ck.last_use = ++use_clock_;
+  if (share_take(pos)) ck.share_until = use_clock_ + kShareTtl;
   slot_used_[slot] = true;
   // State -> staging (device, fast) -> host slot on the copy stream, overlapping what follows.
   Q27_CUDA(cudaStreamWaitEvent(s_, stage_ev_));
@@ -734,6 +736,9 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     const_cast<Checkpoint*>(best)->held = false;  // (its owner is here)
+    // The shared checkpoints on this chain have served their waiter (a later one, deeper, is the match now).
+    for (auto& c : ckpts_)
+      if (c.share_until && c.pos() <= cached && std::equal(c.ids.begin(), c.ids.end(), ids)) c.share_until = 0;
     // The state from its host slot (after its device -> host copy), before anything can evict it.
     Q27_CUDA(cudaStreamSynchronize(cs_));
     const char* src = slot_mem_[best->slot];
@@ -2074,7 +2079,29 @@ bool Model::add_checkpoint_at(int a, int pos) {
   // must lie past the last skipped row, or the checkpoint would claim a ring with a hole (prompt_chunks).
   if (draft_ && p - ddims::kWindow < ring_from) return false;
   plan->insert(std::upper_bound(plan->begin(), plan->end(), p), p);
+  share_mark(p);
   return true;
+}
+
+void Model::share_mark(int pos) {
+  const int p = pos / kGdnChunk * kGdnChunk;
+  for (auto& m : share_marks_)
+    if (m.pos == p) {
+      m.until = use_clock_ + kShareTtl;
+      return;
+    }
+  if (share_marks_.size() >= 16) share_marks_.erase(share_marks_.begin());
+  share_marks_.push_back({p, use_clock_ + kShareTtl});
+}
+
+bool Model::share_take(int pos) {
+  bool found = false;
+  for (size_t i = 0; i < share_marks_.size();) {
+    if (share_marks_[i].until <= use_clock_) share_marks_.erase(share_marks_.begin() + i);
+    else if (share_marks_[i].pos == pos) found = true, share_marks_.erase(share_marks_.begin() + i);
+    else i++;
+  }
+  return found;
 }
 
 void Model::seq_suspend(int a) {

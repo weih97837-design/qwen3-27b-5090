@@ -182,3 +182,59 @@ def test_error_still_saves_nothing():
     s.cur = o
     s.finish(o, "error", save=False, notify=False)
     assert eng.checkpoints == 0
+
+
+def test_unstarted_sibling_share_is_marked_in_the_engine():
+    eng = Eng()
+    marks = []
+    eng.share_mark = marks.append
+    s = sched(eng)
+    s.alive.append(worker.Seq("o", req(prompt([5] * 300)), 0.0))
+    s.submit("n", req(prompt([6] * 300)))
+    assert marks == [s.by_id["n"].share_len]
+
+
+def test_waiter_of_a_preempted_sibling_does_not_stall():
+    eng = Eng()
+    s = sched(eng)
+    o = worker.Seq("o", req(prompt([5] * 300)), 0.0)
+    s.alive.append(o)
+    s.submit("n", req(prompt([6] * 300)))
+    n = s.by_id["n"]
+    s.alive.append(n)
+    assert not s.can_prefill(n)
+    s.alive.remove(o)  # (o was preempted back into the waiting queue, where the full slots keep it)
+    s.waiting.appendleft(o)
+    assert s.can_prefill(n) and n.share_with is None and n.share_len == 0
+
+
+def test_next_candidate_is_tried_when_the_engine_refuses_the_longest():
+    class E(Eng):
+        def add_checkpoint_at(self, area, pos):
+            self.calls.append((area, pos))
+            return area == 3
+
+    eng = E()
+    s = sched(eng)
+    started_sibling(s, prompt([5] * 300, shared=1500), fed=128, area=2)  # (shares 1472 tokens: the longer one)
+    b = started_sibling(s, prompt([5] * 300), fed=128, area=3)  # (shares 960)
+    s.submit("n", req(prompt([6] * 300, shared=1500)))
+    n = s.by_id["n"]
+    assert eng.calls == [(2, 1472), (3, 960)]
+    assert n.share_with is b and n.share_len == 960 and n.reusable == 960
+
+
+def test_old_library_without_optional_symbols_still_loads(monkeypatch):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "engine" / "python"))
+    import q27lib
+
+    class Old:
+        @staticmethod
+        def q27_last_error():  # (the only entry point this "older build" has)
+            return b""
+
+    monkeypatch.setattr(q27lib, "_lib", None)
+    monkeypatch.setattr(q27lib.ctypes, "CDLL", lambda path: Old())
+    assert q27lib.lib() is not None
+    assert "q27_share_mark" in q27lib.SIGNATURES and not hasattr(q27lib.lib(), "q27_share_mark")
+    monkeypatch.setattr(q27lib, "_lib", None)

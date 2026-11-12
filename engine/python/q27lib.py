@@ -29,6 +29,7 @@ SIGNATURES = {
     "q27_seq_swap": ([P, I], I),
     "q27_seq_drop": ([P, I], I),
     "q27_add_checkpoint_at": ([P, I, I, P], I),
+    "q27_share_mark": ([P, I], I),
     "q27_seq_suspend": ([P, I], I),
     "q27_has_draft": ([P], I),
     "q27_max_lanes": ([P], I),
@@ -383,6 +384,12 @@ class Engine:
         ok = ctypes.c_int()
         self._check(lib().q27_add_checkpoint_at(self.h, area, pos, ctypes.byref(ok)), "q27_add_checkpoint_at")
         return bool(ok.value)
+
+    def share_mark(self, pos):
+        """Tells the engine a waiting request shares the checkpoint at pos (rounded down to 64): it is kept from the
+        covered-first eviction until that request has used it. A no-op with an older library."""
+        if hasattr(lib(), "q27_share_mark"):
+            self._check(lib().q27_share_mark(self.h, pos), "q27_share_mark")
 
     def seq_drop(self, area):
         """Gives the pages of the sequence parked in `area` back."""

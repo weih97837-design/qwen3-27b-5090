@@ -353,21 +353,30 @@ class Scheduler:
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
         p = array.array("i", s.prompt).tobytes()
+        cands = []
         for o in list(self.alive) + list(self.waiting):
             n = lcp_bytes(p, array.array("i", o.eng_ids).tobytes())
             n = min(n, len(s.prompt) - 1) // 64 * 64
-            if n > max(s.reusable, s.share_len) + SHARE_MIN and not (o.started and o.fed >= n):
-                s.share_with, s.share_len = o, n
-        if s.share_with is not None:
-            o = s.share_with
-            # A sibling that has not begun gets the position with its other checkpoints (prefix_begin); one that is
-            # part-way through its prompt needs the engine to plan it now. Without that checkpoint there is nothing
-            # to wait for (the newcomer would only get the first message's), so it does not share.
-            if o.started and not self.plan_sibling_checkpoint(o, s.share_len):
-                s.share_with, s.share_len = None, 0
-            else:
-                o.at = sorted(set(o.at) | {s.share_len})  # (also for a later restart of o)
-                s.reusable = s.share_len
+            if n > s.reusable + SHARE_MIN and not (o.started and o.fed >= n):
+                cands.append((n, o))
+        # Longest share first (the later request on a tie); when the engine refuses a sibling that already started, the
+        # next one is tried. A sibling that has not begun gets the position with its other checkpoints (prefix_begin);
+        # one that is part-way through its prompt needs the engine to plan it now. Without that checkpoint there is
+        # nothing to wait for (the newcomer would only get the first message's), so it does not share with that one.
+        for n, o in sorted(reversed(cands), key=lambda c: -c[0]):
+            if o.started and not self.plan_sibling_checkpoint(o, n):
+                continue
+            if not o.started:
+                mark = getattr(self.engine, "share_mark", None)
+                if mark is not None:  # (the engine keeps it from eviction until the newcomer has used it)
+                    try:
+                        mark(n)
+                    except Exception as e:  # noqa: BLE001 - a sharing hint must not stop the request
+                        log(f"{o.rid}: share mark at {n} failed: {e}")
+            s.share_with, s.share_len = o, n
+            o.at = sorted(set(o.at) | {n})  # (also for a later restart of o)
+            s.reusable = n
+            break
         s.at = self.checkpoints(s.prompt, s.reusable)
         # (stats: where the first message ends, the last message and the generation prompt start)
         starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
@@ -835,6 +844,10 @@ class Scheduler:
 
     def can_prefill(self, s):
         o = s.share_with
+        if o is not None and not s.started and o not in self.alive:
+            # (o was preempted back into the queue or is gone: with the slots full of waiters it could never be admitted)
+            s.share_with, s.share_len = None, 0
+            o = None
         if not s.started and o is not None and not o.dead and o.phase == PREFILL and not (o.started and o.fed >= s.share_len):
             return False
         # Image embeddings of a request live in one shared pinned table until its prompt has run, so only one

@@ -103,6 +103,10 @@ struct Checkpoint {
   // any other checkpoint first (and cache_stats does not count its pages as room). Cleared by prefix_begin using it,
   // by spill_release, or implicitly when only held / loading checkpoints remain (the oldest held one is then evicted).
   bool held = false;
+  // Sibling share (Model::share_mark): this checkpoint was planned for a request that waits for it. While use_clock_ is
+  // below share_until it is not "covered" (ckpt_covered): the sibling saves deeper ones past it, but the newcomer has not
+  // run prefix_begin yet. Cleared by a prefix_begin that matches it; expires by itself so it cannot pin a slot for ever.
+  uint64_t share_until = 0;
   int pos() const { return int(ids.size()); }
 };
 
