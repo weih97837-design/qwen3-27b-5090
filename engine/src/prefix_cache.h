@@ -8,8 +8,12 @@
 // reference count; the last, partial page is copied before the resumed sequence writes into it.
 #pragma once
 
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -88,6 +92,90 @@ struct Checkpoint {
   int pos() const { return int(ids.size()); }
 };
 
+// Pinned host memory for spill entries (SPILL_PINNED_GIB > 0). Bookkeeping only: the engine pins whole slabs with
+// cudaHostAlloc, never on the hot path (Model::spill_grow_pinned, called while idle), and hands them to add_slab.
+// An entry gets ONE contiguous region inside one slab (first fit, lowest offset; freed extents are coalesced), so
+// the host layout of an entry is the same whether it is pinned or not. alloc returns nullptr when no slab has a
+// free extent that large (the caller then uses pageable memory). Engine thread only, no locks.
+class PinnedPool {
+ public:
+  static constexpr size_t kAlign = 4096;
+  void add_slab(char* base, size_t bytes) {
+    slabs_.push_back({base, bytes, {{0, bytes}}});
+    total_ += bytes;
+  }
+  char* alloc(size_t bytes) {
+    bytes = round(bytes);
+    if (bytes == 0) return nullptr;
+    for (Slab& s : slabs_)
+      for (auto it = s.free.begin(); it != s.free.end(); ++it)
+        if (it->second >= bytes) {
+          const size_t off = it->first, len = it->second;
+          s.free.erase(it);
+          if (len > bytes) s.free.emplace(off + bytes, len - bytes);
+          used_ += bytes;
+          return s.base + off;
+        }
+    return nullptr;
+  }
+  // p / bytes: exactly what alloc returned / was asked for.
+  void release(char* p, size_t bytes) {
+    bytes = round(bytes);
+    for (Slab& s : slabs_) {
+      if (p < s.base || p >= s.base + s.bytes) continue;
+      auto it = s.free.emplace(size_t(p - s.base), bytes).first;
+      auto next = std::next(it);
+      if (next != s.free.end() && it->first + it->second == next->first) {
+        it->second += next->second;
+        s.free.erase(next);
+      }
+      if (it != s.free.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second == it->first) {
+          prev->second += it->second;
+          s.free.erase(it);
+        }
+      }
+      used_ -= bytes;
+      return;
+    }
+  }
+  size_t total() const { return total_; }
+  size_t used() const { return used_; }
+  std::vector<char*> slab_bases() const {
+    std::vector<char*> v;
+    for (const Slab& s : slabs_) v.push_back(s.base);
+    return v;
+  }
+  void forget_slabs() { slabs_.clear(), total_ = used_ = 0; }
+
+ private:
+  struct Slab {
+    char* base;
+    size_t bytes;
+    std::map<size_t, size_t> free;  // offset -> length of the free extents
+  };
+  static size_t round(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
+  std::vector<Slab> slabs_;
+  size_t total_ = 0, used_ = 0;
+};
+
+// Owner of an entry's KV bytes: a region of the PinnedPool (pool != nullptr, released back to it) or a new char[]
+// (pool == nullptr). The deleter is part of the pointer's state and survives reset(), so a KvBuf is only ever
+// (re)filled by assignment from Model::spill_alloc_kv, never by reset(new char[...]).
+struct KvDel {
+  PinnedPool* pool = nullptr;
+  size_t bytes = 0;
+  void operator()(char* p) const {
+    if (!p) return;
+    if (pool)
+      pool->release(p, bytes);
+    else
+      delete[] p;
+  }
+};
+using KvBuf = std::unique_ptr<char[], KvDel>;
+
 // Tiered cache (SPILL_RAM_GIB > 0): a checkpoint the KV pool had to give up is copied to host memory instead of
 // being dropped, and later written to a file (the frontend's policy, frontend/tiercache.py, or the RAM cap). Its
 // tokens stay in memory for the lookup; prefix_begin brings a spilled checkpoint back into the pool when it is
@@ -95,13 +183,19 @@ struct Checkpoint {
 // bytes (ssm | conv | draft ring).
 struct Spilled {
   std::vector<int32_t> ids;
-  std::unique_ptr<char[]> kv, state;  // null once the entry is only on disk
+  KvBuf kv;                           // null once the entry is only on disk (pinned pool region or pageable)
+  std::unique_ptr<char[]> state;      // (same)
   size_t kv_bytes = 0, state_bytes = 0;
   bool ring = false;
   std::string path;     // the file (empty: in memory only)
   uint64_t last_use = 0;
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
   bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
+  // SPILL_ASYNC_IO: the device -> host copy that fills kv (or the host -> device copy that reads it) is queued on the
+  // I/O stream and `done` was recorded behind it. While inflight the CPU must not touch kv / state / free them:
+  // Model::spill_wait first (cudaEventSynchronize). Never set with SPILL_ASYNC_IO=0.
+  cudaEvent_t done = nullptr;
+  bool inflight = false;
   int pos() const { return int(ids.size()); }
   bool in_ram() const { return kv != nullptr; }
   size_t ram_bytes() const { return in_ram() ? kv_bytes + state_bytes : 0; }
@@ -109,6 +203,7 @@ struct Spilled {
 
 struct SpillStats {
   int64_t spilled = 0, restored = 0, written = 0, dropped = 0, subsumed = 0, failed = 0, backed_up = 0;
+  int64_t pin_hits = 0, pin_misses = 0;  // entries given pinned memory / pageable memory although SPILL_PINNED_GIB > 0
 };
 
 struct CacheStats {

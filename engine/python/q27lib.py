@@ -44,6 +44,7 @@ SIGNATURES = {
     "q27_spill_import": ([P, ctypes.c_char_p, P], I),
     "q27_spill_stats": ([P, P], I),
     "q27_spill_backup_one": ([P, P], I),
+    "q27_spill_grow_pinned": ([P, I, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
@@ -432,6 +433,13 @@ class Engine:
         self._check(lib().q27_spill_backup_one(self.h, ctypes.byref(out)), "q27_spill_backup_one")
         return bool(out.value)
 
+    def spill_grow_pinned(self, n=1):
+        """SPILL_PINNED_GIB: pins up to n more slabs of host memory for spill entries (slow: call only while idle);
+        returns how many were added, 0 when the pool is full or off."""
+        out = ctypes.c_int()
+        self._check(lib().q27_spill_grow_pinned(self.h, n, ctypes.byref(out)), "q27_spill_grow_pinned")
+        return out.value
+
     def spill_export(self, entry_id, path):
         """Writes an entry that is in memory to `path` and frees the memory (the lookup still finds it)."""
         self._check(lib().q27_spill_export(self.h, entry_id, os.fsencode(path)), "q27_spill_export")
@@ -447,10 +455,10 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 11)()
+        out = (ctypes.c_int64 * 15)()
         self._check(lib().q27_spill_stats(self.h, out), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
-                "failed", "backed_up")
+                "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses")
         return dict(zip(keys, out))
 
     def memory_report(self):

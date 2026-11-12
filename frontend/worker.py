@@ -134,6 +134,7 @@ class Scheduler:
     tiers = None
     last_active = 0.0
     backup_done = False
+    pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
 
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
@@ -191,6 +192,11 @@ class Scheduler:
         if block and not self.cache_full:
             self.cache_full = self.engine.cache_grow(1) == 0
             block = self.cache_full
+        # Same for the pinned pool of the tiered cache (SPILL_PINNED_GIB, off by default): one slab per idle pass, since
+        # pinning is slow (other CUDA calls wait) and must never happen under load.
+        if block and not self.pin_full:
+            self.pin_full = self.grow_pinned() == 0
+            block = self.pin_full
         if block and wait > 0:
             self.conn.poll(wait)
         while self.conn.poll(0):
@@ -205,6 +211,16 @@ class Scheduler:
             elif msg[0] == "stop":
                 self.flush_on_stop()
                 raise SystemExit(0)
+
+    def grow_pinned(self):
+        """Pins one more slab of the engine's spill pool; 0 when it is full or off, the engine predates it, or it failed."""
+        if self.tiers is None or not hasattr(self.engine, "spill_grow_pinned"):
+            return 0
+        try:
+            return self.engine.spill_grow_pinned(1)
+        except Exception as e:  # noqa: BLE001 - the pool is an optimisation: the entries stay pageable
+            log(f"pinned spill pool: {e}")
+            return 0
 
     def touch(self):
         """Activity (a request in or out, a turn): the idle clock restarts and the idle backup starts over."""

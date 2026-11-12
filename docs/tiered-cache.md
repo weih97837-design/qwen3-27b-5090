@@ -70,6 +70,41 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 100 GiB SSD 約可保存 21 個代理。
 - 512K 的 KV 池約佔 9 GiB VRAM。
 
+## 加速選項（預設關閉）
+
+目前每次 spill（逐出）與 promote（前綴命中時搬回）都是在運算 stream 上以一般（pageable）主機記憶體複製，複製完才繼續，
+因此會暫停所有 GPU 工作與引擎執行緒，速度也只有 PCIe 的一半左右。兩個選項可改善，**預設都關閉**，行為與先前審查過的版本完全相同；
+請先在自己的 GPU 上通過 `scripts/tiered_cache_test.py`（輸出 token 必須與參考完全相同）再開啟。
+
+| 變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `SPILL_PINNED_GIB` | `0` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉 |
+| `SPILL_ASYNC_IO` | `0` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
+| `SPILL_PINNED_SLAB_MIB` | `1024` | 每次 pin 的區塊大小（MiB），一般不需調整 |
+
+- **SPILL_PINNED_GIB**：pin 記憶體很慢（WSL2 上約每 GiB 0.45 秒，期間其他 CUDA 呼叫都要等），所以絕不在請求處理中進行：
+  伺服器閒置時，前端每輪呼叫一次 `spill_grow_pinned`，每次 pin 一個區塊（slab），直到達到上限（與 state 快取的 `cache_grow` 相同）。
+  每個 entry 在一個區塊內取得一段連續空間（first-fit）；放不下時（區塊用完、碎片、或 entry 大於一個區塊）改用一般記憶體，與先前相同。
+  `/stats` 的 tiers 區塊有 `pinned_bytes`（已 pin 的總量）與 `pinned_used`（使用中）。
+- **SPILL_ASYNC_IO**：複製改在獨立 stream 上進行，以事件（event）與運算 stream 在 GPU 端排序；CPU 只在需要讀寫
+  entry 的主機記憶體時才等待（寫入 SSD、丟棄、備份完成）。需要 `SPILL_RAM_GIB` 大於 0。
+  閒置備份仍會在該次呼叫結束前等它完成。
+
+**Windows 共享 GPU 記憶體預算。** pinned 記憶體會計入 Windows 的「共享 GPU 記憶體」，上限約為主機 RAM 的一半。
+引擎本身已經 pin 約 7 GiB（state 快取等），所以「約 7 GiB ＋ `SPILL_PINNED_GIB`」必須低於主機 RAM 的一半左右
+（例如 64 GB 的機器約 32 GiB，`SPILL_PINNED_GIB` 不宜超過 20 左右）。pin 失敗不會讓引擎停止，只會記錄一行並改用一般記憶體。
+已 pin 的區塊不論有沒有使用都佔用記憶體；放在其中的 entry 仍計入 `SPILL_RAM_GIB` 上限。兩者都受 WSL VM 的 `memory=` 限制。
+entry 必須放進單一區塊，所以超過 `SPILL_PINNED_SLAB_MIB`（預設 1 GiB）的 entry 仍使用一般記憶體；
+`spill_stats` 的 `pin_hits` / `pin_misses` 可看到有多少 entry 用到 pinned 記憶體。
+
+比較開啟前後（每個引數是一組以空白分隔的 NAME=VALUE，每組各跑一次）：
+
+```
+docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
+    python scripts/tiered_cache_bench.py --spill-dir /cache/kv/bench \
+    --compare "SPILL_PINNED_GIB=0 SPILL_ASYNC_IO=0" "SPILL_PINNED_GIB=8 SPILL_ASYNC_IO=1"
+```
+
 ## WSL2 注意事項
 
 - **RAM 層計入 WSL VM 的記憶體。** 預設的 WSL2 記憶體上限不足以容納 32 GiB 的 RAM 層。請在 `%UserProfile%\.wslconfig`

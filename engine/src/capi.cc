@@ -129,6 +129,12 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   // off) and SPILL_DIR (where they are written when that is full; frontend/tiercache.py writes them out sooner).
   if (const char* e = getenv("SPILL_RAM_GIB")) o.spill_ram_gib = atof(e);
   if (const char* e = getenv("SPILL_DIR")) o.spill_dir = e;
+  // Tiered cache speed-ups, off by default (docs/tiered-cache.md): SPILL_PINNED_GIB (pinned host memory for spill entries,
+  // pinned while idle in slabs of SPILL_PINNED_SLAB_MIB; 0 / unset: pageable) and SPILL_ASYNC_IO (1: KV copies on their own
+  // stream, no stall of the compute stream).
+  if (const char* e = getenv("SPILL_PINNED_GIB")) o.spill_pinned_gib = std::max(0.0, atof(e));
+  if (const char* e = getenv("SPILL_PINNED_SLAB_MIB")) o.spill_pinned_slab_mib = std::max(16, atoi(e));
+  if (const char* e = getenv("SPILL_ASYNC_IO")) o.spill_async_io = atoi(e) != 0;
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
@@ -385,9 +391,15 @@ int q27_spill_import(void* m, const char* path, uint64_t* id) {
   return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
 }
 
-// out[11]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up.
+// out[15]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
+// pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to pageable memory.
 int q27_spill_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->spill_stats(out); });
+}
+
+// *added: slabs of pinned host memory added to the spill pool (0: full, or off). Idle only: pinning is slow.
+int q27_spill_grow_pinned(void* m, int n, int* added) {
+  return guard([&] { *added = static_cast<Model*>(m)->spill_grow_pinned(n); });
 }
 
 // *done: 1 when a checkpoint was copied to host memory (it stays in the pool), 0 when none needed a copy.
