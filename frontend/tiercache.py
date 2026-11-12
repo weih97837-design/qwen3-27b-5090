@@ -6,6 +6,11 @@ busy) is written to a file in the directory (engine.spill_export). Files stay wi
 written first) and a free-space reserve, and are deleted after ttl_days. A file an earlier run wrote is indexed at
 start() (engine.spill_import). A checkpoint that is reused leaves the engine's list by itself.
 
+Idle backups (VRAM_BACKUP_IDLE_S, worker.Scheduler): while the engine is idle, the engine copies VRAM checkpoints to
+RAM without removing them from VRAM (engine.spill_backup_one); their entries have "backup": True. Retention never writes
+them to the SSD (tick skips them: the checkpoint is still in VRAM). flush() does write them on a stop
+(SPILL_FLUSH_ON_STOP_S), since VRAM is lost when the engine unloads.
+
 Everything runs on the caller's thread: the engine is not thread-safe.
 """
 
@@ -20,6 +25,10 @@ GiB = 1 << 30
 DAY = 86400.0
 SUFFIX = ".q27kv"
 TMP_SUFFIX = ".q27kv.tmp"
+# The longest a stop may spend writing (SPILL_FLUSH_ON_STOP_S is cut to it). server.py gives the engine process
+# 15 s to exit on an unload or restart and 10 s on shutdown (EngineClient._stop, stop); a flush cut off by the
+# server's terminate would leave a file half written.
+STOP_FLUSH_MAX_S = 8.0
 
 
 def _float(name, raw):
@@ -59,7 +68,7 @@ def _unlink(path):
 
 class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=100, ssd_min_free_gib=10, ttl_days=7,
-                 tick_s=30, clock=time.time, disk_free=None, log=print):
+                 tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8):
         self.engine = engine
         self.directory = Path(directory) if directory else None  # None: no SSD tier
         self.ram_retention_s = float(ram_retention_s)
@@ -67,6 +76,8 @@ class TierPolicy:
         self.reserve = float(ssd_min_free_gib) * GiB
         self.ttl_s = float(ttl_days) * DAY
         self.tick_s = float(tick_s)
+        self.backup_idle_s = float(backup_idle_s)      # idle seconds before a VRAM checkpoint is backed up (0: off)
+        self.flush_on_stop_s = float(flush_on_stop_s)  # the time a stop may spend writing (0: off)
         self.clock = clock
         self.disk_free = disk_free or (lambda d: shutil.disk_usage(d).free)
         self.log = log
@@ -88,9 +99,15 @@ class TierPolicy:
                                   ("SPILL_SSD_GIB", "ssd_gib", 100),
                                   ("SPILL_SSD_MIN_FREE_GIB", "ssd_min_free_gib", 10),
                                   ("SPILL_TTL_DAYS", "ttl_days", 7),
-                                  ("SPILL_TICK_S", "tick_s", 30)):
+                                  ("SPILL_TICK_S", "tick_s", 30),
+                                  ("VRAM_BACKUP_IDLE_S", "backup_idle_s", 60),
+                                  ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
+        if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
+            log(f"tiered cache: SPILL_FLUSH_ON_STOP_S {opts['flush_on_stop_s']:g} cut to {STOP_FLUSH_MAX_S:g} s "
+                "(the server stops the engine within 10-15 s)")
+            opts["flush_on_stop_s"] = STOP_FLUSH_MAX_S
         return cls(engine, os.environ.get("SPILL_DIR", ""), log=log, **opts)
 
     def _error(self, msg):
@@ -160,34 +177,15 @@ class TierPolicy:
         if self.directory is None:  # no SSD tier: RAM entries stay until the engine's own cap drops them
             return
 
-        # RAM -> SSD: the oldest checkpoints first; when busy, only after twice the retention.
-        ram = sorted((e for e in entries if e["ram_bytes"] > 0),
+        # RAM -> SSD: the oldest checkpoints first; when busy, only after twice the retention. An idle backup is not
+        # written: its checkpoint is still in VRAM, so the file would be a copy of data that is not lost.
+        ram = sorted((e for e in entries if e["ram_bytes"] > 0 and not e.get("backup")),
                      key=lambda e: self.ram_since.get(e["id"], now))
         for e in ram:
-            entry_id = e["id"]
-            age = now - self.ram_since.get(entry_id, now)
+            age = now - self.ram_since.get(e["id"], now)
             if age < self.ram_retention_s or not (idle or age >= 2 * self.ram_retention_s):
                 continue
-            try:
-                room = self.make_room(e["ram_bytes"])
-            except RuntimeError as ex:
-                # Unknown whether there is room, so this is not "no room": keep the entry for a later tick.
-                self._error(f"make room for {entry_id}: {ex}")
-                continue
-            if not room:
-                self._drop(entry_id, "no room on SSD")
-                continue
-            path = self.directory / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}{SUFFIX}"
-            try:
-                self.engine.spill_export(entry_id, str(path))
-            except RuntimeError as ex:
-                self._error(f"export {entry_id}: {ex}")
-                _unlink(path)
-                self._drop(entry_id, "export failed")
-                continue
-            self.written[entry_id] = now
-            self.ram_since.pop(entry_id, None)
-            self.log(f"tiered cache: entry {entry_id} ({e['ram_bytes']} bytes) written to {path.name}")
+            self._to_disk(e, now)
 
         # TTL: files older than ttl_days go, and so do stray files no entry refers to.
         entries = self.engine.spill_list()
@@ -224,6 +222,55 @@ class TierPolicy:
         self.written.pop(entry_id, None)
         self.ram_since.pop(entry_id, None)
         self.log(f"tiered cache: entry {entry_id} dropped ({why})")
+
+    def _to_disk(self, e, now):
+        """Writes one RAM entry to a file in the directory. Returns "written", "kept" (the SSD room could not be
+        checked now: retried later) or "dropped" (no room on the SSD, or the export failed)."""
+        entry_id = e["id"]
+        try:
+            room = self.make_room(e["ram_bytes"])
+        except RuntimeError as ex:
+            # Unknown whether there is room, so this is not "no room": keep the entry for a later tick.
+            self._error(f"make room for {entry_id}: {ex}")
+            return "kept"
+        if not room:
+            self._drop(entry_id, "no room on SSD")
+            return "dropped"
+        path = self.directory / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}{SUFFIX}"
+        try:
+            self.engine.spill_export(entry_id, str(path))
+        except RuntimeError as ex:
+            self._error(f"export {entry_id}: {ex}")
+            _unlink(path)
+            self._drop(entry_id, "export failed")
+            return "dropped"
+        self.written[entry_id] = now
+        self.ram_since.pop(entry_id, None)
+        self.log(f"tiered cache: entry {entry_id} ({e['ram_bytes']} bytes) written to {path.name}")
+        return "written"
+
+    def flush(self, budget_s, clock=None):
+        """On a stop (worker.Scheduler): writes the RAM entries to the directory, oldest first, until budget_s seconds
+        have passed (clock: time.monotonic). Retention and idle do not apply. Each entry starts only inside the
+        budget, so the stop can overrun it by one export. Returns {"written": n, "left": m}, m being the entries
+        not tried. Without a directory nothing is written."""
+        clock = clock or time.monotonic
+        result = {"written": 0, "left": 0}
+        if self.directory is None or budget_s <= 0:
+            return result
+        deadline = clock() + budget_s
+        now = self.clock()
+        ram = sorted((e for e in self.engine.spill_list() if e["ram_bytes"] > 0),
+                     key=lambda e: self.ram_since.get(e["id"], now))
+        for i, e in enumerate(ram):
+            if clock() >= deadline:
+                result["left"] = len(ram) - i
+                break
+            if self._to_disk(e, now) == "written":
+                result["written"] += 1
+        self.log(f"tiered cache: stop flush wrote {result['written']} of {len(ram)} RAM entries "
+                 f"({result['left']} left in RAM)")
+        return result
 
     def make_room(self, incoming):
         """True when `incoming` bytes fit the SSD budget and reserve, after deleting the oldest files if needed.
@@ -275,4 +322,5 @@ class TierPolicy:
         ram = [e for e in self.listed if e["ram_bytes"] > 0]
         return {"ram_entries": len(ram), "ram_bytes": sum(e["ram_bytes"] for e in ram),
                 "disk_entries": len(disk), "ssd_bytes": sum(_size(e["path"]) for e in disk),
+                "backup_entries": sum(1 for e in self.listed if e.get("backup")),
                 "ssd_budget_bytes": int(self.budget), "last_error": self.last_error}

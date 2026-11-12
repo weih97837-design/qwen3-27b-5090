@@ -689,7 +689,7 @@ function drawSlots() {
 
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["溢出 spilled", "spilled"], ["還原 restored", "restored"], ["寫入 SSD written", "written"],
-  ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+  ["已備份 backed_up", "backed_up"], ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
 function tierCol(title, used, cap, note) {
   const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
   return el("div", { class: "tier" },
@@ -719,6 +719,7 @@ function drawTiers() {
       el("span", {}, label + " "), el("b", { style: key === "failed" && t.failed > 0 ? "color:var(--critical)" : "" }, n(t[key]))))));
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
     kvRow("保留 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
+    kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 筆`),
     kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")));
   if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
   if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));

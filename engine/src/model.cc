@@ -580,7 +580,19 @@ bool Model::evict_checkpoint() {
   if (ckpts_.empty()) return false;
   auto it = std::min_element(ckpts_.begin(), ckpts_.end(),
                              [](const Checkpoint& a, const Checkpoint& b) { return a.last_use < b.last_use; });
-  if (spill_on()) spill_checkpoint(*it);  // tiered cache: to host memory instead of gone (before its pages go back)
+  // Tiered cache: its idle backup (if any) is the only copy now; otherwise a copy to host memory instead of gone.
+  // (Before its pages go back.)
+  const auto b = it->backup ? spill_.find(it->backup) : spill_.end();
+  if (b != spill_.end() && spill_subsumed(*it, it->backup)) {
+    // Another checkpoint (deeper, in the pool, or spilled) now covers it: the backup is not needed.
+    spill_erase(b, true);
+    sstats_.subsumed++;
+  } else if (b != spill_.end()) {
+    b->second.live = false;
+    b->second.last_use = it->last_use;
+  } else if (spill_on()) {
+    spill_checkpoint(*it);
+  }
   for (int32_t p : it->pages) pool_.unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);

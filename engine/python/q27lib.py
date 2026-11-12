@@ -43,6 +43,7 @@ SIGNATURES = {
     "q27_spill_drop": ([P, ctypes.c_uint64], I),
     "q27_spill_import": ([P, ctypes.c_char_p, P], I),
     "q27_spill_stats": ([P, P], I),
+    "q27_spill_backup_one": ([P, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
@@ -404,7 +405,8 @@ class Engine:
     # ---- tiered cache (SPILL_RAM_GIB > 0; frontend/tiercache.py)
 
     def spill_list(self):
-        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "path"}] of the checkpoints the KV pool gave up."""
+        """[{"id", "pos", "ram_bytes", "on_disk", "last_use", "backup", "path"}] of the checkpoints the KV pool gave up
+        (backup: the entry is an idle backup of a checkpoint still in the pool)."""
         n = 1 << 16
         while True:
             buf = ctypes.create_string_buffer(n)
@@ -418,10 +420,17 @@ class Engine:
         for line in buf.value.decode("utf-8", "replace").split("\n"):  # (not splitlines: a path may hold \r etc.)
             if not line:
                 continue
-            f = line.split("\t", 5)
+            f = line.split("\t", 6)
             out.append({"id": int(f[0]), "pos": int(f[1]), "ram_bytes": int(f[2]), "on_disk": f[3] == "1",
-                        "last_use": int(f[4]), "path": f[5] if len(f) > 5 else ""})
+                        "last_use": int(f[4]), "backup": f[5] == "1", "path": f[6] if len(f) > 6 else ""})
         return out
+
+    def spill_backup_one(self):
+        """Copies the least recently used checkpoint of the pool to host memory; it stays in the pool. True when one was
+        copied, False when none needed it (call again until False while idle)."""
+        out = ctypes.c_int()
+        self._check(lib().q27_spill_backup_one(self.h, ctypes.byref(out)), "q27_spill_backup_one")
+        return bool(out.value)
 
     def spill_export(self, entry_id, path):
         """Writes an entry that is in memory to `path` and frees the memory (the lookup still finds it)."""
@@ -438,10 +447,10 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 10)()
+        out = (ctypes.c_int64 * 11)()
         self._check(lib().q27_spill_stats(self.h, out), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
-                "failed")
+                "failed", "backed_up")
         return dict(zip(keys, out))
 
     def memory_report(self):

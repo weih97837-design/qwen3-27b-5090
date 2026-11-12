@@ -385,9 +385,14 @@ int q27_spill_import(void* m, const char* path, uint64_t* id) {
   return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
 }
 
-// out[10]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed.
+// out[11]: entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up.
 int q27_spill_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->spill_stats(out); });
+}
+
+// *done: 1 when a checkpoint was copied to host memory (it stays in the pool), 0 when none needed a copy.
+int q27_spill_backup_one(void* m, int* done) {
+  return guard([&] { *done = static_cast<Model*>(m)->spill_backup_one(); });
 }
 
 // out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.

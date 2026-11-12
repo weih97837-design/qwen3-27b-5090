@@ -156,21 +156,26 @@ void Model::copy_pages(const std::vector<int32_t>& pages, char* host, bool to_ho
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
-void Model::spill_checkpoint(const Checkpoint& c) {
-  // Keep only the deepest checkpoint of a conversation: the checkpoints of one long prompt share most of their
-  // pages, and spilling each would store those pages several times. Short checkpoints (up to kKeepShort tokens)
-  // are only subsumed by an equal one, since a new conversation often starts from them.
+// Keeps only the deepest checkpoint of a conversation: the checkpoints of one long prompt share most of their
+// pages, and spilling each would store those pages several times. Short checkpoints (up to kKeepShort tokens)
+// are only subsumed by an equal one, since a new conversation often starts from them.
+bool Model::spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const {
   for (const auto& o : ckpts_)
-    if (&o != &c && o.ids.size() > c.ids.size() && c.pos() > kKeepShort && covers(o.ids, o.ring, c.ids, c.ring)) {
-      sstats_.subsumed++;
-      return;
-    }
+    if (&o != &c && o.ids.size() > c.ids.size() && c.pos() > kKeepShort && covers(o.ids, o.ring, c.ids, c.ring))
+      return true;
   for (const auto& kv : spill_) {
     const Spilled& s = kv.second;
-    if (covers(s.ids, s.ring, c.ids, c.ring) && (c.pos() > kKeepShort || s.ids.size() == c.ids.size())) {
-      sstats_.subsumed++;
-      return;
-    }
+    if (kv.first != ignore_id && covers(s.ids, s.ring, c.ids, c.ring) &&
+        (c.pos() > kKeepShort || s.ids.size() == c.ids.size()))
+      return true;
+  }
+  return false;
+}
+
+void Model::spill_checkpoint(const Checkpoint& c) {
+  if (spill_subsumed(c, 0)) {
+    sstats_.subsumed++;
+    return;
   }
   for (auto it = spill_.begin(); it != spill_.end();) {
     auto next = std::next(it);
@@ -182,6 +187,12 @@ void Model::spill_checkpoint(const Checkpoint& c) {
     it = next;
   }
 
+  if (!spill_copy(c, false)) return;  // (dropped, as without the tiered cache)
+  sstats_.spilled++;
+  spill_enforce_ram();
+}
+
+uint64_t Model::spill_copy(const Checkpoint& c, bool live) {
   Spilled s;
   s.kv_bytes = c.pages.size() * size_t(kKvSlices) * kv_page_bytes_;
   s.state_bytes = ckpt_bytes_;
@@ -190,7 +201,7 @@ void Model::spill_checkpoint(const Checkpoint& c) {
     s.state.reset(new char[s.state_bytes]);
   } catch (const std::bad_alloc&) {
     sstats_.failed++;
-    return;  // (dropped, as without the tiered cache)
+    return 0;
   }
   copy_pages(c.pages, s.kv.get(), true);
   Q27_CUDA(cudaStreamSynchronize(cs_));  // (the state's copy into its host slot may still be on its way)
@@ -198,10 +209,44 @@ void Model::spill_checkpoint(const Checkpoint& c) {
   s.ids = c.ids;
   s.ring = c.ring;
   s.last_use = c.last_use;
+  s.live = live;
   spill_ram_ += s.ram_bytes();
-  spill_.emplace(spill_next_++, std::move(s));
-  sstats_.spilled++;
-  spill_enforce_ram();
+  const uint64_t id = spill_next_++;
+  spill_.emplace(id, std::move(s));
+  return id;
+}
+
+int Model::spill_backup_one() {
+  if (!spill_on()) return 0;
+  // The least recently used pool checkpoint with no valid backup that spill_checkpoint would not subsume.
+  Checkpoint* pick = nullptr;
+  for (auto& c : ckpts_) {
+    if (c.backup && spill_.find(c.backup) != spill_.end()) continue;  // (a)
+    if (pick && c.last_use >= pick->last_use) continue;
+    if (!spill_subsumed(c, 0)) pick = &c;  // (b): as spill_checkpoint's rules
+  }
+  if (!pick) return 0;
+  // A backup never makes spill_enforce_ram evict anything: the copy must fit under the RAM cap as it is. (Otherwise
+  // the enforce would drop another backup, which the next call picks again: an endless loop.)
+  const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
+  const size_t bytes = pick->pages.size() * size_t(kKvSlices) * kv_page_bytes_ + ckpt_bytes_;
+  if (spill_ram_ + bytes > cap) return 0;
+  // (c): as spill_checkpoint, the shallower non-busy entries that the copy covers go (live ones too: their
+  // checkpoints are in the pool, so nothing is lost).
+  for (auto it = spill_.begin(); it != spill_.end();) {
+    auto next = std::next(it);
+    const Spilled& e = it->second;
+    if (!e.busy && covers(pick->ids, pick->ring, e.ids, e.ring) && (e.pos() > kKeepShort || e.ids.size() == pick->ids.size())) {
+      spill_erase(it, true);
+      sstats_.subsumed++;
+    }
+    it = next;
+  }
+  const uint64_t id = spill_copy(*pick, true);
+  if (id == 0) return 0;
+  pick->backup = id;
+  sstats_.backed_up++;
+  return 1;
 }
 
 void Model::spill_lookup(const int32_t* ids, int n, bool spec) {
@@ -212,6 +257,7 @@ void Model::spill_lookup(const int32_t* ids, int n, bool spec) {
   uint64_t best = 0;
   for (const auto& kv : spill_) {
     const Spilled& s = kv.second;
+    if (s.live) continue;  // (an idle backup: its checkpoint is in the pool, and the pool's lookup has it)
     if (s.pos() < n && (!spec || s.ring) && s.pos() > deepest && std::equal(s.ids.begin(), s.ids.end(), ids))
       best = kv.first, deepest = s.pos();
   }
@@ -222,7 +268,7 @@ void Model::spill_lookup(const int32_t* ids, int n, bool spec) {
 
 bool Model::spill_promote(uint64_t id) {
   auto it = spill_.find(id);
-  if (it == spill_.end()) return false;
+  if (it == spill_.end() || it->second.live) return false;  // (a live backup is never restored: its original is here)
   Spilled& s = it->second;
   s.busy = true;
   const bool from_disk = !s.in_ram();
@@ -290,9 +336,21 @@ bool Model::spill_promote(uint64_t id) {
 void Model::spill_enforce_ram() {
   const size_t cap = size_t(opt_.spill_ram_gib * double(size_t(1) << 30));
   while (spill_ram_ > cap) {
+    // An idle backup goes first: its checkpoint is still in the pool, so dropping it loses nothing, and it is never
+    // written to the SSD (it is not the only copy).
     auto victim = spill_.end();
     for (auto it = spill_.begin(); it != spill_.end(); ++it)
-      if (it->second.in_ram() && !it->second.busy &&
+      if (it->second.in_ram() && !it->second.busy && it->second.live &&
+          (victim == spill_.end() || it->second.last_use < victim->second.last_use))
+        victim = it;
+    if (victim != spill_.end()) {
+      spill_erase(victim, true);
+      sstats_.dropped++;
+      continue;
+    }
+    // Only sole copies are left: written to the directory, or dropped without one.
+    for (auto it = spill_.begin(); it != spill_.end(); ++it)
+      if (it->second.in_ram() && !it->second.busy && !it->second.live &&
           (victim == spill_.end() || it->second.last_use < victim->second.last_use))
         victim = it;
     if (victim == spill_.end()) return;
@@ -381,7 +439,7 @@ std::string Model::spill_list() const {
   for (const auto& kv : spill_) {
     const Spilled& s = kv.second;
     out << kv.first << '\t' << s.pos() << '\t' << s.ram_bytes() << '\t' << (s.path.empty() ? 0 : 1) << '\t'
-        << s.last_use << '\t' << s.path << '\n';
+        << s.last_use << '\t' << (s.live ? 1 : 0) << '\t' << s.path << '\n';
   }
   return out.str();
 }
@@ -439,7 +497,7 @@ void Model::spill_stats(int64_t* out) const {
   }
   out[0] = int64_t(spill_.size()), out[1] = ram, out[2] = disk, out[3] = int64_t(spill_ram_);
   out[4] = sstats_.spilled, out[5] = sstats_.restored, out[6] = sstats_.written, out[7] = sstats_.dropped;
-  out[8] = sstats_.subsumed, out[9] = sstats_.failed;
+  out[8] = sstats_.subsumed, out[9] = sstats_.failed, out[10] = sstats_.backed_up;
 }
 
 }  // namespace q27

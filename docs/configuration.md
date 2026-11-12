@@ -120,6 +120,8 @@ everywhere above.
 | `SPILL_SSD_MIN_FREE_GIB` | 10 | The SSD tier never fills the disk below this much free space |
 | `SPILL_TTL_DAYS` | 7 | Files not reused for this many days are deleted |
 | `SPILL_TICK_S` | 30 | Seconds between the tier maintenance passes |
+| `VRAM_BACKUP_IDLE_S` | 60 | Seconds the engine must be idle before it copies VRAM checkpoints to RAM while keeping them in VRAM (idle backup, [tiered-cache.md](tiered-cache.md#閒置時預先備份vram-保留)). Needs `SPILL_RAM_GIB` above 0. 0: off |
+| `SPILL_FLUSH_ON_STOP_S` | 8 | Seconds a stop (idle unload, restart, shutdown) may spend backing up VRAM checkpoints (half of it) and writing RAM entries to `SPILL_DIR`. Cut to 8: `server.py` gives the engine 15 s to exit on an unload or restart and 10 s on shutdown, then terminates it. 0: off |
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |

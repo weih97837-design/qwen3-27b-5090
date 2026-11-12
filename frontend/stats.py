@@ -195,6 +195,7 @@ def tiers_block(engine, tiers, environ=None):
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
                 "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],
+                "backed_up": sp.get("backed_up", 0), "backup_entries": ts.get("backup_entries", 0),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
                 "dir": str(directory) if directory else None}

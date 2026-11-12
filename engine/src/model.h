@@ -143,16 +143,21 @@ class Model {
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
   // Tiered cache (Options::spill_ram_gib > 0). Only the frontend's policy calls these, between engine steps.
-  // spill_list: one line per entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tpath". spill_export writes an entry
+  // spill_list: one line per entry, "id\tpos\tram_bytes\ton_disk\tlast_use\tlive\tpath" (live: 1 = an idle backup whose
+  // checkpoint is still in the pool). spill_export writes an entry
   // that is in memory to `path` and frees the memory (it stays found by the lookup). spill_drop forgets an entry and
   // deletes its file. spill_import indexes a file another run wrote (0 when it is not a file of this model and KV
-  // type, or unreadable: the caller deletes it). spill_stats out[10]: entries, in memory, on disk, memory bytes,
-  // spilled, restored, written, dropped, subsumed (a deeper checkpoint of the same tokens was kept), failed.
+  // type, or unreadable: the caller deletes it). spill_stats out[11]: entries, in memory, on disk, memory bytes,
+  // spilled, restored, written, dropped, subsumed (a deeper checkpoint of the same tokens was kept), failed, backed_up.
   std::string spill_list() const;
   void spill_export(uint64_t id, const std::string& path);
   void spill_drop(uint64_t id);
   uint64_t spill_import(const std::string& path);
   void spill_stats(int64_t* out) const;
+  // Idle backup: copies the least recently used pool checkpoint that has no valid backup to host memory and keeps it
+  // in the pool too. Its eviction then only marks the copy as the sole one (no copy stall). 1: one was copied, 0: none
+  // needed it (or no tiered cache). Called by the frontend while the engine is idle, repeatedly until 0.
+  int spill_backup_one();
   // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
   // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
   // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
@@ -228,6 +233,8 @@ class Model {
   // Tiered cache (spill.cc).
   bool spill_on() const { return cache_on_ && opt_.spill_ram_gib > 0; }
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
+  bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
+  uint64_t spill_copy(const Checkpoint& c, bool live);  // the copy of c's pages and state as a new entry; 0: no memory
   void spill_lookup(const int32_t* ids, int n, bool spec);  // brings back a spilled match deeper than the pool's
   bool spill_promote(uint64_t id);               // a spilled entry -> a checkpoint in the pool
   void spill_enforce_ram();                      // over spill_ram_gib: write out (or drop) the least recently used

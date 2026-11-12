@@ -84,6 +84,7 @@ struct Checkpoint {
   int slot = -1;               // host state slot
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   uint64_t last_use = 0;
+  uint64_t backup = 0;         // the spill_ id of its host copy while the pool keeps it (idle backup); 0: none
   int pos() const { return int(ids.size()); }
 };
 
@@ -100,13 +101,14 @@ struct Spilled {
   std::string path;     // the file (empty: in memory only)
   uint64_t last_use = 0;
   bool busy = false;    // being restored: neither dropped nor written out meanwhile
+  bool live = false;    // an idle backup whose checkpoint is still in the pool (never restored while live)
   int pos() const { return int(ids.size()); }
   bool in_ram() const { return kv != nullptr; }
   size_t ram_bytes() const { return in_ram() ? kv_bytes + state_bytes : 0; }
 };
 
 struct SpillStats {
-  int64_t spilled = 0, restored = 0, written = 0, dropped = 0, subsumed = 0, failed = 0;
+  int64_t spilled = 0, restored = 0, written = 0, dropped = 0, subsumed = 0, failed = 0, backed_up = 0;
 };
 
 struct CacheStats {

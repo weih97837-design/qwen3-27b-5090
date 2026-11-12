@@ -130,6 +130,11 @@ class Seq:
 
 
 class Scheduler:
+    # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
+    tiers = None
+    last_active = 0.0
+    backup_done = False
+
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
 
@@ -173,20 +178,21 @@ class Scheduler:
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
         self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
+        self.last_active = time.monotonic()  # the idle backup (touch, backup_due)
 
     # ------------------------------------------------------------ messages
 
     def send(self, *msg):
         self.conn.send(msg)
 
-    def poll(self, block):
+    def poll(self, block, wait=STATS_IDLE):
         # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
-        # then wake up now and then for a stats snapshot.
+        # then wake up now and then for a stats snapshot (wait seconds at most: less when a backup is due).
         if block and not self.cache_full:
             self.cache_full = self.engine.cache_grow(1) == 0
             block = self.cache_full
-        if block:
-            self.conn.poll(STATS_IDLE)
+        if block and wait > 0:
+            self.conn.poll(wait)
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
@@ -197,9 +203,61 @@ class Scheduler:
                 self.configure(msg[1])
                 self.send("config", self.settings(), msg[2])
             elif msg[0] == "stop":
+                self.flush_on_stop()
                 raise SystemExit(0)
 
+    def touch(self):
+        """Activity (a request in or out, a turn): the idle clock restarts and the idle backup starts over."""
+        self.last_active = time.monotonic()
+        self.backup_done = False
+
+    def backup_ready(self):
+        """Whether the idle backup may run at all now: tiers on, not exhausted, the engine can back up, and idle."""
+        t = self.tiers
+        return (t is not None and t.backup_idle_s > 0 and not self.backup_done and not self.alive and not self.waiting
+                and hasattr(self.engine, "spill_backup_one"))
+
+    def backup_due(self):
+        return self.backup_ready() and time.monotonic() - self.last_active >= self.tiers.backup_idle_s
+
+    def backup_wait(self):
+        """Seconds the idle wait may last before a backup is due (STATS_IDLE when none is coming)."""
+        if not self.backup_ready():
+            return STATS_IDLE
+        return min(STATS_IDLE, max(0.0, self.tiers.backup_idle_s - (time.monotonic() - self.last_active)))
+
+    def backup_one(self):
+        """One idle backup: the least recently used VRAM checkpoint without a RAM copy is copied to RAM, and stays in
+        VRAM. False when there is nothing left or it failed; the backup then waits for the next activity."""
+        try:
+            if self.engine.spill_backup_one():
+                return True
+            log("idle backup: every checkpoint is backed up")
+        except Exception as e:  # noqa: BLE001 - the backup must not stop the engine
+            log(f"idle backup: {e}")
+        self.backup_done = True
+        return False
+
+    def flush_on_stop(self):
+        """On a stop (idle unload, restart, shutdown): the VRAM checkpoints without a RAM copy are backed up, then the
+        RAM entries are written to SSD, within SPILL_FLUSH_ON_STOP_S (at most half of it for the backups, which take
+        0.3-1 s each). Only with an SSD directory: nothing else survives the stop. Never raises."""
+        t = self.tiers
+        if t is None or t.directory is None or t.flush_on_stop_s <= 0:
+            return
+        t0 = time.monotonic()
+        try:
+            if hasattr(self.engine, "spill_backup_one"):
+                backed = 0
+                while time.monotonic() - t0 < t.flush_on_stop_s / 2 and self.engine.spill_backup_one():
+                    backed += 1
+                log(f"stop: backed up {backed} VRAM checkpoints")
+            t.flush(max(0.0, t.flush_on_stop_s - (time.monotonic() - t0)))
+        except Exception as e:  # noqa: BLE001 - the stop must go on
+            log(f"stop flush: {e}")
+
     def submit(self, rid, req):
+        self.touch()
         s = Seq(rid, req, time.time())
         if s.grammar is not None:
             try:
@@ -400,7 +458,9 @@ class Scheduler:
             f"{'DFlash2' if self.spec else 'no speculative decoding'}, "
             f"{'batched decode steps' if self.batch else 'decode in turns'}")
         while True:
-            self.poll(block=not self.alive and not self.waiting)
+            idle = not self.alive and not self.waiting
+            # A backup due now is one copy per iteration, so the poll does not wait (a request is admitted after it).
+            self.poll(block=idle, wait=0.0 if self.backup_due() else self.backup_wait())
             if not self.waiting or self.held_until[0] is not self.waiting[0]:
                 self.blocked = None
             while self.waiting and len(self.alive) < self.max_seqs and self.admit(self.waiting[0]):
@@ -408,6 +468,8 @@ class Scheduler:
             job = self.pick()
             if job:
                 self.guarded(*job)
+            elif self.backup_due():  # (still idle after the poll: no request arrived)
+                self.backup_one()
             # (stats also once more when the work is done, and after each idle wait)
             self.report(force=not (self.alive or self.waiting))
             if self.tiers is not None:
@@ -452,9 +514,11 @@ class Scheduler:
     def guarded(self, kind, s):
         """Runs a turn; KV pool full: preempts another request and retries; engine errors end the request."""
         t0 = time.time()
+        self.touch()
         try:
             return self._guarded(kind, s)
         finally:
+            self.touch()
             self.m["q27:engine_busy_seconds_total"] += time.time() - t0
 
     def _guarded(self, kind, s):
@@ -777,6 +841,7 @@ class Scheduler:
         v.started, v.fed, v.phase = False, 0, PREFILL
 
     def finish(self, s, reason, save=True, notify=True):
+        self.touch()
         if s.dead:
             return
         s.dead = True
