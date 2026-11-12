@@ -532,6 +532,7 @@ class Scheduler:
                 return False
             # (the restored pages must fit next to what the running requests still need: else nothing is started, the
             # request is admitted as usual and prefix_begin recomputes or promotes as it did without delay hits)
+            self.release_finished_cur()  # (its pages count as free below)
             if not self.kv_room(s, cached=m["pos"], extra=-(-m["pos"] // PAGE)):
                 log(f"{s.rid}: spilled checkpoint of {m['pos']} tokens not loaded (the KV pool has no room for it)")
                 return False
@@ -548,6 +549,19 @@ class Scheduler:
         log(f"{s.rid}: loading a spilled checkpoint of {m['pos']} tokens ({m['bytes'] / 1e9:.2f} GB from "
             f"{'SSD' if m['on_disk'] else 'RAM'}, ~{self.est_load_s(m):.2f} s vs ~{self.est_recompute_s(m['pos']):.2f} s to compute)")
         self.send("event", s.rid, "restore", f"loading a cached prefix of {m['pos']} tokens in the background")
+        return True
+
+    def release_finished_cur(self):
+        """A finished request (its output complete, its end checkpoint saved by finish) still holds the pages of its
+        sequence in the engine until the next prefix_begin / reset: a restore started now would not find them free (the
+        engine counts only free pages and pages only checkpoints hold). Nothing needs that sequence any more (its
+        history and stats are kept by finish; a running request's pages are in the engine or its parking area, never
+        touched here), so it is released: the next request's prefix_begin resets anyway."""
+        cur = self.cur
+        if cur is None or not cur.dead:
+            return False
+        self.engine.reset()
+        self.cur = None
         return True
 
     def release(self, rec, why):

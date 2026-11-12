@@ -564,9 +564,17 @@ int Model::spill_match(const int32_t* ids, int n, bool spec, int64_t* out4) cons
 }
 
 int Model::spill_restore_begin(uint64_t id) {
-  if (!spill_on() || !opt_.spill_async_promote) return 0;
+  if (!spill_on() || !opt_.spill_async_promote) {
+    log("tiered cache: restore of entry %llu refused: %s", (unsigned long long)id,
+        !spill_on() ? "spill is off" : "SPILL_ASYNC_PROMOTE is off");
+    return 0;
+  }
   auto it = spill_.find(id);
-  if (it == spill_.end() || it->second.live || it->second.busy || restoring_.count(id)) return 0;
+  if (it == spill_.end() || it->second.live || it->second.busy || restoring_.count(id)) {
+    log("tiered cache: restore of entry %llu refused: %s", (unsigned long long)id,
+        it == spill_.end() ? "unknown entry" : it->second.live ? "live backup" : it->second.busy ? "busy" : "already restoring");
+    return 0;
+  }
   Spilled& s = it->second;
   spill_reap();
   const int npages = int(ceil_div(s.pos(), kPageTokens));
@@ -576,8 +584,15 @@ int Model::spill_restore_begin(uint64_t id) {
     sstats_.restore_failed++;
     return 0;
   }
-  if (!spill_room(npages)) return 0;  // (nothing changed; checked again when a file read ends)
-  if (!s.in_ram() && s.path.empty()) return 0;
+  if (!spill_room(npages)) {  // (nothing changed; checked again when a file read ends)
+    log("tiered cache: restore of entry %llu refused: no room (freeable < needed %d pages; %d free now, the rest is held by sequences)",
+        (unsigned long long)id, npages, pool_.free_pages());
+    return 0;
+  }
+  if (!s.in_ram() && s.path.empty()) {
+    log("tiered cache: restore of entry %llu refused: no memory copy and no file", (unsigned long long)id);
+    return 0;
+  }
   // (G) every allocation that can throw comes before any state changes or thread starts.
   Restore r;
   r.t0 = std::chrono::steady_clock::now();
@@ -587,6 +602,7 @@ int Model::spill_restore_begin(uint64_t id) {
     ckpts_.reserve(ckpts_.size() + 1);
     restoring_.emplace(id, std::move(r));
   } catch (const std::bad_alloc&) {
+    log("tiered cache: restore of entry %llu refused: out of host memory", (unsigned long long)id);
     return 0;
   }
   if (s.in_ram()) {
@@ -595,6 +611,7 @@ int Model::spill_restore_begin(uint64_t id) {
     if (res == 0) {
       restoring_.erase(id);
       s.busy = false;
+      log("tiered cache: restore of entry %llu refused: no state slot or pages could be taken", (unsigned long long)id);
       return 0;
     }
     if (res == 2) restore_results_.emplace_back(id, true);  // (complete already)
@@ -615,6 +632,7 @@ int Model::spill_restore_begin(uint64_t id) {
   } catch (const std::exception&) {  // (bad_alloc, or no thread: the entry stays on disk)
     s.kv.reset(), s.state.reset();
     restoring_.erase(id);
+    log("tiered cache: restore of entry %llu refused: the file read could not start", (unsigned long long)id);
     return 0;
   }
   // From here nothing throws: the thread is owned by the registered restore (its destructor joins).

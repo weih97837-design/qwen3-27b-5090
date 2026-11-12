@@ -423,6 +423,10 @@ def async_restore(R, key, p2, on_disk):
     if m is None:
         return
     before = eng.spill_stats()
+    # A finished sequence (its end-of-generation checkpoint saved) still holds its pages until the next prefix_begin /
+    # reset, and the restore counts only free pages and pages only checkpoints hold. The server releases it the same
+    # way before an async restore (Scheduler.release_finished_cur).
+    R.op("reset", eng.reset)
     began = R.op("spill_restore_begin", eng.spill_restore_begin, m["id"])
     want = 2 if on_disk else 1
     R.check(f"{key}: spill_restore_begin returns {want}", began == want, began)
