@@ -123,7 +123,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .plan-sum { display: grid; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--grid); }
 .plan-sum .big { font-size: 15px; }
 .plan-sum .big b { font-size: 18px; font-variant-numeric: tabular-nums; }
-.plan-sum .bad { color: var(--critical); }
+.plan-sum .bad, .opts .bad { color: var(--critical); }
 .cfgbtn { font: inherit; color: var(--ink2); background: transparent; border: 1px solid transparent; border-radius: 6px;
   padding: 1px 8px; cursor: pointer; text-align: left; }
 .cfgbtn:hover, .cfgbtn[aria-expanded="true"] { border-color: var(--border); background: var(--wash); }
@@ -735,7 +735,8 @@ function drawTiers() {
 
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
-  "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS"];
+  "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
+  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
   const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
@@ -787,7 +788,8 @@ function drawHeader() {
   if (st) {
     const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
     b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "dflash2" ? "DFlash2" : "no spec", `vision ${st.vision}`,
-      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM reserve ${fmtVal("vram_reserve_gib", st.vram_reserve_gib)}`].join(" · "));
+      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM reserve ${fmtVal("vram_reserve_gib", st.vram_reserve_gib)}`,
+      ...(st.spill_ram_gib != null ? [st.spill_ram_gib ? `tier RAM ${st.spill_ram_gib} GiB` : "no tiered cache"] : [])].join(" · "));
     if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
   }
   b.append(" ", $("launch").hidden ? "▾" : "▴");
@@ -820,7 +822,21 @@ const OPTS = [
   { key: "max_tokens", label: "Context limit", note: "per request, MAX_TOKENS" },
   { key: "vram_reserve_gib", label: "VRAM reserve", note: "left free for other programs", custom: true },
 ];
-const fmtVal = (k, v) => k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
+// The tiered cache (docs/tiered-cache.md): the engine and the tier policy read these when the engine loads, so they
+// apply with a restart; they change no plan of the pools. kind: num (0 or more), flag, path.
+const TIER_OPTS = [
+  { key: "spill_ram_gib", label: "RAM tier", note: "SPILL_RAM_GIB", help: "Host RAM for checkpoints the KV pool gives up. 0 turns the tiered cache off.", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_ram_retention_s", label: "RAM retention", note: "SPILL_RAM_RETENTION_S", help: "Idle seconds before a checkpoint in RAM is written to SSD.", kind: "num", unit: "s", step: "60" },
+  { key: "spill_ssd_gib", label: "SSD cap", note: "SPILL_SSD_GIB", help: "Most the SSD tier holds; the oldest files go first.", kind: "num", unit: "GiB", step: "10" },
+  { key: "spill_ssd_min_free_gib", label: "SSD min free", note: "SPILL_SSD_MIN_FREE_GIB", help: "Never fill the disk below this much free space.", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_ttl_days", label: "File TTL", note: "SPILL_TTL_DAYS", help: "Files not reused for this many days are deleted.", kind: "num", unit: "days", step: "1" },
+  { key: "vram_backup_idle_s", label: "VRAM backup idle", note: "VRAM_BACKUP_IDLE_S", help: "Idle seconds before VRAM checkpoints are also copied to RAM (they stay in VRAM). 0 is off.", kind: "num", unit: "s", step: "10" },
+  { key: "spill_pinned_gib", label: "Pinned RAM", note: "SPILL_PINNED_GIB", help: "Pinned host memory for faster copies; counts against shared GPU memory on Windows. 0 is off.", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_async_io", label: "Async copies", note: "SPILL_ASYNC_IO", help: "KV copies on their own stream; use with pinned RAM. Test with scripts/tiered_cache_test.py first.", kind: "flag" },
+  { key: "spill_async_promote", label: "Delay hits", note: "SPILL_ASYNC_PROMOTE", help: "A request that matches a spilled checkpoint waits for it to load while others run.", kind: "flag" },
+  { key: "spill_dir", label: "SSD folder", note: "SPILL_DIR", help: "Where spilled checkpoints are written. Empty: RAM only.", kind: "path" },
+];
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -853,6 +869,33 @@ function replan() {
   drawLaunch();
 }
 function setForm(k, v) { L.form = { ...L.form, [k]: v }; replan(); }
+function setTier(k, v) { L.form = { ...L.form, [k]: v }; drawLaunch(); }  // (no plan depends on these)
+function tierRow(o) {
+  const row = el("div", { class: "choices" }), v = L.form[o.key];
+  if (v === undefined) return null;  // (a server without them)
+  if (o.kind === "flag") {
+    for (const [val, name] of [[false, "off"], [true, "on"]]) {
+      const b = el("button", { class: "opt", "aria-pressed": String(v === val), type: "button" }, el("b", {}, name));
+      if (L.running && L.running[o.key] === val) b.append(el("i", { class: "run", title: "the running engine" }));
+      b.addEventListener("click", () => setTier(o.key, val));
+      row.append(b);
+    }
+    row.append(el("div", { class: "muted", style: "flex-basis:100%;font-size:11px" }, o.help));
+    return row;
+  }
+  const inp = o.kind === "path"
+    ? el("input", { type: "text", placeholder: "folder", "aria-label": o.label, style: "width:260px", spellcheck: "false" })
+    : el("input", { type: "number", min: "0", step: o.step, "aria-label": o.label + " in " + o.unit });
+  inp.value = v;
+  inp.addEventListener("change", () => {
+    if (o.kind === "path") return setTier(o.key, inp.value.trim());
+    const x = parseFloat(inp.value);
+    if (isFinite(x) && x >= 0) setTier(o.key, x); else drawLaunch();
+  });
+  row.append(el("label", { class: "opt", style: "cursor:default" }, inp, o.unit ? el("span", { class: "n" }, o.unit) : null),
+    el("div", { class: "muted", style: "flex-basis:100%;font-size:11px" }, o.help));
+  return row;
+}
 
 // A Hugging Face repository's weights ("org/name" or "org/name@commit"): the name, then the org and the commit.
 function repoName(v) {
@@ -920,6 +963,18 @@ function drawLaunch() {
     box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
   }
   box.append(el("div", { class: "k" }, "Unload when idle", el("small", {}, "applies at once")), idleRow());
+  if (TIER_OPTS.some((o) => L.form[o.key] !== undefined)) {
+    box.append(el("div", { class: "k", style: "grid-column:1/-1;margin-top:10px" }, "分層快取 Tiered cache",
+      el("small", {}, "Checkpoints the KV pool gives up go to RAM, then to SSD. These apply when the engine restarts.")));
+    const ram = snapHost()?.ram_total_bytes, want = L.form.spill_ram_gib || 0;
+    for (const o of TIER_OPTS) {
+      const row = tierRow(o);
+      if (!row) continue;
+      box.append(el("div", { class: "k" }, o.label, el("small", {}, o.note)), row);
+    }
+    if (ram && want * (1 << 30) > ram) box.append(el("div", { class: "bad", style: "grid-column:1/-1" }, `RAM tier ${want} GiB is more than this machine's RAM (${fmtGiB(ram)}): it will swap or fail.`));
+    if (L.form.spill_ram_gib === 0) box.append(el("div", { class: "muted", style: "grid-column:1/-1" }, "RAM tier 0: the tiered cache is off; the other tier settings are not used."));
+  }
   // The plan of the settings as chosen.
   const p = L.plan?.plan, dev = L.plan?.device;
   sum.replaceChildren();

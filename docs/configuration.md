@@ -253,6 +253,22 @@ variables:
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
 | `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.5 GiB) or a number of GiB from 0 up to the device's memory |
+| `spill_ram_gib` | `SPILL_RAM_GIB` | A number of GiB, 0 or more (64 by default; 0: no tiered cache) |
+| `spill_ram_retention_s` | `SPILL_RAM_RETENTION_S` | Seconds, 0 or more (3600) |
+| `spill_ssd_gib` | `SPILL_SSD_GIB` | GiB, 0 or more (100) |
+| `spill_ssd_min_free_gib` | `SPILL_SSD_MIN_FREE_GIB` | GiB, 0 or more (10) |
+| `spill_ttl_days` | `SPILL_TTL_DAYS` | Days, 0 or more (7) |
+| `vram_backup_idle_s` | `VRAM_BACKUP_IDLE_S` | Seconds, 0 or more (60; 0: off) |
+| `spill_pinned_gib` | `SPILL_PINNED_GIB` | GiB, 0 or more (0: off; the engine clamps it below `SPILL_RAM_GIB`) |
+| `spill_async_io` | `SPILL_ASYNC_IO` | `true` or `false` (`false`) |
+| `spill_async_promote` | `SPILL_ASYNC_PROMOTE` | `true` or `false` (`false`) |
+| `spill_dir` | `SPILL_DIR` | A folder for the spilled checkpoints; empty: no SSD tier |
+
+The tiered cache settings ("分層快取" in the page, and a group of the tray app's settings window) have no upper limit, since
+the machine decides what fits: the page only warns when the RAM tier is more than the machine's RAM. The engine process
+and `TierPolicy` read them when the engine loads, so they apply with a restart of the engine (the page's **Restart**,
+the tray's **Apply**); the other tier variables (`SPILL_TICK_S`, `SPILL_FLUSH_ON_STOP_S`, `SPILL_PINNED_SLAB_MIB`) stay
+variables. The environment (or `settings.ini` `[env]`) still gives the values the server starts with.
 
 Under every choice the page shows the longest context of one request and the KV pool all requests share if only that
 setting changed, and for the settings as chosen the device pools against the budget. These come from the engine's own
@@ -375,6 +391,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
+| Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |

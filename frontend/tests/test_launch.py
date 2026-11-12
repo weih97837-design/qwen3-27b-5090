@@ -17,7 +17,8 @@ from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
 DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dflash2", "vision": "host", "max_seqs": 8,
-            "max_tokens": 262144, "vram_reserve_gib": None}
+            "max_tokens": 262144, "vram_reserve_gib": None,
+            **{k: (launch.spill_dir_default() if v[2] == "path" else v[1]) for k, v in launch.TIER_SETTINGS.items()}}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
 
 
@@ -260,3 +261,114 @@ def test_tier_policy_sees_the_defaults(monkeypatch, tmp_path):
     tiers = TierPolicy.from_env(object(), log=lambda *a: None)  # (the worker's read, after set_engine_env)
     assert tiers is not None and tiers.directory == pathlib.Path(launch.spill_dir_default())
     assert tiers.budget == 100 * (1 << 30) and tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)
+
+
+# ---------------------------------------------------------------- the tiered cache settings
+
+def test_tier_defaults_are_the_compose_ones():
+    import re
+    compose = (ROOT / "compose.yaml").read_text()
+    for key, (var, default, kind) in launch.TIER_SETTINGS.items():
+        m = re.search(rf"^\s+{var}: \$\{{{var}:-([^}}]*)\}}", compose, re.M)
+        assert m, var
+        if kind == "path":
+            assert m.group(1) == launch.ENGINE_ENV_DEFAULTS[var]
+        else:
+            assert float(m.group(1)) == float(default), var
+        assert launch.ENV_NAMES[key] == var
+    assert launch.ENGINE_ENV_DEFAULTS["SPILL_RAM_GIB"] == str(launch.TIER_SETTINGS["spill_ram_gib"][1])
+
+
+def test_tier_validate():
+    lc = settings()
+    s = lc.validate({"spill_ram_gib": 64, "spill_ssd_gib": 0.5, "spill_async_io": True, "spill_dir": ""})
+    assert s["spill_ram_gib"] == 64 and s["spill_ssd_gib"] == 0.5 and s["spill_async_io"] is True and s["spill_dir"] == ""
+    assert lc.validate({"spill_ram_gib": 0})["spill_ram_gib"] == 0       # (tiered cache off)
+    assert lc.validate({"spill_ram_gib": 4096})["spill_ram_gib"] == 4096  # (no artificial upper limit)
+    assert lc.validate({"spill_ssd_gib": 1e6})["spill_ssd_gib"] == 1000000
+    assert isinstance(lc.validate({"spill_ttl_days": 7.0})["spill_ttl_days"], int)
+    for bad in ({"spill_ram_gib": -1}, {"spill_ram_gib": "32"}, {"spill_ram_gib": True}, {"spill_ssd_gib": float("nan")},
+                {"spill_ttl_days": float("inf")}, {"vram_backup_idle_s": None}, {"spill_async_io": 1},
+                {"spill_async_promote": "yes"}, {"spill_dir": 3}, {"spill_dir": " /x"}, {"spill_dir": "a\0b"}):
+        with pytest.raises(ValueError):
+            lc.validate(bad)
+
+
+def test_tier_validate_dir_is_a_folder(tmp_path):
+    lc = settings()
+    f = tmp_path / "file"
+    f.write_text("x")
+    with pytest.raises(ValueError, match="is a file"):
+        lc.validate({"spill_dir": str(f)})
+    assert lc.validate({"spill_dir": str(f)}, check_budget=False)["spill_dir"] == str(f)  # (a save, the server's start)
+    assert lc.validate({"spill_dir": str(tmp_path / "new")})["spill_dir"] == str(tmp_path / "new")
+
+
+def test_tier_env_settings_are_read_like_tierpolicy_and_the_engine(monkeypatch):
+    for var in launch.TIER_ENV:
+        monkeypatch.delenv(var, raising=False)
+    s = launch.env_settings()
+    assert {k: s[k] for k in launch.TIER_SETTINGS if k != "spill_dir"} == \
+        {k: v[1] for k, v in launch.TIER_SETTINGS.items() if k != "spill_dir"}
+    monkeypatch.setenv("SPILL_RAM_GIB", "48.5")
+    monkeypatch.setenv("SPILL_TTL_DAYS", "")
+    monkeypatch.setenv("SPILL_ASYNC_PROMOTE", "1")
+    monkeypatch.setenv("SPILL_ASYNC_IO", "0")
+    monkeypatch.setenv("VRAM_BACKUP_IDLE_S", "-5")  # (TierPolicy refuses it: the default, with a warning)
+    monkeypatch.setenv("SPILL_DIR", "/data/kv")
+    s = launch.env_settings()
+    assert s["spill_ram_gib"] == 48.5 and s["spill_ttl_days"] == 7 and s["spill_async_promote"] is True
+    assert s["spill_async_io"] is False and s["vram_backup_idle_s"] == 60 and s["spill_dir"] == "/data/kv"
+    assert launch.Launch({"prefill_chunk": 1}, dict(DEFAULTS, **{k: s[k] for k in launch.TIER_SETTINGS})).settings["spill_ram_gib"] == 48.5
+
+
+def test_tier_settings_reach_the_engine_env_and_the_policy(monkeypatch, tmp_path):
+    """Launch.config's env is what worker.Scheduler puts in os.environ before TierPolicy.from_env reads it."""
+    lc = settings()
+    monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
+    s = lc.validate({"spec": "none", "spill_ram_gib": 16, "spill_ram_retention_s": 120, "spill_ssd_gib": 50, "spill_ssd_min_free_gib": 2.5,
+                     "spill_ttl_days": 3, "vram_backup_idle_s": 0, "spill_pinned_gib": 4, "spill_async_io": True,
+                     "spill_dir": str(tmp_path / "kv")})
+    env = lc.config(s)["env"]
+    assert env["SPILL_RAM_GIB"] == "16" and env["SPILL_PINNED_GIB"] == "4" and env["SPILL_ASYNC_IO"] == "1"
+    assert env["SPILL_ASYNC_PROMOTE"] == "0" and env["SPILL_DIR"] == str(tmp_path / "kv")
+    for var in launch.TIER_ENV:
+        monkeypatch.delenv(var, raising=False)
+    for k, v in env.items():  # (what the worker does)
+        if v is not None:
+            monkeypatch.setenv(k, v)
+    from tiercache import TierPolicy
+    policy = TierPolicy.from_env(object())
+    assert policy.ram_retention_s == 120 and policy.budget == 50 * GiB and policy.reserve == 2.5 * GiB
+    assert policy.ttl_s == 3 * 86400 and policy.backup_idle_s == 0 and str(policy.directory) == str(tmp_path / "kv")
+    monkeypatch.setenv("SPILL_RAM_GIB", lc.config(dict(s, spill_ram_gib=0))["env"]["SPILL_RAM_GIB"])
+    assert TierPolicy.from_env(object()) is None  # (0: off)
+
+
+def test_tier_env_is_not_part_of_a_plan_job(monkeypatch, tmp_path):
+    lc = settings()
+    monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
+    jobs = []
+    monkeypatch.setattr(lc, "_run", lambda j: jobs.append(j) or [{"fits": True}] * len(j))
+    base = lc.validate({"spec": "none"})
+    lc.plan_many([base, dict(base, spill_ram_gib=64, spill_async_io=True)], DEVICE)
+    assert len(jobs) == 1 and len(jobs[0]) == 1  # (one plan for both)
+    assert not set(jobs[0][0]["env"]) & launch.TIER_ENV
+
+
+def test_tier_env_changes():
+    lc = object.__new__(launch.Launch)
+    lc.settings = lc.at_start = dict(DEFAULTS)
+    lc.settings = dict(lc.at_start, spill_ram_gib=48, spill_async_io=True, spill_ttl_days=0.5, spill_dir="")
+    assert lc.env_changes() == {"SPILL_RAM_GIB": "48", "SPILL_ASYNC_IO": "1", "SPILL_TTL_DAYS": "0.5", "SPILL_DIR": ""}
+
+
+def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):
+    h = hub()
+    monkeypatch.setenv("SPILL_RAM_GIB", "32")
+    assert h.deploy_environ()["SPILL_RAM_GIB"] == "32"
+    h.deploy_env = lambda: {"SPILL_RAM_GIB": "64", "VRAM_RESERVE_GIB": None}
+    assert h.deploy_environ()["SPILL_RAM_GIB"] == "64"
+    assert h.tick()["deploy"]["settings"]["SPILL_RAM_GIB"] == "64"

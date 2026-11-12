@@ -1644,6 +1644,7 @@ def main():
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
                           idle_unload=max(0.0, args.idle_unload))
     HUB.engine_idle = engine.idle_state
+    HUB.deploy_env = lambda: engine.cfg.get("env") or {}  # (the settings table of the stats page follows the applied settings)
     Handler.srv = Server(engine, tok, args.max_tokens, launch)
     server = HTTPServer((args.host, args.port), Handler)
 

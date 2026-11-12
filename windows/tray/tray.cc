@@ -927,7 +927,8 @@ std::wstring env_text(const Json& v) {
     wchar_t number[32];
     switch (v.type) {
         case Json::string: return widen(v.text);
-        case Json::number: swprintf(number, 32, L"%g", v.value); return number;
+        case Json::number: swprintf(number, 32, L"%.15g", v.value); return number;  // (not %g: 2592000 is not 2.592e+06)
+        case Json::boolean: return v.flag ? L"1" : L"0";  // (the tiered cache's switches)
         default: return {};
     }
 }
@@ -1003,12 +1004,12 @@ struct Row {
 enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
 enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
 
-constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12;
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 22;
 
 struct SettingsWindow {
     HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
     HWND browse = nullptr, fix_links = nullptr, keep_text = nullptr, keep_button = nullptr, message = nullptr, apply = nullptr, close = nullptr, open_ini = nullptr;
-    HWND groups[3] = {};
+    HWND groups[4] = {};
     HFONT font = nullptr;
     std::vector<Row> rows;
     Json engine;                // the last GET /admin/engine
@@ -1048,6 +1049,17 @@ std::vector<Row> make_rows() {
         {L"Load the engine", L"ENGINE_AUTOSTART", nullptr, K::choice, T::server, nullptr},
         {L"Unload when idle (seconds)", L"ENGINE_IDLE_UNLOAD_S", nullptr, K::edit, T::live, L"0: never"},
         {L"Smallest KV pool (tokens)", L"MIN_KV_TOKENS", nullptr, K::edit, T::server, L"Below this it does not load. 0: any size"},
+        // The tiered cache (docs/tiered-cache.md): the engine process reads these when it loads, so they reload the engine.
+        {L"RAM tier (GiB)", L"SPILL_RAM_GIB", "spill_ram_gib", K::edit, T::engine, L"0: tiered cache off"},
+        {L"RAM retention (seconds)", L"SPILL_RAM_RETENTION_S", "spill_ram_retention_s", K::edit, T::engine, L"Idle time before it goes to SSD"},
+        {L"SSD cap (GiB)", L"SPILL_SSD_GIB", "spill_ssd_gib", K::edit, T::engine, L"Oldest files go first"},
+        {L"SSD minimum free (GiB)", L"SPILL_SSD_MIN_FREE_GIB", "spill_ssd_min_free_gib", K::edit, T::engine, L"Never fill the disk below this"},
+        {L"File lifetime (days)", L"SPILL_TTL_DAYS", "spill_ttl_days", K::edit, T::engine, L"Files not reused are deleted"},
+        {L"VRAM backup idle (seconds)", L"VRAM_BACKUP_IDLE_S", "vram_backup_idle_s", K::edit, T::engine, L"0: off"},
+        {L"Pinned RAM (GiB)", L"SPILL_PINNED_GIB", "spill_pinned_gib", K::edit, T::engine, L"0: off. Faster copies"},
+        {L"Asynchronous copies", L"SPILL_ASYNC_IO", "spill_async_io", K::choice, T::engine, nullptr},
+        {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
+        {L"SSD folder", L"SPILL_DIR", "spill_dir", K::edit, T::engine, nullptr},
     };
 }
 
@@ -1055,6 +1067,29 @@ Row* row_of(const std::wstring& var) {
     for (auto& row : settings.rows)
         if (var == row.var) return &row;
     return nullptr;
+}
+
+// The rows of the tiered cache: numbers (0 or more), two switches ("0" / "1"), and the SSD folder. Their choices do not
+// come from the server's plans (nothing in a plan depends on them).
+bool tier_number_row(const Row& row) {
+    static const char* const keys[] = {"spill_ram_gib", "spill_ram_retention_s", "spill_ssd_gib", "spill_ssd_min_free_gib",
+                                       "spill_ttl_days", "vram_backup_idle_s", "spill_pinned_gib"};
+    if (!row.key) return false;
+    for (const char* key : keys)
+        if (!strcmp(row.key, key)) return true;
+    return false;
+}
+bool tier_flag_row(const Row& row) { return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote")); }
+bool tier_row(const Row& row) { return tier_number_row(row) || tier_flag_row(row) || (row.key && !strcmp(row.key, "spill_dir")); }
+
+// A number of the tiered cache as text: finite and 0 or more ("" if it is not).
+std::wstring tier_number_text(const std::wstring& text) {
+    wchar_t* end = nullptr;
+    double number = wcstod(text.c_str(), &end);
+    if (text.empty() || *end || !std::isfinite(number) || number < 0) return {};
+    wchar_t out[40];
+    swprintf(out, 40, L"%.15g", number);
+    return out;
 }
 
 std::wstring window_text(HWND window) {
@@ -1115,6 +1150,11 @@ void fill_choice(Row& row, std::vector<std::pair<std::wstring, std::wstring>> it
     settings.filling = outer;
 }
 
+// The two values of a switch of the tiered cache; `value` is "0" or "1".
+void fill_flag(Row& row, const std::wstring& value) {
+    fill_choice(row, {{L"0", L"Off"}, {L"1", L"On"}}, value == L"1" ? L"1" : L"0", true);
+}
+
 void set_message(const std::wstring& text, bool error, bool result) {
     settings.message_is_error = error;
     settings.message_is_result = result;
@@ -1147,6 +1187,16 @@ bool engine_holds_vram() {
     return app.shared.phase == Phase::running && !h.empty() && h != "unloaded" && h != "stopped";
 }
 
+// Whether the control's value is not the running engine's (numbers by value: 32.0 is 32).
+bool engine_value_differs(const Row& row) {
+    std::wstring value = value_of(row), running = engine_running_value(row);
+    if (tier_number_row(row)) {
+        std::wstring a = tier_number_text(value), b = tier_number_text(running);
+        if (!a.empty() && !b.empty()) return a != b;
+    }
+    return value != running;
+}
+
 struct ApplyPlan {
     bool any = false, server = false, engine = false, live = false;
 };
@@ -1161,7 +1211,7 @@ ApplyPlan apply_plan() {
             plan.server = true;
         else if (row.tier == Tier::live)
             plan.live = true;
-        else if (!settings.has_engine || value_of(row) != engine_running_value(row))
+        else if (!settings.has_engine || engine_value_differs(row))
             plan.engine = true;
     }
     return plan;
@@ -1203,6 +1253,11 @@ std::wstring check_values() {
     double seconds = wcstod(idle.c_str(), &end);
     if (idle.empty() || *end || seconds < 0) return L"Unload when idle: seconds, 0 or more.";
     if (!is_number(value_of(*row_of(L"MIN_KV_TOKENS")))) return L"Smallest KV pool: a number of tokens, 0 or more.";
+    for (const auto& row : settings.rows) {
+        if (tier_number_row(row) && row.known && tier_number_text(value_of(row)).empty()) return std::wstring(row.label) + L": a number, 0 or more.";
+        if (row.key && !strcmp(row.key, "spill_dir") && row.known && value_of(row).find_first_of(L"\"") != std::wstring::npos)
+            return L"SSD folder: a path without quotes (empty: RAM only).";
+    }
     std::wstring host = value_of(*row_of(L"HOST"));
     if (host.empty() || host.find_first_of(L" \t\"") != std::wstring::npos) return L"Address: an IP address, such as 127.0.0.1.";
     if (value_of(*row_of(L"HF_HOME")).empty()) return L"Weights folder: a folder.";
@@ -1311,6 +1366,8 @@ void load_rows() {
             swprintf(number, 32, L"%g", wcstod(row.initial.c_str(), nullptr));  // (24.0 and 24 are the same choice)
             row.initial = number;
         }
+        if (row.known && tier_number_row(row) && !tier_number_text(row.initial).empty()) row.initial = tier_number_text(row.initial);  // (24.0 and 24)
+        if (row.known && tier_flag_row(row)) row.initial = _wtoi(row.initial.c_str()) != 0 ? L"1" : L"0";  // (the engine: atoi(value) != 0)
     }
 }
 
@@ -1320,6 +1377,8 @@ void show_rows() {
         std::wstring var = row.var;
         if (var == L"ENGINE_AUTOSTART") {
             fill_choice(row, {{L"0", L"At the first request"}, {L"1", L"When the server starts"}}, row.initial, true);
+        } else if (tier_flag_row(row)) {
+            fill_flag(row, row.initial);
         } else if (row.kind == Kind::choice) {
             fill_choice(row, {{row.initial, row.known ? value_name(row, row.initial) : L"(the default)"}}, row.initial, false);
         } else {
@@ -1517,6 +1576,11 @@ std::string settings_json() {
         if (var == L"WEIGHTS" && !weights_from_scan() && weights_need_server(value)) continue;  // (the server does not take them)
         if (var == L"MAX_SEQS" || var == L"MAX_TOKENS") text = narrow(value);
         else if (var == L"VRAM_RESERVE_GIB") text = value.empty() ? "null" : narrow(value);
+        else if (tier_number_row(row)) {
+            std::wstring number = tier_number_text(value);
+            if (number.empty()) continue;  // (not a number yet: the server keeps its own, and Apply says what is wrong)
+            text = narrow(number);
+        } else if (tier_flag_row(row)) text = value == L"1" ? "true" : "false";
         else text = json_quote(value);
         out += (out.empty() ? "\"" : ",\"") + std::string(row.key) + "\":" + text;
     }
@@ -1542,7 +1606,16 @@ void fill_defaults(const Json& at_start) {
         if (row.known || !row.key) continue;
         row.known = true;
         row.initial = env_text(at_start[row.key]);
-        fill_choice(row, {{row.initial, value_name(row, row.initial)}}, row.initial, false);
+        if (tier_flag_row(row)) {
+            fill_flag(row, row.initial);
+        } else if (row.kind == Kind::edit) {
+            bool outer = settings.filling;  // (not an edit of the user's)
+            settings.filling = true;
+            SetWindowTextW(row.control, row.initial.c_str());
+            settings.filling = outer;
+        } else {
+            fill_choice(row, {{row.initial, value_name(row, row.initial)}}, row.initial, false);
+        }
     }
 }
 
@@ -1581,6 +1654,10 @@ void on_plan_answer(const Json& parsed) {
 
     for (auto& row : settings.rows) {
         if (!row.key) continue;
+        if (tier_row(row)) {  // (no plan choices: they are free to edit once the server's settings are known)
+            EnableWindow(row.control, TRUE);
+            continue;
+        }
         if (SendMessageW(row.control, CB_GETDROPPEDSTATE, 0, 0)) continue;  // (not while someone is choosing)
         std::vector<std::pair<std::wstring, std::wstring>> items;
         std::wstring current = value_of(row);
@@ -1800,6 +1877,11 @@ void layout_settings() {
     y += 22;
     group(1, top);
 
+    top = y;
+    y += 20;
+    place_rows(ROW_LOAD_LAST + 1, ROW_TIER_LAST);
+    group(3, top);
+
     place(settings.keep_text, MARGIN, y + 3, WIDTH - 2 * MARGIN - 110, 36);
     place(settings.keep_button, WIDTH - MARGIN - 100, y, 100, 26);
     y += 40;
@@ -1826,6 +1908,7 @@ void create_settings_controls(HWND window) {
     settings.groups[2] = child(L"BUTTON", L"Server: changing these restarts it", BS_GROUPBOX);
     settings.groups[0] = child(L"BUTTON", L"Engine: what it loads", BS_GROUPBOX);
     settings.groups[1] = child(L"BUTTON", L"When it holds the VRAM", BS_GROUPBOX);
+    settings.groups[3] = child(L"BUTTON", L"Tiered cache (RAM and SSD): changing these reloads the engine", BS_GROUPBOX);
     settings.rows = make_rows();
     int id = IDC_ROW;
     for (auto& row : settings.rows) {
@@ -1942,7 +2025,9 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM wparam, LPARAM 
             } else if (id == IDC_USE_KEEP) {
                 for (const auto& [var, value] : std::map(settings.keep)) {
                     Row* row = row_of(var);
-                    if (row->kind == Kind::choice)
+                    if (tier_flag_row(*row))
+                        fill_flag(*row, value);
+                    else if (row->kind == Kind::choice)
                         fill_choice(*row, {{value, value_name(*row, value)}}, value, true);
                     else
                         SetWindowTextW(row->control, value.c_str());
