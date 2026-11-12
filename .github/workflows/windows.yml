@@ -14,6 +14,10 @@ on:
       - reference/qwen27b/**
       - bench/draft-vocab/**
       - scripts/download_weights.py
+      - scripts/native_env.py
+      - scripts/tiered_cache_test.py
+      - scripts/tiered_cache_bench.py
+      - bench/golden/**
       - scripts/windows/**
       - windows/tray/**
       - .github/workflows/windows.yml
@@ -79,6 +83,13 @@ jobs:
           $app = "dist\qwen3-27b-5090-windows-x64\app"
           & $py -c "import sys; sys.path.insert(0, r'$app\engine\python'); import q27lib; l = q27lib.lib(); assert l.q27t_sf_bytes(2048, 320) == 655360; import PIL, tokenizers, jinja2; print('ok', sys.version)"
           if ($LASTEXITCODE) { throw "smoke test failed" }
+          # The tiered cache scripts (test.cmd, bench.cmd) import without torch and print their usage (no GPU needed).
+          & $py -c "import sys; sys.path.insert(0, r'$app\scripts'); import tiered_cache_test, tiered_cache_bench; assert 'torch' not in sys.modules; print('ok tiered scripts')"
+          if ($LASTEXITCODE) { throw "the tiered cache scripts do not import" }
+          & $py "$app\scripts\tiered_cache_test.py" --help | Out-Null
+          if ($LASTEXITCODE) { throw "tiered_cache_test.py --help failed" }
+          & $py "$app\scripts\tiered_cache_bench.py" --help | Out-Null
+          if ($LASTEXITCODE) { throw "tiered_cache_bench.py --help failed" }
           $tray = Start-Process "dist\qwen3-27b-5090-windows-x64\qwen3-27b-tray.exe" -ArgumentList "--check" -Wait -PassThru
           if ($tray.ExitCode) { throw "the tray app does not find the package ($($tray.ExitCode))" }
           $errs = $null

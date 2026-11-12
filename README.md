@@ -157,6 +157,8 @@ settings and the weights stay ([docs/configuration.md](docs/configuration.md#upd
 
 ### Windows (native)
 
+Full steps for the Windows package (no WSL2, no Docker): [docs/deploy-windows.md](docs/deploy-windows.md).
+
 The same engine and server also run on Windows itself, without WSL2 or Docker, and as fast: decode measured
 326.6 / 1,393 tok/s (one / eight requests) natively against 325.4 / 1,386 under WSL2 on the same day, and the output
 is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (28 MB,

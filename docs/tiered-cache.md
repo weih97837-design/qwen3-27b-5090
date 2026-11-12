@@ -180,7 +180,7 @@ python3 tools/recommend_config.py --json             # 機器可讀的輸出
 
 ## 真機測試
 
-在 RTX 5090 上以開發容器執行（與 `scripts/prefix_cache_test.py` 相同的方式，需要權重與 `bench/golden/`）：
+在 RTX 5090 上以開發容器執行（與 `scripts/prefix_cache_test.py` 相同的方式，需要權重與 `bench/golden/`）。原生 Windows（程式包，無 Docker）改執行 `test.cmd` / `bench.cmd`，見 `docs/deploy-windows.md`。
 
 ```
 # 精確性：各情境的輸出 token 必須與關閉快取的參考完全相同

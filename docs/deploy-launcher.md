@@ -3,7 +3,7 @@
 這份文件說明如何在 Windows 上用**托盤程式**（`qwen3-27b-tray.exe`）啟動與停止伺服器，以及如何在瀏覽器的 **/ui** 頁面調整引擎設定。
 每一步都會說明你會看到什麼。
 
-> **先知道的事**：本 repo 沒有可直接下載的、本分支（`tiered-kv-cache`）的 Windows 套件。`.github/workflows/windows.yml` 只把 zip 發佈到**上游**的 GitHub Release（mkyt 的 repo），那個版本不含本分支的分層快取。要用本分支，必須自己建置（第 1 節）。
+> **先知道的事**：本 fork 的 Windows 套件由 `.github/workflows/windows.yml` 自動建置。合併到 main 後，可在 GitHub → Actions → `windows` → 最新一次成功的執行 → Artifacts 下載 zip（需要登入）；打了 `v` 標籤之後則會出現在本 fork 的 Releases。下載與安裝步驟見 `docs/deploy-windows.md`，要自己建置則看第 1 節。
 > 如果你只需要用 Docker 在 WSL2 裡跑，請改看 `docs/deploy-cli.md`，不需要這份文件。
 
 ---

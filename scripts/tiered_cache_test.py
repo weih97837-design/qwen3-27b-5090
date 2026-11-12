@@ -31,6 +31,11 @@ follow-up turn per conversation that continues the generation with 300 new token
 
     STATE_HOST_CACHE=1 docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py
     python scripts/tiered_cache_test.py --scenarios a,c --keep-dir /cache/kv/test
+
+Native Windows package (no Docker, no torch): test.cmd runs this with the package's Python; the weights are where
+start.cmd downloads them (settings.ini HF_HOME, else the package's huggingface folder), q27.dll is app\\engine\\build\\.
+Without a draft model (SPEC=none, or DFlash2 not downloaded) scenario e is skipped. The default --weights is WEIGHTS
+(settings.ini), else gdnfp4, in the package; nvidia elsewhere.
 """
 
 import argparse
@@ -47,6 +52,9 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # (the package's Python does not add this folder)
+import native_env  # noqa: E402 - before q27lib and qwen27b: they read HF_HOME and Q27_LIB when imported
+DEFAULT_WEIGHTS = native_env.apply()
 
 SCENARIOS = {
     "a": ("RAM promote", ["full"]),
@@ -368,7 +376,7 @@ def grow_pinned(eng, tiered):
 
 def worker(a):
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, engine_target, snapshot
+    from qwen27b.paths import DFLASH2, engine_target, snapshot
 
     draft = None
     if a.spec:
@@ -425,7 +433,8 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
+    ap.add_argument("--weights", default=DEFAULT_WEIGHTS,
+                    help="weight profile: nvidia | gdnfp4 | quasar | a model directory (default: %(default)s)")
     ap.add_argument("--kv-dtype", default="nvfp4", choices=["bf16", "fp8", "nvfp4"])
     ap.add_argument("--tokens", type=int, default=48, help="greedy tokens per turn")
     ap.add_argument("--prompt-len", type=int, default=3000, help="tokens per conversation")
