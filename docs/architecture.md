@@ -135,8 +135,8 @@ At startup the engine computes a plan, allocates each pool once and never calls 
      (64 rows), shared in time by the prefill, the vision tower and its weight staging.
   3. The running sequence's state: GDN states (FP32), convolution states, the draft's context ring.
   4. Per-lane buffers of batched steps ([§10](#10-scheduler-and-concurrency)), about 0.25 GiB for eight lanes.
-  5. **The KV pool**: everything left, in pages of 64 tokens. With the defaults (`gdnfp4`, NVFP4 KV,
-     `MAX_SEQS=8`, `VISION=host`) it holds 605,504 tokens.
+  5. **The KV pool**: everything left, in pages of 64 tokens. Uncapped (`KV_POOL_TOKENS=0`) with `gdnfp4`, NVFP4 KV,
+     `MAX_SEQS=8`, `VISION=host` it holds 605,504 tokens; this fork's defaults cap the pool at 524,288 tokens with `MAX_SEQS=4`.
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
   draft state (189.6 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,

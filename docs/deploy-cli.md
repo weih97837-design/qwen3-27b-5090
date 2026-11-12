@@ -55,6 +55,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
 
 - **成功判準**：結束碼 0，輸出含建議值（`KV_POOL_TOKENS`、`MAX_TOKENS`、`MAX_SEQS`、`KV_DTYPE`、`SPILL_*` 等）。偵測失敗時會印出註記，並保留 `compose.yaml` 的預設值（工具本身結束碼仍為 0）。
 - **審閱**：確認 `MAX_SEQS` 為 4、`KV_DTYPE` 為 `nvfp4`，以及 `KV_POOL_TOKENS` 與 `SPILL_RAM_GIB`、`SPILL_SSD_GIB` 符合你的記憶體與磁碟。
+- **WSL 沒有 `%UserProfile%\.wslconfig` 時**：WSL2 預設只會看到約一半的主機 RAM（例如 96 GB 主機約 48 GB，**未驗證**：本 repo 無法在實機確認），因此建議的 `SPILL_RAM_GIB` 會較小。工具在 RAM 不足時會印出 `.wslconfig` 的 `memory=` 提示；依提示設定後執行 `wsl --shutdown`，再重新執行工具取得較大的建議值。
 - **寫入 `.env`（只在需要時）**：
 
   ```bash
@@ -83,11 +84,11 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
 scripts/download-weights.sh
 ```
 
-- 下載預設的 `gdnfp4` 權重（約 19.5 GB）與 DFlash2 草稿模型（約 3.5 GB）到 `./hf`。
+- 下載預設的 `gdnfp4` 權重（約 19.5 GB）與 DFlash2 草稿模型（約 3.5 GB）到 `./hf`。Hugging Face 快取資料夾（位於 `./hf/hub/`）：`models--juzbox--Qwen3.8-27B-NVFP4-GDN`（gdnfp4 權重）與 `models--incoai--Qwen3.8-27B-DFlash2`（草稿模型）；每個資料夾內以提交雜湊值分出 `snapshots/<commit>/`。`--quasar` 另外加入 `models--QUASAR-QAT--Qwen3.8-27B-QUASAR-NVFP4` 與 `models--nvidia--Qwen3.8-27B-NVFP4`。
 - 其他選項（需要時才加）：`--quasar`；`--repo ORG/NAME[@REVISION]`（另一個 checkpoint，之後設定 `WEIGHTS=ORG/NAME`）。`--dev` 與 `--bf16` 只為測試與參考模型，部署不需要。
 - 要把權重放在別的磁碟：先建立符號連結再下載：`ln -s /其他磁碟/路徑 hf`。
 
-- **成功判準**：腳本結束碼 0，`ls hf/hub` 出現 `models--...` 目錄（確切目錄名稱**未驗證**）。
+- **成功判準**：腳本結束碼 0，`ls hf/hub` 出現 `models--juzbox--Qwen3.8-27B-NVFP4-GDN` 與 `models--incoai--Qwen3.8-27B-DFlash2`。
 - **失敗時**：中斷或網路錯誤後，**重新執行同一個指令**即可續傳（每個 LFS 檔案都會做 SHA-256 檢查）。缺少 Python 3.10+ 時腳本會改用 `uv`，若兩者都沒有則安裝其一。`HF_TOKEN` 只影響速率限制（本 repo 的權重不需要授權）。
 
 ---
@@ -133,16 +134,18 @@ scripts/serve.sh up --build --idle   # 等同 ENGINE_AUTOSTART=0
 ### 6.1 等待引擎就緒（有上限的重試迴圈）
 
 ```bash
-ok=0
-for i in $(seq 900); do
-  if curl -sf -m 5 -o /dev/null http://127.0.0.1:46320/health; then ok=1; break; fi
-  sleep 1
+deadline=$(( $(date +%s) + 900 ))   # 15 minutes, wall-clock
+ready=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  body=$(curl -sf -m 5 http://127.0.0.1:46320/health) && \
+    python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("status") == "ok" else 1)' <<<"$body" && { ready=1; break; }
+  sleep 2
 done
-if [ "$ok" = 1 ]; then echo READY; else echo "TIMEOUT: docker compose logs --tail 100 serve"; fi
+if [ "$ready" = 1 ]; then echo READY; else echo "TIMEOUT: docker compose logs --tail 100 serve"; fi
 ```
 
 - **成功判準**：印出 `READY`。`curl -s http://127.0.0.1:46320/health` 回傳 `{"status": "ok"}`。
-- **注意**：`/health` 在引擎載入中回傳 503，內容為 `{"status": "<狀態>"}`。若 `ENGINE_AUTOSTART=0`（`--idle`），服務會回傳 200 且 `status` 為 `unloaded`，此時引擎**尚未載入**，需先在 `/ui` 啟動或送出第一個請求。
+- **注意**：`/health` 在引擎未就緒時回傳 503，內容為 `{"status": "<狀態>"}`，狀態為 `stopped`、`loading`、`restarting` 或 `stopping`。只有 `status` 為 `ok` 才代表可以送請求。若 `ENGINE_AUTOSTART=0`（`--idle`），或閒置卸載後，服務會回傳 200 且 `status` 為 `unloaded`（載入中為 `loading`）；此時引擎**尚未載入**，上面的迴圈會逾時，需先在 `/ui` 啟動或送出第一個請求。
 - **逾時（15 分鐘）時**：`docker compose logs --tail 100 serve`；必要時看第 11 節。
 
 Compose 內建的健康檢查（`compose.yaml:101-105`，`start_period: 600s`）也可以查：
@@ -186,6 +189,12 @@ curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_'
 - **沒有輸出時**：`frontend/worker.py:821` 只在分層啟用時才輸出這些指標。依序檢查：
   1. 設定是否啟用：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' qwen3-27b-5090 | grep -E '^(SPILL_RAM_GIB|SPILL_DIR|SPILL_SSD_GIB)='`。`SPILL_RAM_GIB=0` 代表分層關閉（`docs/tiered-cache.md`）。
   2. 容器是否為本分支建置：見第 11 節「image 版本不對」。
+- **分層是否真的在運作**：送幾個請求後（最好有一個長到會把 checkpoint 逐出上下文池的提示），檢查：
+  ```bash
+  curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_(written|failed) '
+  ```
+  - `q27:tier_failed` 應維持 `0`。若增加，表示寫入 SSD 層失敗，請確認 `SPILL_DIR`（容器內 `/cache/kv`）可寫入。舊版建置建立的 `kvcache` 磁碟區可能屬於 root，修正方法：`docker compose down`，`docker volume rm qwen3-27b-5090_kvcache`（磁碟區名稱是 compose 專案名稱 `qwen3-27b-5090`（見 `compose.yaml` 第 1 行 `name:`）加上 `_kvcache`），再重新啟動。**這會刪除 SSD 層的全部快取**（見第 10 節）。
+  - `q27:tier_written` 大於 0，只會在 checkpoint 在 RAM 中停留超過 `SPILL_RAM_RETENTION_S`（預設 3600 秒，`compose.yaml`）且引擎閒置之後才出現。剛發生逐出時它仍是 0，這不代表分層故障。
 - **注意**：distroless 基底沒有 shell，`docker compose exec serve sh` 無法使用（`Dockerfile` 的最終階段）。
 
 ---

@@ -19,12 +19,24 @@
 
 ## 1. 取得程式（自行建置）
 
-建置需要在 Windows 上裝好下列工具（`scripts/windows/package.ps1` 的說明）：
+建置需要在 Windows 上裝好下列工具（`scripts/windows/package.ps1` 的說明）。官方下載位置如下：
 
-- Visual Studio（含 C++ 工具：MSVC、`vcvars64.bat`）
-- CUDA Toolkit 13.3（`nvcc`）
-- CMake 與 Ninja（Visual Studio 內建的版本即可）
-- 一個含 pip 的 Python（用來下載套件的 wheel）
+- **Visual Studio 2022 Build Tools**（或完整版 Visual Studio）：<https://visualstudio.microsoft.com/visual-cpp-build-tools/>。安裝時勾選 **「使用 C++ 的桌面開發」**（C++ 工作負載，含 MSVC 與 `vcvars64.bat`）。
+- **CUDA Toolkit 13.3**（`nvcc`；13.x 系列即可，腳本的路徑為 13.3）：<https://developer.nvidia.com/cuda-downloads>，選 Windows、x86_64，使用預設安裝路徑。
+- **CMake**：<https://cmake.org/download/>，選 Windows x64 安裝程式，並勾選 **Add CMake to the system PATH**。Visual Studio 的 C++ 工作負載通常也內含。
+- **Ninja**：<https://github.com/ninja-build/ninja/releases>，下載 `ninja-win.zip`，解壓後把 `ninja.exe` 放進 PATH。Visual Studio 的 C++ 工作負載通常也內含。
+- **Git for Windows**：<https://git-scm.com/download/win>（第 1 步的 `git clone` 需要）。
+- **Python 3（含 pip）**：<https://www.python.org/downloads/>，安裝時勾選 **Add python.exe to PATH**。
+
+**如何開啟 x64 Native Tools Command Prompt**：按 Windows 開始鍵，輸入 `x64 Native Tools`，在 **Visual Studio 2022** 資料夾中點選 **x64 Native Tools Command Prompt for VS 2022**。它會先執行 `vcvars64.bat`（設定 MSVC 編譯器的路徑），之後在該視窗執行的指令才找得到編譯器。
+
+（以上網址為撰寫時的官方位置，撰寫時未能線上確認。）
+
+**名詞說明**
+
+- **SHA-256**：檔案的校驗碼，是由檔案內容算出的一串指紋。下載權重時，程式會比對每個檔案的 SHA-256 與官方記錄是否相同；不同代表下載不完整或損壞，需要重新下載。
+- **HF_HOME**：Hugging Face 權重的存放資料夾（設定視窗的 **Weights folder (HF_HOME)**，見第 4 節）。權重放在其中的 `hub` 子資料夾，例如 `hub\models--juzbox--Qwen3.8-27B-NVFP4-GDN\`。
+- **前綴快取（prefix cache）**：先前已算過的上下文（例如相同的系統提示或同一份文件）會被保留下來重複使用，後續請求不必從頭計算，回應較快。
 
 步驟：
 
@@ -120,6 +132,9 @@
   - **When it holds the VRAM**：**Load the engine**（`ENGINE_AUTOSTART`）、**Unload when idle (seconds)**（`ENGINE_IDLE_UNLOAD_S`，閒置多久後釋放 VRAM）、**Smallest KV pool (tokens)**（`MIN_KV_TOKENS`）。
 - 按鈕：**Browse...**（選擇權重資料夾）、**Open settings.ini**（用文字編輯器開啟檔案）、**Apply**（儲存並套用）、**Close**。
 - **Apply** 會先告訴你會發生什麼。若會中斷進行中的請求或清空前綴快取，會先詢問。
+  - **Apply 會重新啟動伺服器的情況**：只有 **Server: changing these restarts it** 群組（Address、Port、Weights folder）有變動、且伺服器執行中時，Apply 會重新啟動伺服器（訊息 `Saved. The server is restarting.`）。
+  - **Engine 群組**（Weights、KV cache type 等）的變動：引擎已載入時會重新載入引擎（會中斷進行中的請求並清空前綴快取，所以會先詢問）；未載入時於下次載入時生效。
+  - **`[env]` 區段的變數不在這個視窗中**，按 Apply 不會重新啟動伺服器，見第 4a 節。
 
 **注意**：分層快取的設定（`SPILL_*`）不在視窗的欄位中。要改它們，按 **Open settings.ini** 直接編輯 `[env]` 區段，參見 `docs/tiered-cache.md`。
 
@@ -143,7 +158,7 @@ SPILL_TTL_DAYS=7
 ```
 
 - **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 32 GiB（`SPILL_RAM_GIB=32`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
-- **生效方式**：修改後要重新啟動伺服器（托盤選單 **Stop server** 後再 **Start server**，或重新啟動托盤程式）才會套用。
+- **生效方式**：`[env]` 的變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
 ---

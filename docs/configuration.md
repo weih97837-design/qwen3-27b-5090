@@ -217,11 +217,11 @@ happens depends on the settings:
 | Setting | Effect |
 | --- | --- |
 | Default | The KV pool takes what is left. If it cannot hold `MAX_TOKENS`, `MAX_TOKENS` is lowered as well (`MAX_TOKENS_FIT=1`) |
-| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4) |
+| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4, `KV_POOL_TOKENS=0`) |
 | `MAX_TOKENS_FIT=0` | The engine does not start if the KV pool cannot hold `MAX_TOKENS` |
 
-For scale, with the defaults (gdnfp4, nvfp4, `MAX_SEQS=8`), by the memory other programs use: nothing, a KV pool of about 610K
-tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower.
+For scale, uncapped (`KV_POOL_TOKENS=0`) with gdnfp4, nvfp4, `MAX_SEQS=8`, by the memory other programs use: nothing, a KV pool of about 610K
+tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower. This fork's defaults cap the pool at 524,288 tokens (`KV_POOL_TOKENS=524288`) with `MAX_SEQS=4`.
 
 An engine that does not start allocates no pools. With `ENGINE_IDLE_UNLOAD_S` set, the requests waiting for it get 503 with the
 reason (also `refused` in `GET /admin/engine`), and the next request tries again; there are no retries in between. Without it,

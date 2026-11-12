@@ -52,6 +52,7 @@
   設定 `memory=`，例如在 96 GB 的機器上，扣掉系統保留 16 GB 後設為 `memory=80GB`（建議配置工具會依主機 RAM 算出這個值），之後執行 `wsl --shutdown` 重新啟動。
 - **刪除檔案不會縮小 vhdx。** WSL2 的虛擬硬碟在檔案刪除後不會自動縮小，因此 SSD 上限不會把主機磁碟空間還給系統。
 - **使用具名磁碟區。** `kvcache` 位於 WSL2 的 ext4 磁碟上。不要改用 `/mnt/c` 的 bind mount，drvfs 讀寫很慢。
+- **權限修正前建立的磁碟區要刪除一次。** 較舊的建置建立的 `kvcache` 磁碟區可能屬於 root，容器無法寫入 SSD 層（`q27:tier_failed` 會增加）。請執行一次 `docker compose down`，再 `docker volume rm qwen3-27b-5090_kvcache`（會刪除 SSD 層的全部快取），然後重新啟動。
 
 ## 限制
 
