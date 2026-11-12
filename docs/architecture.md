@@ -97,7 +97,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 
 ## 4. Weights
 
-| Part | Format in `gdnfp4` (default) | GiB on the GPU | Read every decode step |
+| Part | Format in `gdnfp4` (WEIGHTS=gdnfp4) | GiB on the GPU | Read every decode step |
 | --- | --- | ---: | :---: |
 | MLP (gate, up, down) | NVFP4, W4A4 (16-element blocks, FP8 block scales) | 8.96 | yes |
 | GDN projections (qkv, z, out; a and b) | NVFP4, W4A4 (a and b: BF16) | 2.94 | yes |
@@ -107,6 +107,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
 | DFlash2 draft | NVFP4, quantized at load time | about 1.2 | yes |
 
+- **The default is now `nvidia`** (NVIDIA's checkpoint, GDN and attention projections in FP8); the table below describes `gdnfp4`, the faster option.
 - **The checkpoint is read as it is**: NVIDIA's NVFP4 checkpoint, or `gdnfp4`, which replaces its GDN projections
   (FP8 in NVIDIA's) with NVFP4 ones quantized by GPTQ from the BF16 original. The loader rearranges the tensors on
   the GPU into the kernels' layouts; there is no converted copy on disk. The attention projections stay FP8

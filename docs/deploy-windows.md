@@ -86,7 +86,7 @@ Get-Content .\qwen3-27b-5090-<版本>-windows-x64.zip.sha256
 
 | 內容 | 位置 |
 | --- | --- |
-| 權重（預設 `WEIGHTS=gdnfp4`） | `huggingface\hub\models--juzbox--Qwen3.8-27B-NVFP4-GDN\` |
+| 權重（預設 `WEIGHTS=nvidia`） | `huggingface\hub\models--nvidia--Qwen3.8-27B-NVFP4\` |
 | 草稿模型（DFlash2，`SPEC` 不是 `none` 時） | `huggingface\hub\models--incoai--Qwen3.8-27B-DFlash2\` |
 | 分層快取的 SSD 層 | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` |
 | 托盤程式的記錄 | `logs\server.log`（舊的為 `server.1.log`） |
@@ -114,7 +114,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_RAM_GIB` | `32` | 被逐出的 checkpoint 放在主機 RAM 的上限（GiB）；`0` 關閉分層 |
 | `SPILL_DIR` | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` | SSD 層的資料夾 |
 | `SPILL_SSD_GIB` | `100` | SSD 層的上限（GiB），超過時刪除最舊的檔案 |
-| `WEIGHTS` | `gdnfp4` | 權重版本 |
+| `WEIGHTS` | `nvidia` | 權重版本（`gdnfp4` 較快，需另行下載） |
 | `HOST` / `PORT` | `127.0.0.1` / `46320` | 監聽位址與埠 |
 | `SPILL_PINNED_GIB` | `0` | pinned 記憶體（GiB），預設關閉 |
 | `SPILL_ASYNC_IO` | `0` | 預設關閉 |
@@ -139,7 +139,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 
 兩個 `.cmd` 都在 `python\python.exe` 上執行 `app\scripts\` 內的腳本，結束時會暫停，視窗不會直接關閉；按任意鍵後才會關閉。
 
-**權重從哪裡讀**：與 `start.cmd` 相同——`settings.ini` 的 `HF_HOME`，否則程式包內的 `huggingface\`。測試的預設 `--weights` 是 `settings.ini`（或環境變數）的 `WEIGHTS`，否則 `gdnfp4`。權重不在預期位置時，腳本會報錯 `... is not in ...hub`，請先確認 `start.cmd` 已下載完成。
+**權重從哪裡讀**：與 `start.cmd` 相同——`settings.ini` 的 `HF_HOME`，否則程式包內的 `huggingface\`。測試的預設 `--weights` 是 `settings.ini`（或環境變數）的 `WEIGHTS`，否則 `nvidia`。權重不在預期位置時，腳本會報錯 `... is not in ...hub`，請先確認 `start.cmd` 已下載完成。
 
 **`test.cmd` 的 PASS 代表什麼**：每個情境的輸出 token（貪婪解碼）都與關閉快取的參考完全相同，而且所有檢查都通過，代表確實走了該情境的路徑（細節見 `docs/tiered-cache.md` 「真機測試」）。最後一行顯示 `all passed` 時結束碼為 0；任一情境 FAIL 時為 1。
 

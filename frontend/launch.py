@@ -65,7 +65,7 @@ def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     budget = env("VRAM_BUDGET_GIB")
-    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
+    return {"weights": env("WEIGHTS", "nvidia"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 

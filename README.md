@@ -95,7 +95,7 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 ## Quick start
 
 ```bash
-scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
+scripts/download-weights.sh                 # NVIDIA's NVFP4 weights and the draft model into ./hf (about 24 GB)
 docker compose up -d --build serve          # builds the serving image from this checkout; serves 127.0.0.1:46320
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
@@ -245,7 +245,7 @@ to change it. The most useful ones:
 | `MAX_TOKENS` | 262144 | Context limit of one request |
 | `MAX_SEQS` | 4 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
-| `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
+| `WEIGHTS` | `nvidia` | `nvidia` (NVIDIA's checkpoint as is, GDN / attention projections FP8; the default), `gdnfp4` (faster: GDN projections in NVFP4, attention FP8; prefill +5 to 11%, decode +11%, KV pool +55K tokens, KL 0.041 against 0.037), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
 | `SPEC` | `dflash2` | `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
