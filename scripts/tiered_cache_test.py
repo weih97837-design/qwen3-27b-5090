@@ -197,7 +197,7 @@ def sizes(prompt_len, tokens):
 # whole KV blocks, and one page is kept back. The driver mirrors it so that it can size the conversations to it.
 PAGE_TOKENS = 64  # kPageTokens
 KV_HEADS = 4  # kKvHeads
-SPEC_BLOCK = 8  # kSpecBlock: a verify block writes up to 8 positions past the committed length
+SPEC_BLOCK = 16  # kSpecBlock: a verify block writes up to 16 positions past the committed length
 KV_ROW_BYTES = {"nvfp4": 144, "fp8": 256, "bf16": 512}  # kv_row_bytes(kv_type)
 EVICT_MARGIN = 4  # pages: the two conversations must exceed the usable pool by this much, so B's prefill evicts A
 AHEAD_PAGES = 0  # (ensure_pages_of evicts only for pages a sequence NEEDS; the 8 pages it maps ahead are taken only if free)
