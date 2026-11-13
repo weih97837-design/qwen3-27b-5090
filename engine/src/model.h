@@ -138,6 +138,8 @@ class Model {
   // launched ahead is dropped.
   void spec_set_masked(int area);
   bool has_draft() const { return draft_ != nullptr; }
+  int spec_block() const { return draft_ ? draft_->block() : 0; }
+  int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -412,7 +414,8 @@ class Model {
   cudaGraphExec_t capture(const std::function<void()>& body);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
-  int spec_rows(const SpecSampling& smp) const { return 1 + (kSpecBlock - 1) * std::max(1, smp.paths); }
+  int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
+  int spec_rows(const SpecSampling& smp) const { return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths); }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
@@ -747,6 +750,12 @@ class Model {
   Lookup lookup_{};           // Q27_LOOKUP (default off), Q27_LOOKUP_MIN, Q27_LOOKUP_AGREE
   int64_t stat_steps_ = 0, stat_lookup_ = 0, stat_tokens_ = 0;
   int spec_paths_ = 1;        // Q27_SPEC_PATHS: draft walks merged into the verify tree (1: chain)
+  // Adaptive verify width (Q27_SPEC_ADAPT*): a single sequence's block between adapt_low_ and the draft's block.
+  bool adapt_on_ = false;
+  int last_block_ = 0;
+  int adapt_low_ = 8;
+  float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
+  void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset
   bool spec_pipeline_ = true;  // Q27_SPEC_PIPELINE: launch the next step before reading this one's result
   bool spec_inflight_ = false; // a step launched ahead whose result has not been returned

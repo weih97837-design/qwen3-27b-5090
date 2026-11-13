@@ -229,6 +229,13 @@ uint64_t Model::spill_fingerprint() const {
   h = fnv(h, &kv, sizeof kv);
   h = fnv(h, &kv_page_bytes_, sizeof kv_page_bytes_);
   h = fnv(h, &ckpt_bytes_, sizeof ckpt_bytes_);
+  // The draft's context ring is part of a checkpoint's state: its kind, window and slot layout (position p lives in slot
+  // p % (window + kRingPad)) decide how those bytes read, beyond their count (ckpt_bytes_). Bump kCkptLayout when it changes.
+  {
+    constexpr int kCkptLayout = 2;  // 1: ring of `window` slots (DFlash2); 2: window + kRingPad slots, DSpine drafts
+    const int dl[4] = {kCkptLayout, draft_ ? int(draft_->kind()) + 1 : 0, draft_ ? draft_->window() : 0, ddims::kRingPad};
+    h = fnv(h, dl, sizeof dl);
+  }
   // The weights themselves: replacing the files at the same path must not reuse KV files computed with other
   // weights. The names and sizes of the files in each directory, and the bytes of the model's config.json.
   for (const std::string& dir : {opt_.model_dir, opt_.draft_dir}) {

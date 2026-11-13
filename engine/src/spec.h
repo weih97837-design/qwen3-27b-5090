@@ -10,7 +10,8 @@
 
 namespace q27 {
 
-constexpr int kSpecBlock = 8;  // the draft block: the anchor and 7 drafted tokens (the deepest path)
+constexpr int kSpecBlock = 16;  // the longest draft block: the anchor and up to 15 drafted tokens (the deepest path;
+                                // DFlash2 drafts 8, DSpine up to 16, Draft::block()). Batched steps: kLaneRows
 constexpr int kSpecSelK = 16;  // selector candidates per position
 constexpr int kTreeMax = 32;   // verify rows: nodes of the draft tree (node 0 is the anchor)
 constexpr int kTreePaths = 4;  // root-to-leaf paths (draft walks)
@@ -54,12 +55,20 @@ struct SpecSampling {
   bool biased = false;
   const BiasList* bias = nullptr;
   bool ignore_eos = false;  // stop[0..1] stay -1 (vLLM's ignore_eos: an end-of-sequence id is an ordinary token)
+  // Rows of a single sequence's block (0: the draft's, Draft::block()). The adaptive verify width (Model,
+  // Q27_SPEC_ADAPT) sets it from accept_ema, the moving average of the tokens per step, between steps; block_next is
+  // the width decided after the last step, block_due the one decided after the step before it. Step k + 1 always
+  // takes the width decided after step k - 1 (block_due), whether or not it was launched ahead of step k's result or
+  // a parked sequence dropped it, so the widths (and the steps) do not depend on the scheduling. Only past steps
+  // decide it, so the proposals stay a fixed distribution.
+  int block = 0, block_next = 0, block_due = 0;
+  float accept_ema = 0.f;
   bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
   bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
            logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
-           ignore_eos == o.ignore_eos;
+           ignore_eos == o.ignore_eos && block == o.block;
   }
 };
 

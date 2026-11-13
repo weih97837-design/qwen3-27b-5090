@@ -105,7 +105,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | lm_head | NVFP4 | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
-| DFlash2 draft | NVFP4, quantized at load time | about 1.2 | yes |
+| Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
 
 - **The checkpoint is read as it is**: NVIDIA's NVFP4 checkpoint, or `gdnfp4`, which replaces its GDN projections
   (FP8 in NVIDIA's) with NVFP4 ones quantized by GPTQ from the BF16 original. The loader rearranges the tensors on
@@ -135,10 +135,11 @@ At startup the engine computes a plan, allocates each pool once and never calls 
      (64 rows), shared in time by the prefill, the vision tower and its weight staging.
   3. The running sequence's state: GDN states (FP32), convolution states, the draft's context ring.
   4. Per-lane buffers of batched steps ([§10](#10-scheduler-and-concurrency)), about 0.25 GiB for eight lanes.
-  5. **The KV pool**: everything left, in pages of 64 tokens. Uncapped (`KV_POOL_TOKENS=0`) with `gdnfp4`, NVFP4 KV,
-     `MAX_SEQS=8`, `VISION=host` it holds 605,504 tokens; this fork's defaults cap the pool at 524,288 tokens with `MAX_SEQS=4`.
+  5. **The KV pool**: everything left, in pages of 64 tokens. Uncapped (`KV_POOL_TOKENS=0`) with the defaults of the
+     upstream engine (`gdnfp4`, NVFP4 KV, `MAX_SEQS=8`, `VISION=host`, DSpine) it holds 601,856 tokens (605,504 with
+     DFlash2); this fork's defaults cap the pool at 524,288 tokens with `MAX_SEQS=4`.
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
-  draft state (189.6 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
+  draft state (189.9 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,
   16 layers x K / V, of G consecutive pages, with G = 57 for NVFP4 so that a slice is at least 2 MiB), so a run of
   consecutive pages is also contiguous memory and a parking area is simply the top N pages of the pool
@@ -189,7 +190,15 @@ request decodes at 96.6 tok/s at a short context.
 
 ## 7. Speculative decoding
 
-The draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
+The default draft is [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16): DFlash2's backbone without the
+convolutions, block-causal, trained with an 8,192-token window (served with 2,048, `Q27_DRAFT_WINDOW`: no fewer accepted
+tokens at a 32K context, shorter steps), and after every layer a code bridge that writes each position's
+predecessor into it. A step drafts up to 15 tokens; the top-16 candidates of each position are scored again with the
+last layer's write redone for every candidate of the predecessor (a 16 x 16 table per position), and the selector
+below walks that table. A sequence verifies 16 rows while its tokens per step stay high and 8 otherwise
+(`Q27_SPEC_ADAPT`); batched steps draft 8 rows per sequence. `SPEC=dflash2` selects DFlash2, described next.
+
+The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
 in one pass; a low-rank selector chooses among the top-16 candidates at each position. One step drafts 7 tokens
 from an anchor and verifies all 8 rows in one forward of the target.
@@ -282,7 +291,7 @@ At 19K tokens prefill runs at 11,295 tok/s; at 194K, 5,875 tok/s, where attentio
 In a hybrid model, attention's KV cache can be reused from any position, but the GDN state exists only where it
 was saved. The cache is therefore a list of **checkpoints**: a token sequence `[0, pos)`, the KV pages that cover
 it (reference-counted, shared between checkpoints of the same conversation) and a copy of the state (GDN in FP32,
-convolution, the draft's context ring: 189.6 MiB).
+convolution, the draft's context ring: 189.9 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
   holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
@@ -295,7 +304,7 @@ convolution, the draft's context ring: 189.6 MiB).
 - **Exactness**: the state is kept in FP32 and the boundaries follow the GDN chunks, so a request resumed from a
   checkpoint produces exactly the tokens it would produce without the cache (`scripts/prefix_cache_test.py`).
 
-An agent's turn after a 20K-token conversation reaches its first token in 0.19 s: everything but the new tool
+An agent's turn after a 20K-token conversation reaches its first token in about 0.2 s: everything but the new tool
 output and user message comes from the cache.
 
 ## 10. Scheduler and concurrency

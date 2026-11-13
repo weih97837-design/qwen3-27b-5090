@@ -222,7 +222,8 @@ class Scheduler:
         self.restore_pinned = (_env_float("SPILL_PINNED_GIB") or 0.0) > 0
         if self.async_promote:
             log("delay hits: spilled checkpoints are restored in the background (SPILL_ASYNC_PROMOTE=1)")
-        # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
+        # Draft tokens are reported for chains (the block's rows but the first; DSpine's single steps: 7 or 15 by the
+        # adaptive width, batched steps 7). Several paths verify a tree: not reported.
         self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
         self.max_seqs = self.engine_seqs  # the target number of running requests (<= engine_seqs)
@@ -852,7 +853,7 @@ class Scheduler:
         self.send("config", self.settings(), None)
         log(f"{self.engine_seqs} sequences at once (target {self.max_seqs}, KV admission {'on' if self.admit_kv else 'off'}, "
             f"min {self.min_tps:g} tok/s per request), decode share {self.share}, quantum {self.quantum * 1000:.0f} ms, "
-            f"{'DFlash2' if self.spec else 'no speculative decoding'}, "
+            f"{'speculative decoding (' + str(self.engine.spec_block) + '-row blocks)' if self.spec else 'no speculative decoding'}, "
             f"{'batched decode steps' if self.batch else 'decode in turns'}")
         while True:
             idle = not self.alive and not self.waiting and not self.restores
@@ -1131,7 +1132,7 @@ class Scheduler:
                     write_masks(self.engine, s.gm, self.engine.spec_draft(), 0, self.eos)
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
-                self.count_draft(s, toks)
+                self.count_draft(s, toks, self.engine.last_step_block - 1)
             else:
                 if s.gm is not None:
                     write_mask(self.engine, s.gm, 0)
@@ -1184,10 +1185,14 @@ class Scheduler:
         if has_prefill:
             self.credit -= dt
 
-    def count_draft(self, s, toks):
-        """A verify step's tokens are the accepted drafts and the bonus token."""
-        s.drafted += self.draft_block
+    def count_draft(self, s, toks, drafted=7):
+        """A verify step's tokens are the accepted drafts and the bonus token. The server gets the counts so far too
+        (the timings of a request a stop string ends before the engine reports it)."""
+        if not self.draft_block:
+            return
+        s.drafted += drafted
         s.draft_accepted += len(toks) - 1
+        self.send("drafts", s.rid, s.drafted, s.draft_accepted)
 
     def emit(self, s, toks, logprobs=None):
         """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes
@@ -1415,13 +1420,13 @@ def write_mask(engine, m, row):
 
 
 def write_masks(engine, m, chain, row0, eos):
-    """Grammar masks of a speculative step's verify rows row0 .. row0 + 7 (chain: their tokens, Engine.spec_draft; the
+    """Grammar masks of a speculative step's verify rows row0 .. row0 + len(chain) - 1 (chain: their tokens, Engine.spec_draft; the
     first, the last output token, has been through matcher m): row i masks by what follows chain[1..i]. Rows past a
     drafted token the grammar does not allow, or an end-of-sequence id (eos), are left open: that token is rejected,
     or ends the step. (A matcher that consumed an end-of-sequence id does not roll back to the state before it.)"""
     k = m.validate_tokens(chain[1:])
     k = next((i for i, t in enumerate(chain[1:1 + k]) if t in eos), k)
-    for i in range(8):
+    for i in range(len(chain)):
         addr, size = engine.mask_row(row0 + i)
         if i and i <= k:
             m.consume_token(chain[i])

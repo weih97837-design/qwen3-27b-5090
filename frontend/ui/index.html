@@ -823,7 +823,7 @@ function drawHeader() {
   b.replaceChildren();
   if (st) {
     const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
-    b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "dflash2" ? "DFlash2" : "no spec", `vision ${st.vision}`,
+    b.append([st.weights, `KV ${st.kv_dtype}`, ({ dspine: "DSpine", dflash2: "DFlash2" })[st.spec] || "no spec", `vision ${st.vision}`,
       `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM reserve ${fmtVal("vram_reserve_gib", st.vram_reserve_gib)}`,
       ...(st.spill_ram_gib != null ? [st.spill_ram_gib ? `tier RAM ${st.spill_ram_gib} GiB` : "no tiered cache"] : [])].join(" · "));
     if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
@@ -868,7 +868,7 @@ const L = { saved: null, running: null, form: null, weights: {}, plan: null, err
 const OPTS = [
   { key: "weights", label: "Weights", note: "model kind", names: { gdnfp4: ["gdnfp4", "GDN NVFP4, attn FP8"], nvidia: ["nvidia", "GDN / attn FP8"], quasar: ["quasar", "all NVFP4 (QAT)"] } },
   { key: "kv_dtype", label: "KV cache", note: "quantization", names: { nvfp4: ["NVFP4"], fp8: ["FP8"], bf16: ["BF16"] } },
-  { key: "spec", label: "Speculative decoding", names: { dflash2: ["DFlash2"], none: ["off"] } },
+  { key: "spec", label: "Speculative decoding", names: { dspine: ["DSpine", "default; up to 16 rows"], dflash2: ["DFlash2", "8 rows; faster with many requests"], none: ["off"] } },
   { key: "vision", label: "Vision tower", note: "image input", names: { host: ["host", "pinned RAM, streamed"], fp8: ["GPU FP8"], bf16: ["GPU BF16"], off: ["off", "no images"] } },
   { key: "max_seqs", label: "Requests at once", note: "MAX_SEQS" },
   { key: "max_tokens", label: "Context limit", note: "per request, MAX_TOKENS" },

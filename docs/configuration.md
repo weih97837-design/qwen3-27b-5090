@@ -98,7 +98,7 @@ everywhere above.
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
-| `MAX_SEQS` | 4 | Requests the engine can run at once (1–8); more wait in a queue. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs about 0.25 GiB of fixed per-request buffers. KV pool with gdnfp4 and NVFP4 KV: 620,096 tokens with 4, 605,504 with 8 |
+| `MAX_SEQS` | 4 | Requests the engine can run at once (1–8); more wait in a queue. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs about 0.25 GiB of fixed per-request buffers. KV pool with gdnfp4, NVFP4 KV and DFlash2: 620,096 tokens with 4, 605,504 with 8 (DSpine's tables take about 3,600 tokens of it: 601,856 with 8) |
 | `ADMIT_KV` | 1 | 1: a waiting request starts only when the KV pool can take it: free pages plus pages held only by prefix-cache checkpoints must cover the remaining prompts of the running requests, `KV_RESERVE_TOKENS` of output per request, and one more parking area. With nothing running a request always starts. 0: start by count only (a request that later runs out of KV is suspended) |
 | `KV_RESERVE_TOKENS` | 4096 | Output tokens per request that `ADMIT_KV` keeps room for (or the request's remaining `max_tokens`, if smaller) |
 | `MIN_SEQ_TPS` | 0 | Lower bound of tokens per second per request; 0 disables it. Another request does not start if it would push each below this. The prediction uses the measured speed at each number of running requests (decode turns, about the last 10 s); unmeasured counts are scaled from smaller ones by the step time |
@@ -108,7 +108,10 @@ everywhere above.
 | `PREFILL_CHUNK` | 2048 | Prefill chunk in tokens (8,192 is only 2.5% faster at 32K and needs 4x the activations, P5-4) |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or another NVFP4 checkpoint of Qwen3.8-27B on the Hugging Face Hub, e.g. a fine-tune: `ORG/NAME` (its main branch) or `ORG/NAME@REVISION`, downloaded with `scripts/download_weights.py --weights ORG/NAME` (which first checks that the engine takes it) or `scripts/download-weights.sh --repo ORG/NAME` (see [Other checkpoints](#other-checkpoints)). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
-| `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft) or `none` |
+| `SPEC` | `dspine` | `dspine` (speculative decoding with the DSpine draft, `tencent/Qwen3.8-27B-DSpine-b16`: blocks of up to 16, adaptive width), `dflash2` (the DFlash2 draft, blocks of 8) or `none`. Unset with only DFlash2 downloaded (a checkout from before DSpine became the default), the server uses DFlash2 and logs a warning; `scripts/download-weights.sh` gets DSpine |
+| `Q27_DRAFT_BLOCK` | `16` | DSpine: rows of a single sequence's draft block (the last token and the drafted ones), 2..16 (DSpine was trained on 16; fewer rows verify faster). Batched steps (several sequences decoding) always draft 8 per sequence |
+| `Q27_DRAFT_WINDOW` | `2048` | DSpine: the draft's context window (its attention and context ring), 256..8192. DSpine was trained with 8,192, but at a 32K context that accepted no more tokens than 2,048 and made each step 0.2-0.3 ms longer; its ring takes 160 MiB per sequence at 8,192, 40 MiB at 2,048 (as DFlash2's) |
+| `Q27_SPEC_ADAPT` | `1` | Adaptive verify width when the draft's block is longer than 8 (DSpine): a sequence verifies `Q27_SPEC_ADAPT_LOW` (8) rows while the moving average of its tokens per step (`Q27_SPEC_ADAPT_ALPHA`, 0.125) is below `Q27_SPEC_ADAPT_DOWN` (4.0), and the full block again once it reaches `Q27_SPEC_ADAPT_UP` (4.5). Only past steps decide the width, so the output distribution is unchanged. `0`: always the full block |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
 | `STATE_HOST_CACHE` | 8 | GiB of pinned host memory for prefix-cache checkpoints (8 = about 42 checkpoints, twice the 21 of 4; 0 disables the cache; the server sets 8 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning takes about 0.45 s per GiB on WSL2): one by one while the server is idle, or when a checkpoint needs one |
@@ -148,7 +151,7 @@ everywhere above.
 | --- | --- | --- |
 | `Q27_ATTN_FP8` | empty | Prefill attention MMAs, read per call. Empty: `2` with FP8 KV, `3` with NVFP4 KV (`2` without the staging buffer). FP8 KV: `2` QK^T and P·V in FP8, `1` P·V only, `0` BF16. NVFP4 KV: `3` QK^T on native FP4 MMAs (Q quantized to NVFP4, K as cached, V from the E4M3 staging buffer; P7-8), `2` K and V rounded to E4M3 for FP8 MMAs, otherwise exact in f16 |
 | `Q27_ATTN_FP4_STAGE` | 1 | NVFP4 KV prefill: `1` converts the context to an E4M3 staging buffer once per layer and chunk (mode 3: V only, 1 KiB per token of `max_tokens`, 256 MiB at 262K; with `Q27_ATTN_FP8=2` at startup K and V, 2 KiB per token, bit-identical to per-CTA conversion). `0`: convert in every CTA (mode 2). Sized at startup, read per call |
-| `Q27_ATTN_TC_F8` | empty | Decode / verify attention MMAs, read per call. Empty: FP8 with NVFP4 KV (P7-7), `1`: FP8 also with FP8 KV, `0`: BF16 / f16. FP8 means Q in E4M3 with per-row scales, NVFP4 KV re-rounded to E4M3, P in E4M3: 8% faster speculative steps at 131K and at 8 x 32K, no change on golden or needle retrieval |
+| `Q27_ATTN_TC_F8` | empty | Decode / verify attention MMAs, read per call. Empty or `1`: FP8 with FP8 and NVFP4 KV (P7-7; FP8 KV since P3-36), `0`: BF16 / f16 (a 16-row verify then takes two launches with FP8 KV). FP8 means Q in E4M3 with per-row scales, NVFP4 KV re-rounded to E4M3, P in E4M3: 8% faster speculative steps at 131K and at 8 x 32K, no change on golden or needle retrieval |
 
 ## Concurrency
 
@@ -251,7 +254,7 @@ variables:
 | --- | --- | --- |
 | `weights` | `WEIGHTS` | `gdnfp4`, `nvidia`, `quasar` (those downloaded), or the model directory the service started with |
 | `kv_dtype` | `KV_DTYPE` | `nvfp4`, `fp8`, `bf16` |
-| `spec` | `SPEC` | `dflash2`, `none` |
+| `spec` | `SPEC` | `dspine`, `dflash2`, `none` |
 | `vision` | `VISION` | `host`, `fp8`, `bf16`, `off` |
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
@@ -426,7 +429,7 @@ path if the folder moved.
 - **Browse...** chooses the **Weights folder** in Explorer's dialog: the folder with `hub\` in it (choosing `hub\` itself
   counts as the folder above). **Weights** lists the checkpoints of the model there, also those of other repositories
   ([Other checkpoints](#other-checkpoints)), and follows the folder at once, before you apply it, with the estimates of
-  that folder's weights. If the chosen weights or the DFlash2 draft are not there, the window says so (the draft's absence
+  that folder's weights. If the chosen weights or the draft are not there, the window says so (the draft's absence
   also means no estimate until `SPEC` is `none`) and asks first, as the server would download them.
 - To share one cache with WSL, set `HF_HOME` to it on the Windows drive. `huggingface_hub` or `hf download` under WSL with
   a 9p mount of the drive leaves links (LX symlinks) that Windows programs cannot read; the window names those
@@ -471,11 +474,11 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_SKINNY_EXACT=1` | Make a row's skinny-GEMM result independent of M (tests of tree verification and preemption) |
 | `Q27_SKINNY_EXT_REDUCE_M` | Rows from which the skinny GEMM's split-K reduction runs as a separate kernel (default 1: M >= 2; at M = 1 the last CTA reduces; same result; P7-4) |
 | `Q27_DRAFT_ATTN_TC=0` | The draft's attention on CUDA cores (default: tensor cores; P7-4) |
-| `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; the output is garbage) |
+| `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8,draft,dctx` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; `draft` / `dctx`: the draft model / its context update in a speculative step; the output is garbage) |
 | `Q27_DECODE_MEMCPY=1` | Decode inputs and outputs by copies instead of mapped pinned memory |
 | `Q27_ATTN_TC=0` | Decode / verify attention on CUDA cores (tree verification always uses them) |
 | `Q27_ATTN_TC_DEC=0` | Decode (T = 1) attention with one warp per token (same result) |
-| `Q27_ATTN_TC8_GRP=0` | With `Q27_ATTN_TC_F8=1`, compute T <= 2 in one warp instead of four (same result; static) |
+| `Q27_ATTN_TC8_GRP=0` | With the FP8 MMAs (`Q27_ATTN_TC_F8`), compute T <= 2 in one warp instead of four (same result; static) |
 | `Q27_KV_BLOCK=N` | Pages per block of the KV pool (P7-13; default the smallest count whose slice is >= 2 MiB: 57 for NVFP4, 32 for FP8, 16 for BF16). 1 lays pages out one by one (long-context decode 1.5% slower). Read at startup |
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
