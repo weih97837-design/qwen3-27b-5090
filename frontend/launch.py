@@ -16,10 +16,10 @@ import re
 import sys
 import threading
 
-from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
+from qwen27b.paths import DFLASH2, DRAFTS, DSPINE, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
-CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
+CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
 DEFAULT_RESERVE_GIB = 1.5   # VRAM_RESERVE_GIB when unset (memory.cc budget_for)
@@ -123,11 +123,27 @@ def parse_tier(key, text, warn=None):
     return default
 
 
+def downloaded(pin):
+    try:
+        return (snapshot(*pin) / "config.json").is_file()
+    except FileNotFoundError:
+        return False
+
+
+def default_spec():
+    """SPEC, else dspine; dflash2 when only DFlash2 is downloaded (a checkout updated from before DSpine became the
+    default, whose weights folder has DFlash2 alone: the server still starts, and logs how to get DSpine)."""
+    spec = os.environ.get("SPEC")
+    if spec:
+        return spec
+    return "dflash2" if not downloaded(DSPINE) and downloaded(DFLASH2) else "dspine"
+
+
 def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     reserve = env("VRAM_RESERVE_GIB")
-    return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
+    return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": parse_reserve(reserve)}
 
@@ -248,7 +264,7 @@ class Launch:
     def config(self, s):
         """The engine's configuration (worker.run) for settings s; FileNotFoundError when weights are missing."""
         path = model_dir(s["weights"])
-        draft = snapshot(*DFLASH2) if s["spec"] == "dflash2" else None
+        draft = snapshot(*DRAFTS[s["spec"]]) if s["spec"] in DRAFTS else None
         eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
                "VRAM_RESERVE_GIB": None if s["vram_reserve_gib"] is None else f"{s['vram_reserve_gib']:g}",

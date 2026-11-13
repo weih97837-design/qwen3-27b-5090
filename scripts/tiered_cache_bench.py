@@ -14,7 +14,7 @@ For each size, on a fresh engine (KV_POOL_TOKENS = 1.25 x size, so the next conv
   promote_ssd   prefix_begin of A restores it from the file
 
 Engine creation and the prefills of the checkpoints are not timed. Every timed call is bracketed by
-time.perf_counter(). The environment is passed through unchanged, so a flag the engine does not know is ignored
+time.perf_counter(). Engines get the server's draft model (--spec, default as the server's: dspine, else dflash2, else none). The environment is passed through unchanged, so a flag the engine does not know is ignored
 and the run still works. Compare variants in one command:
 
     python scripts/tiered_cache_bench.py --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
@@ -104,17 +104,19 @@ def grow_pinned(eng):
             pass
 
 
-def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
+def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info, spec):
     from q27lib import Engine
     from qwen27b.paths import engine_target
-    from tiered_cache_test import make_prompt
+    from tiered_cache_test import draft_path, make_prompt
+
+    draft = draft_path(spec)  # (the server's draft is loaded in its engine: the same VRAM budget and pool)
 
     A, B, C = (make_prompt(docs, size, i) for i in (0, 1, 2))
     promote_ids = A + [5]  # the checkpoint of A is a prefix of this
 
     set_env(size)
     t0 = time.perf_counter()
-    eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype)
+    eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype, draft=draft)
     grow_pinned(eng)
     info.append({"size": size, "engine_create_s": round(time.perf_counter() - t0, 2)})
     try:
@@ -171,7 +173,7 @@ def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info):
         eng.close()
 
     # the restart: a second engine imports the file and restores from it
-    eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype)
+    eng = Engine(engine_target(weights), max_tokens=size + 8192, kv_dtype=kv_dtype, draft=draft)
     grow_pinned(eng)
     try:
         ms, eid = timed(lambda: eng.spill_import(path))
@@ -195,7 +197,7 @@ def run_once(args):
             for sub in ("entries", "chunks"):
                 for f in pathlib.Path(spill_dir, sub).glob("*"):
                     f.unlink()
-            run_size(size, docs, spill_dir, args.weights, args.kv_dtype, rows, info)
+            run_size(size, docs, spill_dir, args.weights, args.kv_dtype, rows, info, args.spec)
     finally:
         if own:
             shutil.rmtree(spill_dir, ignore_errors=True)
@@ -232,10 +234,14 @@ def print_table(title, cols):
 
 
 def main():
+    from tiered_cache_test import SPEC_CHOICES, default_spec
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS,
                     help="weight profile: nvidia | gdnfp4 | quasar | a model directory (default: %(default)s)")
     ap.add_argument("--kv-dtype", default="nvfp4", choices=["bf16", "fp8", "nvfp4"])
+    ap.add_argument("--spec", choices=SPEC_CHOICES,
+                    help="draft model of the engines (default: the server's: $SPEC, else dspine if downloaded, else dflash2, else none)")
     ap.add_argument("--sizes", default="32768,131072,262144", help="checkpoint sizes in tokens, comma-separated")
     ap.add_argument("--spill-dir", help="where the SSD files go (default: a temp dir; use the kvcache volume to measure it)")
     ap.add_argument("--json", help="also write the results here")
@@ -244,6 +250,8 @@ def main():
     # internal: one variant in a child process
     ap.add_argument("--child-json", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    args.spec = args.spec or default_spec()
+    print(f"draft model: {args.spec}", flush=True)
     args.sizes = [int(x) for x in args.sizes.split(",") if x.strip()]
 
     if args.compare:
@@ -256,7 +264,7 @@ def main():
                 out = os.path.join(tmp, f"v{i}.json")
                 cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), "--child-json", out,
                        "--sizes", ",".join(map(str, args.sizes)), "--weights", args.weights,
-                       "--kv-dtype", args.kv_dtype]
+                       "--kv-dtype", args.kv_dtype, "--spec", args.spec]
                 if args.spill_dir:
                     cmd += ["--spill-dir", args.spill_dir]
                 print(f"\n# variant {i + 1}: {variant or '(no change)'}", flush=True)

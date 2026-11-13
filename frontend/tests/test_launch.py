@@ -16,7 +16,7 @@ import launch  # noqa: E402
 from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
-DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dflash2", "vision": "host", "max_seqs": 8,
+DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dspine", "vision": "host", "max_seqs": 8,
             "max_tokens": 262144, "vram_reserve_gib": None,
             **{k: (launch.spill_dir_default() if v[2] == "path" else v[1]) for k, v in launch.TIER_SETTINGS.items()}}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
@@ -128,9 +128,10 @@ def test_plans_match_the_engine():
     p = out["plan"]
     # The serve default's startup log on this device: kv pool 9461 pages (605504 tokens), device 28.377 GiB
     # (28.378 until the own GEMMs replaced CUTLASS and its 7.8 MiB workspace, then 28.370 until the penalty
-    # counts of the 8 sequences, 7.6 MiB).
-    assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 605504, True)
-    assert abs(p["device"] / GiB - 28.3775) < 0.001 and abs(p["budget"] / GiB - 28.70) < 0.01
+    # counts of the 8 sequences, 7.6 MiB). With the DSpine draft (the default since; window 2048): 601856 tokens,
+    # 28.3924 GiB (its codebook is in host memory, its sender table of the draft vocabulary, 256 MB, on the device).
+    assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 601856, True)
+    assert abs(p["device"] / GiB - 28.3924) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
     kv = {v["value"]: v["plan"] for v in out["variants"]["kv_dtype"]}
     assert kv["nvfp4"] == p and kv["fp8"]["kv_tokens"] < kv["nvfp4"]["kv_tokens"]
     big = {v["value"]: v["plan"] for v in out["variants"]["vram_reserve_gib"]}
@@ -406,3 +407,21 @@ def test_spill_fair_agents_setting(monkeypatch):
     monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
     assert launch.env_settings()["spill_fair_agents"] is False
     assert launch.tier_env_value("spill_fair_agents", False) == "0" and launch.tier_env_value("spill_fair_agents", True) == "1"
+
+
+def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
+    # A checkout updated from before DSpine became the default has DFlash2 alone: the server still starts.
+    have = set()
+    monkeypatch.setattr(launch, "downloaded", lambda pin: pin in have)
+    monkeypatch.delenv("SPEC", raising=False)
+    assert launch.default_spec() == "dspine"  # (nothing downloaded: the error names DSpine)
+    have.add(launch.DFLASH2)
+    assert launch.default_spec() == "dflash2"
+    have.add(launch.DSPINE)
+    assert launch.default_spec() == "dspine"
+    monkeypatch.setenv("SPEC", "")  # (compose.yaml passes an empty SPEC when unset)
+    assert launch.default_spec() == "dspine"
+    have.discard(launch.DSPINE)
+    monkeypatch.setenv("SPEC", "dspine")  # (asked for: no fallback)
+    assert launch.default_spec() == "dspine"
+    assert launch.env_settings()["spec"] == "dspine"

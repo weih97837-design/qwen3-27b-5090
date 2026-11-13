@@ -11,7 +11,7 @@ development:
 | 0 | Measurements of the GPU (bandwidth, MMA peaks, PCIe, the WSL2 memory limit), the reference model, golden recordings |
 | 1 | A working engine: loader, memory plan, straightforward kernels, decode and prefill without speculation |
 | 2 | Decode speed: skinny GEMMs, fused kernels, CUDA graphs and PDL |
-| 3 | Speculative decoding with DFlash2 |
+| 3 | Speculative decoding with DFlash2 (DSpine, the default since, came later) |
 | 4 | Memory: prefix cache, NVFP4 KV cache, vision tower |
 | 5 | Prefill speed |
 | 6 | Serving: API server, scheduler, several requests at once |
@@ -105,11 +105,40 @@ gate without an explicit decision, recorded below with its numbers.
   decode +0.2 to 1.4%. Golden on the decode path against the BF16 original: KL 0.0344 -> 0.0359; needle retrieval
   at 256K 56 -> 57 of 64. With the FP8 KV cache the verify is already near its read time and gains 0 to 2%, so it
   is not the default there (`Q27_ATTN_TC_F8=1`). Rows of one token stay bit-identical across 1 to 8 tokens.
+- **P3-36: the 16-row verify attention (DSpine).** A verify of 11 to 16 rows needs 5 or 6 compute warps of 16 rows.
+  With 4 producer warps that instance was capped at 168 registers (3 warps per SMSP) and spilled; with 2 producer
+  warps it keeps 255 registers: one NVFP4 layer at 32K keys, 16 rows, 93.9 -> 50.2 us (8 rows: 44.4 us), DSpine's
+  step on code at 32K 15.02 -> 14.50 ms with the same tokens. The FP8 MMAs are now also the default with the FP8 KV
+  cache: the BF16 / F16 kernel took a 16-row verify as two launches of 8 rows (106 vs 63 us per layer at 32K), while
+  1 and 8 rows are as fast or faster (golden on the decode path unchanged: KL 0.0336 -> 0.0332, P7-7).
+  The adaptive verify width now switches at a step that does not depend on the scheduling (a step launched ahead or
+  dropped by a parked sequence), so a sequence takes the same steps alone or interleaved with others.
 - **P5-11 for decode: not adopted.** The block-scaled FP8 MMA is twice as fast for prefill, but decode is
   bandwidth-bound and gained nothing, so the skinny GEMMs kept the plain FP8 MMA.
 
 ## Speculative decoding
 
+- **DSpine as the default draft, with an adaptive verify width** (2026-11). DSpine (the DFlash backbone with a code bridge
+  after every layer, blocks of 16) accepts far more tokens on code and JSON (JSON 10.4 against 6.5 tokens per step with
+  the default sampling), but a 16-row verify costs about 1.5 ms more per step than 8 rows here (12.5 ms), so on prose
+  and Japanese prose it lost to DFlash2 (0.88 and 0.99 times). Switching a request between 16 and 8 rows from the
+  moving average of its tokens per step fixed that: against DFlash2, code 1.19, JSON 1.46, ja-code 1.22, Japanese
+  1.06 and prose 1.00 times (one request, sampled), after two fixes in the draft: its table kernel decoded FP4 through
+  a table in local memory (270 -> 37 us), and the candidates' sender projections now come from a table built at load
+  for the draft vocabulary (256 MB) instead of codebook rows read over PCIe. Batched steps of several
+  requests draft 8 rows each; there DSpine accepts fewer tokens than DFlash2, and through the server the sum of
+  four and eight concurrent sampled requests is 0.96 and 0.94 times DFlash2's (one request 1.15 times; 2026-11-13,
+  [benchmarks.md](benchmarks.md#concurrent-requests)). DSpine stays the default because one request at a time is
+  the common case (a coding agent), and `SPEC=dflash2` remains for servers that mostly batch. The width depends only on past steps, so the output distribution
+  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
+  table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
+  DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
+  At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)
+  and Japanese (1.14), but prose is 0.93 times (DSpine accepts fewer prose tokens there: 3.07 against 3.26) and four
+  concurrent requests 0.97 to 0.99 times. Of a 16-row verify's extra 0.6 ms, the skinny GEMMs (+0.3) and the GDN
+  recurrence, sequential per token, take most; no split-K setting or batching of the GDN preparation helped.
+  DSpine was trained with an 8,192-token window; served with 2,048 it accepts as many tokens at 32K with 0.2-0.3 ms
+  shorter steps and a 40 MiB context ring per request instead of 160, so 2,048 is the default (`Q27_DRAFT_WINDOW`).
 - **DFlash2 with an 8-row chain** (Phase 3). The chain verify was built first, with every verify row
   bit-identical to the decode of the same token, so greedy speculative decoding must reproduce plain decoding
   exactly (a strict test). Short-context decode came out 1.36 to 1.62 times SGLang's DFlash2 on the same GPU.

@@ -14,7 +14,7 @@ is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If
 dies (a CUDA error), requests in flight fail with 503, /health answers 503 and a new engine is started.
 Requests are cancelled when the client disconnects or a stop string matches.
 
-    python frontend/server.py [--port 46320] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|none]
+    python frontend/server.py [--port 46320] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dspine|dflash2|none]
 """
 
 import argparse
@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "reference"))
 
 import structured  # noqa: E402
 import worker  # noqa: E402
-from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
+from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
 from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
@@ -50,7 +50,7 @@ from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _
 
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "qwen3.8-27b")
 DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config.json of the checkpoint
-SPEC_MARGIN = 8  # a verify block writes up to 8 positions past the committed length
+SPEC_MARGIN = 16  # a verify block writes up to 16 positions past the committed length (DSpine; DFlash2 8)
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
 UI_PAGE = ROOT / "frontend/ui/index.html"
@@ -504,7 +504,7 @@ class Generation:
         self.tokens, self.timings = 0, None
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
-        self.prefilled, self.toks, self.first_tok = None, [], None
+        self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
         req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
@@ -569,6 +569,8 @@ class Generation:
                     self.cached = msg[2]["cached"]
                 elif kind == "prefilled":
                     self.prefilled, self.toks = msg[2], self.toks[-1:]  # (it follows the prefill's token)
+                elif kind == "drafts":  # (the worker's counts so far, before the step's "tok")
+                    self.drafts = (msg[2], msg[3])
                 elif kind == "tok":
                     self.tokens += len(msg[2])
                     self.toks.append((time.time(), len(msg[2])))
@@ -615,6 +617,8 @@ class Generation:
         self.timings = {"computed_tokens": p["computed_tokens"], "prefill_s": p["prefill_s"], "ttft": p["ttft"],
                         "total": p["ttft"] + toks[-1][0] - self.first_tok,
                         "drafted": p["drafted"] + steps * p["draft_block"], "draft_accepted": p["draft_accepted"] + accepted}
+        if self.drafts:  # (exact: the steps' own block lengths)
+            self.timings["drafted"], self.timings["draft_accepted"] = self.drafts
 
     @property
     def usage(self):
@@ -1607,7 +1611,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
-    ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "none"])
+    ap.add_argument("--spec", default=default_spec(), choices=["dspine", "dflash2", "none"])
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
@@ -1644,6 +1648,11 @@ def main():
                                max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),
                     tokenizer=fingerprint(path))
     HUB.start()
+    if not os.environ.get("SPEC") and args.spec == "dflash2":  # (default_spec: DSpine is not downloaded)
+        note = ("the DSpine draft (the default) is not downloaded, so the DFlash2 draft is used: "
+                "scripts/download-weights.sh gets DSpine (4.1 GB), or set SPEC=dflash2 to keep DFlash2")
+        log(note)
+        HUB.add_log("admin", None, note, level="warn")
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
                           idle_unload=max(0.0, args.idle_unload))
     HUB.engine_idle = engine.idle_state

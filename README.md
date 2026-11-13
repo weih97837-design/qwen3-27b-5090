@@ -7,15 +7,16 @@ Anthropic-compatible APIs with images, so coding agents such as Claude Code and 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
 GPU. That buys two things:
 
-- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–2.8x the
-  single-request decode, 1.1–1.7x the throughput of eight concurrent requests, and a 152K-token prompt answered in
-  23 s instead of 31–56 s.
-- **The full 262K context with room to spare.** A 605K-token KV cache on a 32 GB card, 2.8–6.3x what the other
+- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–3.7x the
+  single-request decode, 1.02–1.6x the throughput of eight concurrent requests, and a 152K-token prompt answered in
+  22 s instead of 31–56 s.
+- **The full 262K context with room to spare.** A 602K-token KV cache on a 32 GB card, 2.8–6.3x what the other
   engines fit, with up to eight requests, images and speculative decoding all enabled at once. Of the others, only
   NInfer reached the model's whole 262,144-token context here, serving one request without speculative decoding.
 
-All numbers are measured at a **400 W power limit** (the card's default is 575 W), on the same day, driver and scripts
-for every engine. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
+All numbers are measured at a **400 W power limit** (the card's default is 575 W) with the same scripts: the other
+engines on 2026-10-11, this engine with its current default draft (DSpine) on 2026-11-13; the same-day numbers with
+the previous default are in the benchmarks too. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
 commands that reproduce them. At 575 W the engine is only 1–2% faster for one request and 9–26% faster for prefill
 and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 ([Power limit and energy](docs/benchmarks.md#power-limit-and-energy)).
@@ -24,14 +25,17 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 | On one RTX 5090 at 400 W | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| Decode, one request: code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
-| Eight concurrent requests, total (tok/s) | **1,395** | 1,260–1,277 | 837–851 | 912–930 |
-| Time to first token, 152K-token document | **23 s** | 31 s | 50 s | 56 s |
-| Time to first token, agent turn after a 20K-token history | **0.19 s** | 0.39 s | 0.31 s | 0.57 s |
-| Follow-up question on a 73K-token document | **0.14 s** | 10.9 s | 0.49 s | 1.01 s |
+| Decode, one request: code / JSON / prose (tok/s) | **410 / 674 / 263** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
+| Eight concurrent requests, total (tok/s) | **1,305** (1,392 with `SPEC=dflash2`) | 1,260–1,277 | 837–851 | 912–930 |
+| Time to first token, 152K-token document | **22 s** | 31 s | 50 s | 56 s |
+| Time to first token, agent turn after a 20K-token history | **0.22 s** | 0.39 s | 0.31 s | 0.57 s |
+| Follow-up question on a 73K-token document | **0.12 s** | 10.9 s | 0.49 s | 1.01 s |
 
-- **Speculative decoding** with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) block drafter,
-  batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+- **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
+  16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
+  `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+  DSpine is faster for one request (JSON 1.36x, code 1.07x); with four or eight requests at once DFlash2 is 4–7%
+  faster, so a server that mostly runs many requests at once may prefer `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -43,9 +47,9 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 | | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| KV cache (tokens) | **605,504** | 96,128 | 214,219 | 173,913 |
+| KV cache (tokens) | **601,856** | 96,128 | 214,219 | 173,913 |
 | Longest context of one request | **262,144** (the model's limit) | 94,208 | 196,608 | 160,000 |
-| ... at the same time as | 8 concurrent requests, images, DFlash2 | 4 requests | 4 requests, MTP | 8 requests, MTP |
+| ... at the same time as | 8 concurrent requests, images, DSpine | 4 requests | 4 requests, MTP | 8 requests, MTP |
 
 The other engines' columns are the largest settings with concurrency and speculative decoding that ran on this
 machine; NInfer and SGLang need other configurations for other scenarios (NInfer: 262K for one request without
@@ -139,6 +143,8 @@ first in either case.
 
 - **What to expect:** the weights in `./hf` stay where they are and are not downloaded again. Replacing the container
   ends the requests in progress and reloads the engine.
+  Updating from a version before DSpine became the default draft: run `scripts/download-weights.sh` to add it (4.1 GB);
+  until then the server keeps using DFlash2 and says so in its log.
 - **Which version is running:** this prints the commit of the image you have, to compare with the
   [commits](https://github.com/mkyt/qwen3-27b-5090/commits/main). (The output is empty for an image built here with
   `--build`.)
@@ -146,6 +152,11 @@ first in either case.
   ```bash
   docker image inspect local/qwen3-27b-5090-serve:tiered-kv-cache --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
   ```
+
+- **Where the image comes from:** an image built here has no provenance. The one GitHub Actions publishes from this
+  repository (`ghcr.io/<owner>/qwen3-27b-5090`, without the tiered cache's compose settings) carries a signed build
+  provenance attestation from v0.5.0 on, which the [GitHub CLI](https://cli.github.com/) checks:
+  `gh attestation verify oci://ghcr.io/<owner>/qwen3-27b-5090:latest --repo <owner>/qwen3-27b-5090`.
 
 - **Freeing disk space:** each update leaves the previous image behind, without a name.
   `docker image prune` deletes such images, including those of other projects, and asks first.
@@ -171,7 +182,10 @@ the state, and its menu starts and stops the server, changes its settings, opens
 the start at logon. The
 server then takes no VRAM until the first request and frees it after 30 minutes without one
 ([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
-first start (compare the zip's SHA-256 with the release's).
+first start. To check the download, compare the zip's SHA-256 with the release's, or, from v0.5.0, check its signed
+build provenance with the [GitHub CLI](https://cli.github.com/): `gh attestation verify
+qwen3-27b-5090-v0.5.0-windows-x64.zip --repo mkyt/qwen3-27b-5090` (also for `qwen3-27b-tray.exe` and
+`app\engine\build\q27.dll` in it).
 
 Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
 the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:46320
@@ -246,7 +260,7 @@ to change it. The most useful ones:
 | `MAX_SEQS` | 4 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
-| `SPEC` | `dflash2` | `dflash2` or `none` |
+| `SPEC` | `dspine` | `dspine`, `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
 [docs/configuration.md](docs/configuration.md) lists every setting. The RAM and SSD tiers for evicted KV checkpoints are in [docs/tiered-cache.md](docs/tiered-cache.md). By default the server accepts connections from this PC
@@ -348,7 +362,7 @@ docs/         architecture, decisions, configuration, benchmarks
 ## License
 
 MIT ([LICENSE](LICENSE)). The
-model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
+model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DSpine, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
 not distributed here; other checkpoints carry their own licenses. The Windows package also contains Python and its
 packages under their own licenses (in the package). The golden prompt texts are public domain or from this repository
 ([bench/golden/sources/README.md](bench/golden/sources/README.md)).

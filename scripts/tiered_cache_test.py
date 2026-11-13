@@ -66,7 +66,9 @@ conversations exceed the usable pool, so B's prefill evicts A's checkpoint. It p
 
 Native Windows package (no Docker, no torch): test.cmd runs this with the package's Python; the weights are where
 start.cmd downloads them (settings.ini HF_HOME, else the package's huggingface folder), q27.dll is app\\engine\\build\\.
-Without a draft model (SPEC=none, or DFlash2 not downloaded) scenario e is skipped. The default --weights is WEIGHTS
+--spec {dspine,dflash2,none} picks the draft model every engine of the test is created with (as the server does:
+default $SPEC, else dspine if downloaded, else dflash2 if downloaded, else none); it is printed at the start. Without a
+draft model (--spec none, or none downloaded) scenario e is skipped. The default --weights is WEIGHTS
 (settings.ini), else gdnfp4, in the package; nvidia elsewhere.
 """
 
@@ -88,6 +90,40 @@ sys.path.insert(0, str(ROOT / "reference"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # (the package's Python does not add this folder)
 import native_env  # noqa: E402 - before q27lib and qwen27b: they read HF_HOME and Q27_LIB when imported
 DEFAULT_WEIGHTS = native_env.apply()
+
+SPEC_CHOICES = ("dspine", "dflash2", "none")
+
+
+def default_spec():
+    """The draft the server starts with (frontend/launch.py default_spec): $SPEC, else dspine if downloaded, else dflash2 if
+    downloaded; none when neither is (the server would then still say dspine and log how to get it, a test cannot run it)."""
+    from qwen27b.paths import DFLASH2, DSPINE, snapshot
+
+    spec = os.environ.get("SPEC")
+    if spec:
+        return spec if spec in SPEC_CHOICES else "none"
+    for name, pin in (("dspine", DSPINE), ("dflash2", DFLASH2)):
+        try:
+            if (snapshot(*pin) / "config.json").is_file():
+                return name
+        except FileNotFoundError:
+            pass
+    return "none"
+
+
+def draft_path_or_missing(spec):
+    try:
+        return draft_path(spec)
+    except FileNotFoundError:
+        return "not downloaded: scenario e is skipped"
+
+
+def draft_path(spec):
+    """The draft checkpoint folder of a --spec value (None for none); FileNotFoundError when it is not downloaded."""
+    from qwen27b.paths import DRAFTS, snapshot
+
+    return snapshot(*DRAFTS[spec]) if spec in DRAFTS else None
+
 
 SCENARIOS = {
     "a": ("RAM promote", ["full"]),
@@ -161,7 +197,7 @@ def sizes(prompt_len, tokens):
 # whole KV blocks, and one page is kept back. The driver mirrors it so that it can size the conversations to it.
 PAGE_TOKENS = 64  # kPageTokens
 KV_HEADS = 4  # kKvHeads
-SPEC_BLOCK = 8  # kSpecBlock: a verify block writes up to 8 positions past the committed length
+SPEC_BLOCK = 16  # kSpecBlock: a verify block writes up to 16 positions past the committed length
 KV_ROW_BYTES = {"nvfp4": 144, "fp8": 256, "bf16": 512}  # kv_row_bytes(kv_type)
 EVICT_MARGIN = 4  # pages: the two conversations must exceed the usable pool by this much, so B's prefill evicts A
 AHEAD_PAGES = 0  # (ensure_pages_of evicts only for pages a sequence NEEDS; the 8 pages it maps ahead are taken only if free)
@@ -809,23 +845,24 @@ def grow_pinned(eng, tiered):
 
 def worker(a):
     from q27lib import Engine
-    from qwen27b.paths import DFLASH2, engine_target, snapshot
+    from qwen27b.paths import engine_target
 
     draft = None
-    if a.spec:
-        try:
-            draft = snapshot(*DFLASH2)
-        except Exception as e:  # noqa: BLE001 - no draft model here: the scenario is skipped
+    try:
+        draft = draft_path(a.spec)  # (every engine gets the server's draft, whether or not the scenario steps with it)
+    except FileNotFoundError as e:
+        if a.use_spec:  # (scenario e needs it; the others run without)
             return write_json(a.out, {"skip": f"no draft model ({e})"})
+        say(f"  (no {a.spec} draft: {e}; the engine runs without one)")
     _, max_tokens = sizes(a.prompt_len, a.tokens)
     say(f"  > Engine ({a.mode}, max_tokens {max_tokens}, KV_POOL_TOKENS {os.environ.get('KV_POOL_TOKENS')})")
     eng = Engine(engine_target(a.weights), max_tokens=max_tokens, kv_dtype=a.kv_dtype, draft=draft)
     say("  < Engine ready")
-    if a.spec and not eng.has_draft:
+    if a.use_spec and not eng.has_draft:
         return write_json(a.out, {"skip": "the engine has no draft model"})
     grow_pinned(eng, a.mode == "tiered")
     docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i", "j", "k"))
-    R = Run(eng, a.mode == "tiered", a.spec, a.tokens, docs, a.prompt_len, a.phase, print)
+    R = Run(eng, a.mode == "tiered", a.use_spec, a.tokens, docs, a.prompt_len, a.phase, print)
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
     if len(heads) != 4 and a.scenario not in ("h", "i", "j", "k"):  # (h builds its own prompts, which share their first tokens)
         raise SystemExit("the prompts do not differ in their first 64 tokens")
@@ -862,9 +899,9 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
     cmd = [sys.executable, "-u", "-X", "faulthandler", str(pathlib.Path(__file__).resolve()), "--worker",
            "--scenario", scen, "--mode", mode, "--phase", phase, "--out", str(out), "--spill-dir", str(spill_dir or ""),
            "--tokens", str(a.tokens), "--prompt-len", str(a.prompt_len), "--kv-dtype", a.kv_dtype, "--weights", a.weights,
-           "--ram-gib", str(a.ram_gib), "--pool-tokens", str(pool)]
+           "--ram-gib", str(a.ram_gib), "--pool-tokens", str(pool), "--spec", a.spec]
     if scen == "e":
-        cmd.append("--spec")
+        cmd.append("--use-spec")
     if prior:
         cmd += ["--prior", str(prior)]
     return set_env, cmd
@@ -924,6 +961,8 @@ def main():
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--pool-tokens", type=int,
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
+    ap.add_argument("--spec", choices=SPEC_CHOICES,
+                    help="draft model of every engine (default: the server's: $SPEC, else dspine if downloaded, else dflash2, else none)")
     ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j,k", help="a,b,c,d,e,f,g,h,i,j,k")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     ap.add_argument("--worker-cmd", metavar="SCENARIO",
@@ -936,10 +975,12 @@ def main():
     ap.add_argument("--out", help=argparse.SUPPRESS)
     ap.add_argument("--prior", help=argparse.SUPPRESS)
     ap.add_argument("--spill-dir", default="", help=argparse.SUPPRESS)
-    ap.add_argument("--spec", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--use-spec", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.worker:
         return worker(a)
+    a.spec = a.spec or default_spec()
+    say(f"draft model: {a.spec}" + ("" if a.spec == "none" else f" ({draft_path_or_missing(a.spec)})"), flush=True)
 
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
