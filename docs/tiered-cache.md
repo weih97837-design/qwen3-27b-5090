@@ -52,7 +52,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 以下全部是 `compose.yaml` 中 `serve` 服務的環境變數，可在 `.env` 或 shell 中覆寫，於容器啟動時生效。
 
 `SPILL_RAM_GIB`、`SPILL_RAM_RETENTION_S`、`SPILL_SSD_GIB`、`SPILL_SSD_MIN_FREE_GIB`、`SPILL_SSD_MIN_TOKENS`、`SPILL_TTL_DAYS`、`VRAM_BACKUP_IDLE_S`、
-`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`、`SPILL_FAIR_AGENTS` 與 `SPILL_DIR` 也是啟動設定：可以在 /ui 的「啟動設定」
+`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`、`SPILL_FAIR_AGENTS`、`SPILL_UNUSED_TTL_S`、`SPILL_COLD_AFTER_S`、`SPILL_COLD_FIRST`、`SPILL_SSD_WARM_ONLY`、`SPILL_PROBATION_GIB` 與 `SPILL_DIR` 也是啟動設定：可以在 /ui 的「啟動設定」
 （**分層快取** 區段）和 Windows 托盤程式的設定視窗（**Tiered cache** 群組）直接修改，不必手動編輯 `settings.ini` 的 `[env]`。
 引擎程序與 `TierPolicy` 在引擎載入時才讀取這些值，所以要重新啟動引擎才會生效（/ui 按 **重新啟動**，托盤按 **Apply**）。
 環境變數與 `settings.ini` 的值仍是伺服器啟動時的初始值；在 /ui 改的值只持續到伺服器重新啟動，要永久保留請寫入變數
@@ -71,6 +71,11 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `SPILL_SSD_MIN_TOKENS` | `32768` | 短於此 token 數的 checkpoint 不會寫入 SSD：超過 RAM 保留時間後直接從 RAM 丟棄。每個 checkpoint 都帶約 190 MiB 的遞迴狀態，與長度無關；短前綴重算只需約 0.2–0.4 秒，與讀回時間相近，寫入只會浪費 SSD 空間與寫入壽命。`0`：不設下限（舊行為）。已在磁碟上的檔案不受影響；`/metrics` 的 `ssd_skipped_short` 計算被丟棄的筆數 |
 | `SPILL_TTL_DAYS` | `7` | 自寫入 SSD 起算（重用後會重新計時），超過此天數的檔案會被刪除 |
 | `SPILL_FAIR_AGENTS` | `1` | `1`：RAM 層或 SSD 層要騰出空間時，從**目前在該層用量最大的 agent** 挑逐出對象（共用 chunk 的位元組平分給引用它的各 agent），再依「被取代 → 從未重用 → 最久未用」。`0`：整層直接用同一個順序，沒有 agent 這一步。VRAM 仍是單純 LRU。見「保留策略」 |
+| `SPILL_COLD_FIRST` | `1` | `1`：要騰出空間時，**冷 agent** 的 entry 比一切都先逐出（見「保留策略」步驟 0）。`0`：沒有這一步 |
+| `SPILL_COLD_AFTER_S` | `600` | 某 agent 在該層沒有任何 entry 被命中過、且它在該層最新的 entry 已超過這麼多秒，就是冷的；剛建立的對話還不算冷 |
+| `SPILL_UNUSED_TTL_S` | `1800` | entry 從建立（進 RAM）或寫入 SSD 起，這麼多秒都沒有被命中，就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠（一次性 agent 不該佔著快取）。有命中過的 entry 照原規則；共用的短前綴（≤ 16,384 token）、閒置備份、還原中的 entry 不受影響。`0`：關閉。計入計數器 `expired`（`q27:tier_expired`） |
+| `SPILL_SSD_WARM_ONLY` | `1` | `1`：RAM → SSD 時，從未命中、且其 agent 也沒有任何命中的 entry（「未證明」）不寫入：沒有明確 id 的 `auto:` agent 直接丟棄，有明確 id 的只能在試用額度內寫入。`0`：全部照舊寫入。計入 `not_written`（`q27:tier_not_written`） |
+| `SPILL_PROBATION_GIB` | `4` | 所有「未證明」entry 在 SSD 上合計最多佔用的容量（邏輯 GiB）；滿了先丟最舊的未證明 entry。warm agent 的 entry 不計入 |
 | `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
 | `VRAM_BACKUP_VICTIMS` | `8` | 閒置備份只複製「下一批會被逐出」的前 N 個 checkpoint（`0`：全部）。只能用環境變數設定 |
@@ -340,7 +345,11 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 45 筆被還原（< 5%）。快取留住的大多是不會再用的 entry。因此 RAM 與 SSD 兩層用**同一條**逐出規則（實作：`engine/src/retention.h`、`chunk_store.h` 的
 `pick_victim` 給引擎的 RAM 層；`frontend/tiercache.py` 的 `_pick_victim` 給 SSD 層，兩者互相對照測試）。victim 是下列順序的最小值：
 
-1. **用量最大的 agent**（`SPILL_FAIR_AGENTS=1`，預設）：該層裡 agent 的位元組 = 它自己 entry 的 tail／狀態／manifest，加上共用 chunk 的位元組除以「引用該 chunk 的
+0. **冷 agent 先**（`SPILL_COLD_FIRST=1`，預設）：agent 在某一層是**冷**的，當且僅當它在該層**沒有任何 entry 的 hits > 0**，且它在該層**最新**的 entry 已超過
+   `SPILL_COLD_AFTER_S`（預設 600 秒；剛建立的對話還不算冷；未知 agent 0 不是 agent，永遠不冷）。只要候選裡有冷 agent 的 entry，victim 就只從它們選；
+   多個冷 agent 時由下一步挑**用量最多的**（同量 id 小的先；沒有時間排序，因為引擎與 Python 的時鐘不同）。再依步驟 2–4 選 entry。
+   「在該層」是看整層（包含還原中的 entry）而不只是候選。
+1. **用量最大的 agent**（`SPILL_FAIR_AGENTS=1`，預設；若有步驟 0 則只在冷 agent 之間）：該層裡 agent 的位元組 = 它自己 entry 的 tail／狀態／manifest，加上共用 chunk 的位元組除以「引用該 chunk 的
    不同 agent 數」。完全彈性，沒有保證的最小份額；未知 agent 自成一桶（`unknown`）。同量時 id 小的先。
 2. 在該 agent 內，**被取代（superseded）**的 entry 先走。
 3. **從未重用（hits = 0）**先於重用過的。`hits` = 該 entry（或它由來的 VRAM checkpoint）被還原或被 `prefix_begin` 選為命中的次數；隨 entry 在 VRAM／RAM／SSD 間移動，
@@ -348,6 +357,22 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 4. 最後才是舊規則：釋放記憶體最多者，且在最佳值 2 倍範圍內取最久未用（SSD：unique 位元組太少的排後面，其餘最舊寫入先）。
 
 引擎的 RAM 層仍分兩類：閒置備份（VRAM 還有原件）永遠先於唯一副本，上面的順序在各類內套用。
+
+**一次性 agent 的三條規則**（沒有再回來的 agent id，含沒有 `X-Agent-Id`、每次得到新 `auto:xxxxxxxx` 的請求；它們不該佔著 RAM／SSD）：
+
+- **A. 從未命中的存活期限**（`SPILL_UNUSED_TTL_S`，預設 1800 秒，`0` 關閉）：entry 從進 RAM（frontend 第一次在 tick 看到它的時間）或寫入 SSD（檔案時間）起，這麼久都沒有命中（hits = 0），
+  就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠；計入計數器 `expired`。hits > 0 的 entry 照既有規則（`SPILL_TTL_DAYS` 等）。**不會丟**：共用的短前綴（≤ 16384 token，與「被取代」同一個豁免）、
+  閒置備份（VRAM 還有原件）、還原中的 entry、以及引擎沒有回報 `hits` 的 entry（舊引擎）。預設 1800 < `SPILL_RAM_RETENTION_S`（3600），所以從未命中的 entry 在 RAM 就會過期，通常到不了 SSD 寫入。
+- **B. 冷 agent 先逐出**：上面的步驟 0。RAM 層由引擎判斷（`Spilled::born` = entry 進 RAM 的時間；`retention.h` 的 `cold_agents`），SSD 層由 frontend 判斷（寫入時間）；
+  各層只由一邊決定，所以兩邊時鐘不同也不會互相矛盾。
+- **C. 沒證明價值的 agent 不佔 SSD**（`SPILL_SSD_WARM_ONLY=1`，預設）：「未證明」= entry 沒有命中，且其 agent 在引擎回報的**任何** entry 都沒有命中（agent 0 與 ≤ 16384 token 的共用前綴除外）。
+  未證明的 entry 要從 RAM 寫入 SSD 時：沒有明確 id 的 `auto:` agent 直接丟棄（`not_written`）；有明確 id 的 agent 可以寫，但所有未證明 entry 合計最多佔 `SPILL_PROBATION_GIB`（預設 4 GiB，邏輯大小）的 SSD，
+  滿了就先丟最舊的未證明 entry（也計入 `not_written`）。agent 一旦有命中就是 warm，它的 entry 走一般規則、不計入額度。`flush()`（停止時寫出）套用同一個閘門；每次 tick 也會清掉因其他路徑
+  （引擎在 RAM 吃緊時自己寫出）而進了 SSD 的未證明 entry。`SPILL_SSD_WARM_ONLY=0`：全部照舊寫入（額度不使用）。
+
+**取捨**：全新 agent id 的第一段對話，在該 agent 有第一次命中之前，不會（`auto:`）或只在 4 GiB 試用額度內（有 id）留在 SSD；而且未證明的 entry 仍受規則 A 約束，所以一個新 agent 若隔了比
+`SPILL_UNUSED_TTL_S` 更久才回來，會重算一次（那一次的命中之後它就是 warm 了）。`auto:` agent 是否為 `auto:` 由 worker 告知 TierPolicy（owner id 是雜湊，無法反推），重啟後這份記憶消失：重啟後它們被當成有 id 的 agent（走試用額度，不會立刻被丟）。
+**已知限制**：hits 不會衰減，所以只要有過一次命中，agent 就永遠 warm／不冷；agent 的有命中 entry 若已被還原到 VRAM（離開該層）或被逐出，其餘留在該層的 never-hit entry 會讓 agent 在該層看起來是冷的（以「該層」為準，這是設計）。
 
 **被取代**：entry 的 token 是另一個 entry（RAM、SSD 或 VRAM 池中的 checkpoint）的嚴格前綴、較深者可以代替它（草稿環形緩衝有效性涵蓋）、長度 > 16384
 （`kKeepShort`；更短的是新對話共用的系統提示詞）、**不是分岔點**（所有延伸它的 entry 都在最深者那條鏈上）、也**不是共用前綴**（它與延伸它的 entry 屬於 ≥ 2 個 agent）。

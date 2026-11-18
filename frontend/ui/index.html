@@ -874,7 +874,7 @@ function drawSlots() {
 
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["擠出 spilled", "spilled"], ["載回 restored", "restored"], ["寫入 SSD written", "written"],
-  ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+  ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["過期丟棄 expired", "expired"], ["未寫入 SSD not_written", "not_written"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
 function tierCol(title, used, cap, note) {
   const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
   return el("div", { class: "tier" },
@@ -932,7 +932,7 @@ function drawTiers() {
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
   "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
-  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"];
+  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "SPILL_UNUSED_TTL_S", "SPILL_COLD_AFTER_S", "SPILL_COLD_FIRST", "SPILL_SSD_WARM_ONLY", "SPILL_PROBATION_GIB", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
   const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
@@ -1100,6 +1100,11 @@ const TIER_OPTS = [
   { key: "spill_async_io", label: "非同步複製", note: "SPILL_ASYNC_IO", help: "KV 複製使用獨立的 stream；請搭配固定 RAM 使用。請先用 scripts/tiered_cache_test.py 測試。", kind: "flag" },
   { key: "spill_async_promote", label: "延遲命中", note: "SPILL_ASYNC_PROMOTE", help: "命中已擠出存檔點的請求會等它載回，其他請求照常執行。", kind: "flag" },
   { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。關閉：對全部項目套用該順序。", kind: "flag" },
+  { key: "spill_unused_ttl_s", label: "從未命中保留時間", note: "SPILL_UNUSED_TTL_S", help: "一份存檔點從存入起這麼多秒都沒有被命中，就從 RAM 與 SSD 丟棄（不論還有沒有空間）。曾命中的不受影響。0 表示關閉。", kind: "num", unit: "s", step: "60" },
+  { key: "spill_cold_after_s", label: "冷 Agent 門檻", note: "SPILL_COLD_AFTER_S", help: "某 Agent 在該層沒有任何命中、且最新的存檔點已超過這麼多秒，就算「冷」；剛開始的對話不算。", kind: "num", unit: "s", step: "60" },
+  { key: "spill_cold_first", label: "冷 Agent 先淘汰", note: "SPILL_COLD_FIRST", help: "RAM 或 SSD 已滿時，先淘汰冷 Agent 的項目（其中用量最多者先），再套用公平淘汰順序。", kind: "flag" },
+  { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。", kind: "flag" },
+  { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_dir", label: "SSD 資料夾", note: "SPILL_DIR", help: "擠出的存檔點寫入的位置。留空：只用 RAM。", kind: "path" },
 ];
 // Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's

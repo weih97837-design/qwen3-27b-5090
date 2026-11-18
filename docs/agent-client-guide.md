@@ -28,6 +28,12 @@ curl http://127.0.0.1:46320/v1/chat/completions \
 
 OpenAI SDK 以 `default_headers={"X-Agent-Id": "reviewer/pr-1842"}` 設定，或在請求加 `user="reviewer/pr-1842"`。
 
+### 一次性 agent
+
+伺服器把「只呼叫一次或幾次、之後不再出現」的代理 id（包含沒帶 id、每次得到新 `auto:xxxxxxxx` 的請求）視為一次性：它們的快取會優先被逐出（冷 agent 先走），從未命中超過 `SPILL_UNUSED_TTL_S`（預設 30 分鐘）就丟棄，
+而且在該代理有第一次命中之前不會寫進 SSD（`auto:` 完全不寫，有 id 的只有 4 GiB 試用額度）。所以**常駐的代理一定要帶固定的 `X-Agent-Id`**：沒有 id 的請求看起來就是一次性代理，而且沒有 id 就永遠不會變成 warm
+（每個不同的提示詞開頭都是新的 `auto:` id）。第一次命中之後，該代理的快取就走一般規則。詳見 `docs/tiered-cache.md` 「保留策略」。
+
 ## 2. 讓提示詞前綴位元組穩定
 
 前綴快取比對的是**token id 序列的最長共同前綴**。你的請求只要和上一個請求在某個位置開始不同，那個位置之後的所有東西都要重新計算。代理的提示詞動輒幾萬 token，所以這是最大的效能因素。

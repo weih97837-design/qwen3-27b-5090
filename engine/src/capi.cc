@@ -146,6 +146,9 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   if (const char* e = getenv("SPILL_DEDUP")) o.spill_dedup = atoi(e) != 0;
   // SPILL_FAIR_AGENTS (default 1): the RAM tier's victim comes from the agent using the most RAM (retention.h); 0: no per-agent step.
   if (const char* e = getenv("SPILL_FAIR_AGENTS"); e && *e) o.spill_fair_agents = atoi(e) != 0;
+  // SPILL_COLD_FIRST (default 1) / SPILL_COLD_AFTER_S (default 600): cold agents' entries are the first RAM victims (retention.h).
+  if (const char* e = getenv("SPILL_COLD_FIRST"); e && *e) o.spill_cold_first = atoi(e) != 0;
+  if (const char* e = getenv("SPILL_COLD_AFTER_S"); e && *e) o.spill_cold_after_s = std::max(0.0, atof(e));
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {

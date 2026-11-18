@@ -695,6 +695,18 @@ static void test_retention_order() {
   // within the big agent the rules still apply
   f[2].hits = 0;
   CHECK(pick_victim(f, true) == 2);
+  // step 0 (cold agents first): the cold agent's entry goes before the biggest agent's, even a hit / newer one; among cold agents the
+  // one with the most bytes; cold_first = false and no cold candidate leave the order alone
+  {
+    V c{cand(1, 500, 9, 900.0, 0, true), cand(50, 500, 7, 10.0, 4, false), cand(60, 500, 5, 300.0, 0, false), cand(70, 500, 6, 20.0, 0, false)};
+    c[1].cold = true, c[2].cold = true;  // (a "cold" flag is the caller's: here agent 7 is flagged although an entry hit, to see the order only)
+    CHECK(pick_victim(c, true) == 2);          // cold agents 7 (10 B) and 5 (300 B): the one with the most bytes
+    CHECK(pick_victim(c, true, false) == 0);   // step 0 off: the biggest agent (9), its superseded entry
+    CHECK(pick_victim(c, false) == 1 || pick_victim(c, false) == 2);  // no fairness: the cold ones, steps 2-4: never hit before hit
+    CHECK(pick_victim(c, false) == 2);
+    c[1].cold = c[2].cold = false;
+    CHECK(pick_victim(c, true) == 0);          // nobody cold: the old order
+  }
   // ties between agents: the smaller id
   CHECK(pick_victim(V{cand(5, 100, 4, 50.0, 0, false), cand(1, 100, 3, 50.0, 0, false)}) == 1);
   // the class choice is unchanged by the order: a backup of a small agent still goes before a sole copy

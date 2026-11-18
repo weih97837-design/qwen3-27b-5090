@@ -59,6 +59,10 @@ def make(tmp_path, budget=1000, fair=True, retention=0, **kw):
     eng = RetEngine()
     clock = Clock()
     d = tmp_path / "spill"
+    for off in ("unused_ttl_s", "cold_after_s", "probation_gib"):  # (the never-hit / cold / warm-only rules are off here: test_cold_agents.py)
+        kw.setdefault(off, 0 if off == "unused_ttl_s" else 600 if off == "cold_after_s" else 4)
+    kw.setdefault("cold_first", False)
+    kw.setdefault("ssd_warm_only", False)
     tier = TierPolicy(eng, str(d), ram_retention_s=retention, ssd_gib=budget * B, ssd_min_free_gib=0, ttl_days=7, tick_s=0, clock=clock,
                       disk_free=lambda _d: 10 ** 12, log=lambda _m: None, ssd_min_tokens=8192, fair_agents=fair, **kw)
     tier.start()
@@ -322,10 +326,12 @@ def test_dedup_layout_make_room_applies_the_retention_order(tmp_path):
     assert sorted(eng.entries) == sorted([big_hit, small_never])
 
 
-def _engine_pick(cands, fair):
+def _engine_pick(cands, fair, cold_first=False):
     """A port of chunk_store.h pick_victim for candidates of equal `freed` (what the SSD's order compares): agent with the most bytes
     (ties: smaller id), then superseded, then never hit, then least recently used."""
     pool = list(cands)
+    if cold_first and any(c.get("cold") for c in pool):  # step 0: the entries of cold agents
+        pool = [c for c in pool if c.get("cold")]
     if fair:
         top = max(pool, key=lambda c: (c["use"], -c["owner"]))["owner"]
         pool = [c for c in pool if c["owner"] == top]

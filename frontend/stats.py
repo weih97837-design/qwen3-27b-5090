@@ -198,7 +198,7 @@ UNKNOWN_AGENT = "unknown"
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
                    "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS",
-                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "VRAM_BACKUP_IDLE_S",
+                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "SPILL_UNUSED_TTL_S", "SPILL_COLD_AFTER_S", "SPILL_COLD_FIRST", "SPILL_SSD_WARM_ONLY", "SPILL_PROBATION_GIB", "VRAM_BACKUP_IDLE_S",
                    "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")
 DAY_S = 86400.0
 
@@ -346,6 +346,7 @@ def tiers_block(engine, tiers, environ=None):
                 "ram_reuse_rate": _rate(sp.get("restored_ram"), sp["spilled"]),
                 "ssd_reuse_rate": _rate(sp.get("restored_disk"), sp["written"]),
                 "fair_agents": ts.get("fair_agents"), "ssd_skipped_superseded": ts.get("ssd_skipped_superseded", 0),
+                "expired": ts.get("expired", 0), "not_written": ts.get("not_written", 0),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
                 "dir": str(directory) if directory else None}

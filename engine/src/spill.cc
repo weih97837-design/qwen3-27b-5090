@@ -95,7 +95,8 @@
 //      and recycles the load event; the entry is not left busy (spill_promote's own guard; spill_restore_begin /
 //      spill_restore_poll for a restore, which also drop its restoring_ record and report it failed).
 //
-// RETENTION (retention.h, docs/tiered-cache.md "Retention"). Which entry spill_enforce_ram evicts is value based: the agent using the
+// RETENTION (retention.h, docs/tiered-cache.md "Retention"). Which entry spill_enforce_ram evicts is value based: the entries of COLD
+// agents first (Options::spill_cold_first; Spilled::born is when an entry came to RAM), then the agent using the
 // most RAM (Options::spill_fair_agents), then superseded entries, never-hit before hit ones, then the old rule (chunk_store.h
 // pick_victim); a superseded sole copy is dropped, never written to the SSD. An entry's `owner` (Model::set_owner, carried by the
 // sequence through park / resume), `hits` (a prefix_begin match, or a restore) and the manifest's copy of both (version 2) follow the
@@ -669,6 +670,7 @@ uint64_t Model::spill_add(const Checkpoint& c, Spilled&& s, bool live) {
   s.ring = c.ring;
   s.last_use = c.last_use;
   s.owner = c.owner, s.hits = c.hits, s.last_hit = c.last_hit;
+  s.born = ret_now_s();
   s.live = live;
   const size_t own = s.own_bytes();
   const uint64_t id = spill_next_;
@@ -1349,17 +1351,25 @@ void Model::spill_enforce_ram() {
       std::vector<VictimCand> cand[2];  // [0] the idle backups, [1] the sole copies
       std::vector<std::map<uint64_t, Spilled>::iterator> its[2];
       const std::map<uint64_t, double> use = opt_.spill_fair_agents ? spill_use(false) : std::map<uint64_t, double>();
+      std::set<uint64_t> cold;  // (the agents that are cold in the RAM tier: every entry in RAM counts, busy ones too)
+      if (opt_.spill_cold_first) {
+        std::vector<ColdEntry> tier;
+        for (const auto& kv : spill_)
+          if (kv.second.in_ram()) tier.push_back({kv.second.owner, kv.second.hits, kv.second.born});
+        cold = cold_agents(tier, ret_now_s(), opt_.spill_cold_after_s);
+      }
       for (auto it = spill_.begin(); it != spill_.end(); ++it)
         if (it->second.in_ram() && !it->second.busy) {
           const Spilled& s = it->second;
           const int cls = s.live ? 0 : 1;
           VictimCand vc{s.last_use, spill_freed(s), s.state_bytes};
           vc.agent = s.owner, vc.hits = s.hits, vc.superseded = spill_superseded(it->first);
+          vc.cold = cold.count(s.owner) > 0;
           if (const auto u = use.find(s.owner); u != use.end()) vc.agent_use = u->second;
           cand[cls].push_back(vc);
           its[cls].push_back(it);
         }
-      if (const VictimChoice v = choose_victim(cand[0], cand[1], opt_.spill_fair_agents); v.pass >= 0) {
+      if (const VictimChoice v = choose_victim(cand[0], cand[1], opt_.spill_fair_agents, opt_.spill_cold_first); v.pass >= 0) {
         victim = its[v.pass][size_t(v.idx)];
         victim_sup_durable = spill_superseded(victim->first, true);
       }

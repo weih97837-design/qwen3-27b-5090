@@ -183,6 +183,19 @@ int main() {
     CHECK(ids.size() > 600 && sup > 0 && sup < ids.size());
     CHECK(ms < 5000);  // (a sanity bound for sanitizer builds; the number printed above is the one to read, on an -O2 build)
   }
+  {  // cold agents: no hit in the tier and the newest entry at least `after` seconds old; agent 0 is never cold
+    const double now = 1000, after = 600;
+    std::vector<ColdEntry> t{{1, 0, 100}, {1, 0, 300},   // agent 1: newest entry 700 s old: cold
+                             {2, 0, 100}, {2, 0, 500},   // agent 2: its newest entry is 500 s old: not cold yet
+                             {3, 2, 0},                  // agent 3: old but hit: warm
+                             {4, 0, 0}, {4, 1, 900},     // agent 4: one entry hit: warm
+                             {0, 0, 0},                  // unknown bucket: never cold
+                             {5, 0, 400}};               // agent 5: exactly `after` old: cold
+    const auto c = cold_agents(t, now, after);
+    CHECK(c == std::set<uint64_t>({1, 5}));
+    CHECK(cold_agents(t, now, 0).count(2) == 1 && cold_agents(t, now, 0).count(3) == 0 && cold_agents(t, now, 0).count(0) == 0);
+    CHECK(cold_agents({}, now, after).empty());
+  }
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
 }

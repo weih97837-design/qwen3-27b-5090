@@ -4,6 +4,8 @@
 // agree on random candidates.
 //
 // ONE order for a tier (the victim is the minimum):
+//   0. entries of COLD agents first (SPILL_COLD_FIRST=0 skips this step; cold_agents() below). Among them step 1 picks the agent
+//      using the most bytes, so "the cold agent with the most bytes" goes first, then steps 2-4 inside it,
 //   1. the agent that uses the MOST bytes in this tier (fractional attribution below; SPILL_FAIR_AGENTS=0 skips this step), then
 //      within that agent
 //   2. superseded entries first (an intermediate checkpoint of a conversation whose deeper checkpoint exists),
@@ -26,7 +28,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -52,6 +56,33 @@ inline std::vector<uint64_t> block_hashes(const std::vector<int32_t>& ids) {
     prev = h[k] = x ^ (x >> 29);
   }
   return h;
+}
+
+// Wall-clock seconds for the age of an entry (a monotonic clock: only differences are used).
+inline double ret_now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// COLD agents of a tier (SPILL_COLD_AFTER_S, SPILL_COLD_FIRST): an agent none of whose entries in the tier has hits > 0 and whose NEWEST
+// entry there is at least `after` seconds old (born: when the entry came to the tier). A just-created conversation is not cold yet.
+// Agent 0 is the "unknown" bucket, not an agent: never cold. `entries` is the whole tier (also entries that cannot be victims now:
+// busy ones count for the agent's hits and age). frontend/tiercache.py _cold_owners is the same rule, from the times it keeps.
+struct ColdEntry {
+  uint64_t owner = 0;
+  uint32_t hits = 0;
+  double born = 0;
+};
+inline std::set<uint64_t> cold_agents(const std::vector<ColdEntry>& entries, double now, double after) {
+  std::map<uint64_t, std::pair<bool, double>> a;  // owner -> (any hit, newest born)
+  for (const ColdEntry& e : entries) {
+    auto it = a.emplace(e.owner, std::make_pair(false, e.born)).first;
+    it->second.first = it->second.first || e.hits > 0;
+    it->second.second = std::max(it->second.second, e.born);
+  }
+  std::set<uint64_t> cold;
+  for (const auto& [o, v] : a)
+    if (o != 0 && !v.first && now - v.second >= after) cold.insert(o);
+  return cold;
 }
 
 struct RetNode {
