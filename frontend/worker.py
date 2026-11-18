@@ -188,6 +188,48 @@ class Seq:
         return self._bytes
 
 
+def media_end(prompt, lo, hi, vision_end=None):
+    """The position after the last media placeholder (an id >= VOCAB: an image or a pair of video frames) in
+    prompt[lo:hi], with the vision-end token that closes the span when it follows; 0 without media. Everything of the
+    media is before this position, the text after it (the question) is not."""
+    j = next((i for i in range(hi - 1, lo - 1, -1) if prompt[i] >= VOCAB), -1)
+    if j < 0:
+        return 0
+    return j + 2 if vision_end is not None and j + 1 < hi and prompt[j + 1] == vision_end else j + 1
+
+
+def plan_checkpoints(prompt, reusable, im_start, user, breaks, vision_end=None):
+    """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
+    and tools), the starts of the last message and of the generation prompt (a retried request, or a
+    client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
+    prefix shared inside a message), and, in a final user message, the end of its last image or video (the next
+    question about the same media shares all of it: no pair past the cached prefix is decoded, encoded or
+    prefilled again) and after its last blank line (a document followed by a question: the next question about it
+    shares the document). The end of the generation is saved after it."""
+    starts = [i for i, t in enumerate(prompt) if t == im_start]
+    at = set(starts[1:2] + starts[-2:])
+    if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == user:
+        # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
+        # the document and miss a follow-up question that differs only after it)
+        g = starts[-1] // 64 * 64
+
+        def add(pos):
+            # (a new position must keep more than 64 tokens from the other planned positions, our sibling share's
+            # `reusable` included: a chunk of <= 64 tokens between two checkpoints takes the decode GEMMs)
+            r = pos // 64 * 64
+            others = [q // 64 * 64 for q in at | ({reusable} if reusable > 0 else set()) if q != starts[-1]]
+            if pos and 0 < r < g and all(abs(r - q) > 64 for q in others):
+                if g - r <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
+                    at.discard(starts[-1])
+                at.add(pos)
+
+        add(media_end(prompt, starts[-2], starts[-1], vision_end))
+        add(next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in breaks), 0))
+    if reusable > 0:
+        at.add(reusable)
+    return sorted(at)
+
+
 class Scheduler:
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
@@ -195,6 +237,7 @@ class Scheduler:
     returns = ()  # (video loans to give back; __init__ makes the deque)
     user = None  # the id of "user" and the ids of blank-line tokens (checkpoints: after the last blank line of a final user message)
     breaks = frozenset()
+    vision_end = None  # the id of <|vision_end|> (checkpoints: the end of a media span)
     last_active = 0.0
     backup_done = False
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
@@ -249,6 +292,7 @@ class Scheduler:
         self.im_start = cfg["im_start"]
         self.user = cfg.get("user")
         self.breaks = frozenset(cfg.get("breaks", ()))
+        self.vision_end = cfg.get("vision_end")
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
         self.slot_lanes = {}     # rid -> UI lane (1-based) in the last stats snapshot (slot_rows keeps lanes still)
@@ -932,29 +976,8 @@ class Scheduler:
             return f"?({type(e).__name__})", ""
 
     def checkpoints(self, prompt, reusable):
-        """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
-        and tools), the starts of the last message and of the generation prompt (a retried request, or a
-        client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
-        prefix shared inside a message), and after the last blank line of a final user message (a document followed
-        by a question: the next question about it shares the document). The end of the generation is saved
-        after it."""
-        starts = [i for i, t in enumerate(prompt) if t == self.im_start]
-        at = set(starts[1:2] + starts[-2:])
-        if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
-            # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
-            # the document and miss a follow-up question that differs only after it)
-            b = next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in self.breaks), 0)
-            g = starts[-1] // 64 * 64
-            # (b must also keep more than 64 tokens from the other planned positions, our sibling share's `reusable`
-            # included: a chunk of <= 64 tokens between two checkpoints takes the decode GEMMs)
-            others = [q // 64 * 64 for q in at | ({reusable} if reusable > 0 else set()) if q != starts[-1]]
-            if b and b // 64 * 64 < g and all(abs(b // 64 * 64 - q) > 64 for q in others):
-                if g - b // 64 * 64 <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
-                    at.discard(starts[-1])
-                at.add(b)
-        if reusable > 0:
-            at.add(reusable)
-        return sorted(at)
+        """Checkpoints of a prompt (docs/architecture.md §9); see plan_checkpoints."""
+        return plan_checkpoints(prompt, reusable, self.im_start, self.user, self.breaks, self.vision_end)
 
     # ------------------------------------------------------------ scheduling
 

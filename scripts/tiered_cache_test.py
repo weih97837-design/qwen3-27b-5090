@@ -399,16 +399,16 @@ class Run:
         self.log(f"  media of {key}: {len(spans)} pairs, {encoded} encoded (the rest inside the {cached} cached tokens)")
         return encoded
 
-    def turn1(self, key, ids, at=(), media=None, expect_cached=0):
+    def turn1(self, key, ids, at=(), media=None, expect_cached=0, at_least=False):
         """A new conversation. at: positions the prefill saves checkpoints at (the cache run only). media: the prompt's
-        (spans, sources, videos). expect_cached: the prefix the cache must hold already (a hit on an earlier prompt)."""
+        (spans, sources, videos). expect_cached: the prefix the cache must hold already (a hit on an earlier prompt; at_least: or more)."""
         if media:
             self.media[key] = media
         if self.cache:
             cached = self.op("prefix_begin", self.eng.prefix_begin, ids, at=at, spec=self.spec)
             self.check(f"{key}: " + ("a new conversation is not cached" if not expect_cached else
-                                     f"resumes from a checkpoint of an earlier prompt at token {expect_cached}"),
-                       cached == expect_cached, f"cached {cached}")
+                                     f"resumes from a checkpoint of an earlier prompt at token {expect_cached}" + (" or after it" if at_least else "")),
+                       cached >= expect_cached if at_least else cached == expect_cached, f"cached {cached}")
         else:
             self.eng.reset()
             cached = 0
@@ -890,14 +890,18 @@ def scen_j(R, spill_dir):
 
 
 def l_prompts(R):
-    """Scenario l's prompts: a text prefix, the video, a question. (ids A, ids B, media A, media B, at): the text prefix is sized so that
-    each prompt has R.L tokens, `at` is the checkpoint the server's CHECKPOINT_INTERVAL (4096) saves inside A's prefill, the last multiple of 4096 before the question."""
+    """Scenario l's prompts, chat-shaped as the server renders them (system-less: one user message of a text prefix, the video and
+    a question, then the generation prompt). (ids A, ids B, media A, media B, at, resume): the text prefix is sized so that
+    each prompt has R.L tokens; `at` are A's checkpoints: the ones worker.plan_checkpoints plans (the video's end among them,
+    the same helper the engine's scheduler calls) and the last multiple of 4096 before the question (the server's
+    CHECKPOINT_INTERVAL, inside the video); `resume` is where B must resume: the end of the video rounded down to 64."""
     import base64
 
     sys.path.insert(0, str(ROOT / "frontend"))
     import server
     from qwen27b.paths import engine_target
     from tokenizer import Tokenizer
+    import worker
 
     model = engine_target(R.weights)
     tok = Tokenizer(model)
@@ -907,11 +911,13 @@ def l_prompts(R):
     url = "data:video/mp4;base64," + base64.b64encode(raw).decode()
     qa, qb = (tok.encode(q) for q in L_QUESTIONS)
     filler = tok.encode("\n")[0]
-    n = max(len(qa), len(qb))
+    n = max(len(qa), len(qb), 160)  # (160: the video's end is more than a 64-block before the generation prompt, so it keeps its own checkpoint)
     qa, qb = qa + [filler] * (n - len(qa)), qb + [filler] * (n - len(qb))  # (the same length: the pool holds A and B alike)
+    im, user, assistant = tok.token_id("<|im_start|>"), tok.encode("user")[0], tok.encode("assistant")[0]
+    head, tail = [im, user], [im, assistant]  # (the user message and the generation prompt)
 
     def prepare(prefix, q, frames):
-        return imgs.prepare(prefix + [pads[2], pads[1], pads[3]] + q, [("video", url)], pads, tok.encode, {"num_frames": frames})
+        return imgs.prepare(head + prefix + [pads[2], pads[1], pads[3]] + q + tail, [("video", url)], pads, tok.encode, {"num_frames": frames})
 
     frames = 40  # (the video has 45 frames of its own: more are the same frames again)
     for _ in range(3):  # tokens grow with the frames (the frame size does not change below the 768 tokens a pair is capped at)
@@ -919,37 +925,45 @@ def l_prompts(R):
         if len(ids) >= L_VIDEO_TOKENS:
             break
         frames = 2 * -(-int(frames * L_VIDEO_TOKENS / len(ids) + 2) // 2)
-    video = len(ids)
-    prefix_len = R.L - video - n
+    video = len(ids) - len(head) - len(tail)
+    prefix_len = R.L - video - n - len(head) - len(tail)
     if prefix_len < 256 or video < L_VIDEO_TOKENS:
         raise SystemExit(f"scenario l: the video takes {video} tokens in a prompt of {R.L} (needs >= {L_VIDEO_TOKENS} and 256 of text)")
     prefix = make_prompt(R.docs, prefix_len, 0)
     ids_a, spans, srcs, videos_a = prepare(prefix, qa, frames)
     ids_b, spans_b, srcs_b, videos_b = prepare(prefix, qb, frames)
-    assert spans == spans_b and ids_a[:len(ids_a) - n] == ids_b[:len(ids_b) - n] and len(ids_a) == len(ids_b) == R.L
-    # Where the server's CHECKPOINT_INTERVAL (4096) puts a checkpoint of A's prefill: the last multiple of 4096 before the
-    # question, where B diverges. It lies inside the video, so B decodes and encodes the pairs from there on again.
-    at = (len(ids_a) - n) // 4096 * 4096
-    assert spans[0][0] < at < spans[-1][0], (spans[0][0], at, spans[-1][0])
-    return ids_a, ids_b, (spans, srcs, videos_a), (spans_b, srcs_b, videos_b), at
+    cut = len(ids_a) - n - len(tail)  # (where the question starts: B diverges from A here)
+    assert spans == spans_b and ids_a[:cut] == ids_b[:cut] and ids_a[cut:] != ids_b[cut:] and len(ids_a) == len(ids_b) == R.L
+    # The engine-side checkpoints: the scheduler's (the end of the video, `resume` rounded down to 64) and the server's
+    # CHECKPOINT_INTERVAL (4096) one, the last multiple of 4096 before the question, which lies inside the video.
+    planned = worker.plan_checkpoints(ids_a, 0, im, user, frozenset(), pads[3])
+    end = worker.media_end(ids_a, 0, len(ids_a) - len(tail), pads[3])
+    assert end in planned and end <= cut and ids_a[end - 1] == pads[3] and all(t < worker.VOCAB for t in ids_a[end:]), (end, cut, planned)
+    resume = end // 64 * 64
+    interval = cut // 4096 * 4096
+    assert spans[0][0] < interval < spans[-1][0], (spans[0][0], interval, spans[-1][0])
+    at = sorted(q for q in set(planned) | ({interval} if abs(interval - resume) > 64 else set()) if q > 0)
+    return ids_a, ids_b, (spans, srcs, videos_a), (spans_b, srcs_b, videos_b), at, resume
 
 
 def scen_l(R, spill_dir):
     if R.cache and not R.eng.has_vision:
         raise ScenarioSkip("the engine has no vision tower (VISION=host)")
     try:
-        ids_a, ids_b, media_a, media_b, at = l_prompts(R)
+        ids_a, ids_b, media_a, media_b, at, resume = l_prompts(R)
     except ImportError as e:
         raise ScenarioSkip(f"the server's modules are not importable here ({e})")
     spans = media_a[0]
     R.log(f"  prompt {len(ids_a)} tokens: video of {len(spans)} pairs, {sum(gh * gw for _, gh, gw in spans)} tokens, "
-          f"from token {spans[0][0]}; checkpoint at {at}")
+          f"from token {spans[0][0]}; checkpoints {at}, B resumes at {resume}")
     s0 = R.snap("start")
-    R.turn1("A", ids_a, at=[at], media=media_a)
-    R.turn1("B", ids_b, at=[at], media=media_b, expect_cached=at)  # the same video, another question: the prefix cache
+    R.turn1("A", ids_a, at=at, media=media_a)
+    # The same video, another question: the prefix cache hit is the video's end checkpoint (at or after it, never the interval one
+    # inside the video): no pair is decoded, encoded or prefilled again but at most the last one that the rounding cut.
+    R.turn1("B", ids_b, at=at, media=media_b, expect_cached=resume, at_least=True)
     cs = R.eng.cache_stats() if R.cache else None
     if cs:
-        R.check("B's prompt was a prefix cache hit on A's checkpoint", cs["hits"] >= 1 and cs["cached_tokens"] >= at,
+        R.check("B's prompt was a prefix cache hit on A's checkpoint", cs["hits"] >= 1 and cs["cached_tokens"] >= resume,
                 f"hits {cs['hits']}, cached_tokens {cs['cached_tokens']}")
     R.turn1("C", make_prompt(R.docs, R.L, 5))  # another conversation: its prefill evicts the checkpoints of A and B
     s1 = R.snap("after C's prefill (evicts A and B)")

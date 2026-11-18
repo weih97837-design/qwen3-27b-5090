@@ -118,11 +118,17 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `HOST` / `PORT` | `127.0.0.1` / `46320` | 監聽位址與埠 |
 | `VIDEO_MAX_TOKENS` | `131072` | 一支影片最多的 token 數（檢查點自己的是 12288）。`IMAGE_TOKENS` 預設跟著它：每 token 10 KiB 的 pinned 主機記憶體，131072 時 1.25 GiB；編碼影片時另有每 token 6 KiB 的縮圖畫面（0.75 GiB）。RAM 32 GiB 以下建議改 `32768` |
 | `VIDEO_MAX_FRAMES` | `2048` | 一支影片最多取幾張畫面（檢查點自己的是 768） |
-| `SPILL_PINNED_GIB` | `0` | pinned 記憶體（GiB），預設關閉 |
-| `SPILL_ASYNC_IO` | `0` | 預設關閉 |
-| `SPILL_ASYNC_PROMOTE` | `0` | 預設關閉 |
+| `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後（閒置時）才寫入 SSD |
+| `SPILL_SSD_MIN_FREE_GIB` | `10` | SSD 所在磁碟保留的最小可用空間（GiB） |
+| `SPILL_SSD_MIN_TOKENS` | `32768` | 短於此 token 數的 checkpoint 不寫入 SSD（`0`：不設下限） |
+| `SPILL_TTL_DAYS` | `7` | 未被重用的 SSD 檔案保留天數 |
+| `VRAM_BACKUP_IDLE_S` | `60` | 引擎閒置多久後把 VRAM checkpoint 備份到 RAM（`0`：關閉） |
+| `SPILL_PINNED_GIB` | `8` | pinned 記憶體（GiB）；`0` 關閉（v0.3.2 起預設 8） |
+| `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
+| `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
+| `SPILL_FAIR_AGENTS` | `1` | RAM／SSD 層滿時，從用量最大的 agent 挑逐出對象；`0` 關閉 |
 
-`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 只在 `test.cmd` 全部通過後才建議開啟（見 `docs/tiered-cache.md`）。
+`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 自 v0.3.2 起預設開啟；pinned 記憶體在 Windows 上計入 GPU 共用記憶體，記憶體吃緊時可設 `SPILL_PINNED_GIB=0`（見 `docs/tiered-cache.md`）。
 `HOST=0.0.0.0` 會讓區網其他電腦連線；第一次啟動時 Windows 防火牆會詢問是否允許 Python，允許前請確認網路環境。
 
 ---

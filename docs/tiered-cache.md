@@ -320,7 +320,7 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 ### 快取行為
 
 - 影片的每一對畫面在提示詞裡的 id 由「影片位元組的 sha256、取樣計畫（格點、大小、第幾對、來源畫面）」決定（`reference/qwen27b/image_tokens.py`），所以**同一支影片、同一個取樣計畫，得到同樣的 id**；不同的影片、不同的 fps／`max_frames`，id 不同，不會誤命中。這些 id 走和圖片相同的前綴快取與 chunk 鍵鏈（`kVocab` 以上的 id），所以影片的 KV 與一般文字一樣溢出到 RAM、SSD 並還原。
-- **同一支影片再問一次便宜**：落在已快取前綴內的對，不會再解碼、不會再過視覺塔、也不會再 prefill。多回合對話（把上一回合的回覆原樣帶回，見 `docs/agent-client-guide.md`）整支影片都在快取內，只算新的文字。同一支影片換一個問題：快取命中的是問題之前、最近的 4096 token 檢查點（`CHECKPOINT_INTERVAL`）；其後的對重新解碼、編碼與 prefill，問題前後的文字也是。
+- **同一支影片再問一次便宜**：落在已快取前綴內的對，不會再解碼、不會再過視覺塔、也不會再 prefill。多回合對話（把上一回合的回覆原樣帶回，見 `docs/agent-client-guide.md`）整支影片都在快取內，只算新的文字。同一支影片換一個問題：最後一則使用者訊息裡最後一段圖片或影片的結尾（含收尾的 `<|vision_end|>`）有自己的檢查點（`Scheduler.checkpoints`，與其他檢查點一樣向下對齊 64 token），所以第二個問題從影片結尾續起，不再解碼、編碼或 prefill 影片的任何一對（對齊造成的最多 63 個 token，可能讓最後一對在續起點之後，只重算那一對）；只有問題文字重新 prefill。條件：影片與問題在同一則最後的使用者訊息、影片在問題之前；影片在較早的訊息裡時，由多回合對話的回合結尾檢查點涵蓋。這個檢查點與其他位置保持 64 token 以上的間隔（太近則不加；與生成提示起點同一個 64 區塊附近時取代它），多個媒體部分只取最後一個的結尾。每個檢查點約佔一筆 190 MiB 的狀態槽，所以一個影片提示詞只多一個。
 - 例子：一支 4K 60 秒的影片（預設 2 fps，60 對 × 720 ＝ 43,200 token）。第一次要完整解碼、編碼 60 對並 prefill 約 43.8K token；存下的 entry 約 0.95 GiB，超過 `SPILL_SSD_MIN_TOKENS`（32,768），閒置 `SPILL_RAM_RETENTION_S` 後會寫到 SSD。之後同一個對話（或同一支影片）再來，從 VRAM、RAM 或 SSD 還原該 entry，不需重算那 43K token。
 - 取樣計畫不同的同一支影片（例如把 `fps` 從 2 改成 1）是另一份 id，不共用。要讓不同請求共用快取，請固定影片位元組與 `mm_processor_kwargs`。
 - 保留策略與公平性不為影片特別處理：entry 屬於送出請求的代理（`X-Agent-Id`），與文字相同。
@@ -445,7 +445,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | i RAM 去重＋pinned＋async | 同 h，加 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`，全部經 `spill_match` / `spill_restore_*` 還原 | 同 h |
 | j SSD 去重 | 4 段共用前綴的對話全部 `spill_export` 到 `SPILL_DIR`（兩個行程）：第一個行程寫出，第二個行程（新的 Engine、同一個目錄）`spill_import`、`spill_sweep`，丟棄一筆後從檔案還原其他筆（兩筆走 `prefix_begin` 的同步 promote，一筆走 `spill_restore_begin`） | `spill_disk_usage` 實體 < 0.6 × 邏輯、`.kvc` 檔數少於 chunk 參照數；重啟後仍然成立；丟棄釋放的位元組恰為 `unique_disk_bytes` 且共用的 `.kvc` 仍在；還原的 token 與參考相同；最後一筆還原後沒有殘留檔案 |
 | k 保留策略 | 兩個 agent（`set_owner`）：一個有很多大的 entry（含被取代與從未重用者），一個只有幾個；RAM 層壓力（小的 `SPILL_RAM_GIB`）下 | 小 agent 的 entry 全數留在 RAM、大 agent 被逐出的是被取代／從未重用的；`spill_meta` 的 owner／hits／superseded 與 `spill_agents` 位元組一致；還原後 token 與參考相同 |
-| l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一；B 同一支影片、問題二，從 A 的 prefill 在問題前最後一個 4096 倍數處存的檢查點續起（影片中段，其後的對重新解碼與編碼）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 等於該檢查點、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片） |
+| l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一，prefill 存下 `Scheduler.checkpoints` 規劃的影片結尾檢查點與問題前最後一個 4096 倍數處的檢查點；B 同一支影片、問題二，從影片結尾檢查點續起（`cached` 不小於影片結尾向下對齊 64 的位置，影片不再解碼與編碼，最多重算最後一對）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 不小於影片結尾（向下對齊 64）、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片） |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
 
