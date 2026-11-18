@@ -56,6 +56,17 @@ checks the spill counters to show that the intended path was taken.
                       writing it. Every restored follow-up (B from RAM, A's from the file) must equal the uncached reference. Prompts
                       are >= 25K tokens (superseded needs more than kKeepShort = 16384).
 
+  l  Video input      (docs/tiered-cache.md "影片輸入"; needs the vision tower and NVDEC, else skipped.) The prompts are a text
+                      prefix and the video bench/vision/colors.mp4 sampled to ~9,000 tokens (num_frames: the frames are looped, so the
+                      prompt has two or more 4096-token chunks of video ids) and a question, ~12K tokens in all (the engine's own
+                      media path: server.Images.prepare, videoproc, mm_encode_frames, as worker.py runs it). A asks question 1; B the
+                      same video with question 2: B must resume at the checkpoint that A's prefill saved before the last pair of
+                      the video (the prefix cache hit; the pair after it is decoded and encoded again). C's prefill then evicts
+                      both to RAM; A's follow-up is restored from RAM (the whole video lies in the cached prefix: nothing is decoded
+                      or encoded), the RAM entries are written to SPILL_DIR and B's follow-up is restored from the file. Every output
+                      must equal the uncached reference (the reference decodes and encodes the video again each time). Runs with the
+                      draft model like the others.
+
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens. The driver sizes the conversations
 to the engine's pool, including its block rounding (choose_prompt_len): the prompt length is raised until two
@@ -137,7 +148,14 @@ SCENARIOS = {
     "i": ("RAM dedup with pinned segments + async I/O", ["full"]),
     "j": ("SSD dedup: shared chunk files, restart, drop, restore (sync + async)", ["write", "read"]),
     "k": ("retention: per-agent fairness, never-hit first, superseded", ["probe", "run"]),
+    "l": ("video input: prefix hit on the same video, RAM and SSD spill and restore", ["full"]),
 }
+# Scenario l: the engine needs the vision tower and room for the video's embeddings (both modes, the reference too).
+SCEN_ENV_ALL = {"l": {"VISION": "host", "IMAGE_TOKENS": "16384"}}
+L_VIDEO = "colors.mp4"  # bench/vision: red, green and blue for 3 s each
+L_VIDEO_TOKENS = 9000  # the video's tokens in the prompt at least (two chunks of 4096 and some)
+L_MIN_PROMPT = 12288   # tokens of a prompt of scenario l at least (the video, the text before it and the question)
+L_QUESTIONS = ("What colors appear in the video, and in which order?", "At about which second does the color change first?")
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
 SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
             "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"},
@@ -289,6 +307,7 @@ class Run:
         self.eng, self.cache, self.spec, self.n = eng, cache, spec, n
         self.docs, self.L, self.phase, self.log = docs, prompt_len, phase, log
         self.ids, self.outs, self.fed = {}, {}, {}
+        self.media = {}  # key -> (spans, sources, videos) of its prompt (scenario l)
         self.checks, self.stats = [], []
 
     def prompt(self, idx):
@@ -344,13 +363,56 @@ class Run:
             out.append(eng.forward_sample([out[-1]], 0.0, 1, 1.0))
         return out
 
-    def turn1(self, key, ids):
+    def encode_media(self, key, cached):
+        """What worker.py's load() does for a request with images and videos: mm_set, then the embeddings of every image and
+        pair of frames that does not lie inside the restored prefix (`cached` tokens), the video decoded on NVDEC from its first
+        pair past it on, the KV pool lending the decoder its memory (Engine.kv_lend)."""
+        import videoproc
+
+        spans, srcs, videos = self.media[key]
+        eng = self.eng
+        eng.mm_set(spans)
+        i, encoded = 0, 0
+        while i < len(spans):
+            start, gh, gw = spans[i]
+            if start + gh * gw <= cached:
+                i += 1
+                continue
+            assert srcs[i][0] == "video", "scenario l has videos only"
+            k, g = srcs[i][1], srcs[i][2]
+            j = i
+            while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
+                j += 1
+            raw, plan = videos[k]
+            plan = videoproc.tail(plan, g)
+            need, sessions = videoproc.memory(raw, plan)
+            loan = eng.kv_lend(need)
+            try:
+                frames = videoproc.frames(raw, plan, sessions=sessions if loan >= 0 else 1)
+            finally:
+                if loan >= 0:
+                    eng.kv_unlend(loan)
+            eng.mm_encode_frames(i, frames[:2 * (j - i)], srcs[i][3])
+            encoded += j - i
+            i = j
+        self.log(f"  media of {key}: {len(spans)} pairs, {encoded} encoded (the rest inside the {cached} cached tokens)")
+        return encoded
+
+    def turn1(self, key, ids, at=(), media=None, expect_cached=0):
+        """A new conversation. at: positions the prefill saves checkpoints at (the cache run only). media: the prompt's
+        (spans, sources, videos). expect_cached: the prefix the cache must hold already (a hit on an earlier prompt)."""
+        if media:
+            self.media[key] = media
         if self.cache:
-            cached = self.op("prefix_begin", self.eng.prefix_begin, ids, spec=self.spec)
-            self.check(f"{key}: a new conversation is not cached", cached == 0, f"cached {cached}")
+            cached = self.op("prefix_begin", self.eng.prefix_begin, ids, at=at, spec=self.spec)
+            self.check(f"{key}: " + ("a new conversation is not cached" if not expect_cached else
+                                     f"resumes from a checkpoint of an earlier prompt at token {expect_cached}"),
+                       cached == expect_cached, f"cached {cached}")
         else:
             self.eng.reset()
             cached = 0
+        if media:
+            self.encode_media(key, cached)
         out = self._gen(ids[cached:])
         if self.cache:
             self.op("checkpoint", self.eng.checkpoint)  # the checkpoint at the end of the generation
@@ -368,8 +430,12 @@ class Run:
             cached = self.op("prefix_begin", self.eng.prefix_begin, p2, spec=self.spec)
             self.check(f"{key}+: the follow-up resumes at the end of the first generation",
                        cached == self.fed[key], f"cached {cached}, end {self.fed[key]}")
+            if key in self.media:
+                self.encode_media(key, cached)
         else:
             self.eng.reset()
+            if key in self.media:
+                self.encode_media(key, 0)
             replay = self._gen(self.ids[key])
             if replay != self.outs[key] or self.eng.pos != self.fed[key]:
                 raise RuntimeError(f"reference replay of {key} differs from its first turn (not deterministic)")
@@ -822,7 +888,82 @@ def scen_j(R, spill_dir):
         R.check("when the last sibling is restored no chunk or manifest file is left", not left, f"{sorted(left)[:4]}")
 
 
-SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g, "h": scen_h, "i": scen_h, "j": scen_j, "k": scen_k}
+def l_prompts(R):
+    """Scenario l's prompts: a text prefix, the video, a question. (ids A, ids B, media A, media B, at): the text prefix is sized so that
+    each prompt has R.L tokens, `at` is the multiple of 64 tokens before the last pair of the video (the checkpoint A's prefill saves)."""
+    import base64
+
+    sys.path.insert(0, str(ROOT / "frontend"))
+    import server
+    from qwen27b.paths import engine_target
+    from tokenizer import Tokenizer
+
+    model = engine_target(R.weights)
+    tok = Tokenizer(model)
+    pads = tuple(tok.token_id(t) for t in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
+    imgs = server.Images(str(model), 4194304, int(os.environ.get("IMAGE_TOKENS", 16384)))
+    raw = (ROOT / "bench/vision" / L_VIDEO).read_bytes()
+    url = "data:video/mp4;base64," + base64.b64encode(raw).decode()
+    qa, qb = (tok.encode(q) for q in L_QUESTIONS)
+    filler = tok.encode("\n")[0]
+    n = max(len(qa), len(qb))
+    qa, qb = qa + [filler] * (n - len(qa)), qb + [filler] * (n - len(qb))  # (the same length: the pool holds A and B alike)
+
+    def prepare(prefix, q, frames):
+        return imgs.prepare(prefix + [pads[2], pads[1], pads[3]] + q, [("video", url)], pads, tok.encode, {"num_frames": frames})
+
+    frames = 40  # (the video has 45 frames of its own: more are the same frames again)
+    for _ in range(3):  # tokens grow with the frames (the frame size does not change below the 768 tokens a pair is capped at)
+        ids, spans, _, _ = prepare([], [], frames)
+        if len(ids) >= L_VIDEO_TOKENS:
+            break
+        frames = 2 * -(-int(frames * L_VIDEO_TOKENS / len(ids) + 2) // 2)
+    video = len(ids)
+    prefix_len = R.L - video - n
+    if prefix_len < 256 or video < L_VIDEO_TOKENS:
+        raise SystemExit(f"scenario l: the video takes {video} tokens in a prompt of {R.L} (needs >= {L_VIDEO_TOKENS} and 256 of text)")
+    prefix = make_prompt(R.docs, prefix_len, 0)
+    ids_a, spans, srcs, videos_a = prepare(prefix, qa, frames)
+    ids_b, spans_b, srcs_b, videos_b = prepare(prefix, qb, frames)
+    assert spans == spans_b and ids_a[:len(ids_a) - n] == ids_b[:len(ids_b) - n] and len(ids_a) == len(ids_b) == R.L
+    at = (spans[-1][0] - 16) // 64 * 64  # (inside the text before the last pair: that pair is encoded again by B)
+    return ids_a, ids_b, (spans, srcs, videos_a), (spans_b, srcs_b, videos_b), at
+
+
+def scen_l(R, spill_dir):
+    if R.cache and not R.eng.has_vision:
+        raise ScenarioSkip("the engine has no vision tower (VISION=host)")
+    try:
+        ids_a, ids_b, media_a, media_b, at = l_prompts(R)
+    except ImportError as e:
+        raise ScenarioSkip(f"the server's modules are not importable here ({e})")
+    spans = media_a[0]
+    R.log(f"  prompt {len(ids_a)} tokens: video of {len(spans)} pairs, {sum(gh * gw for _, gh, gw in spans)} tokens, "
+          f"from token {spans[0][0]}; checkpoint at {at}")
+    s0 = R.snap("start")
+    R.turn1("A", ids_a, at=[at], media=media_a)
+    R.turn1("B", ids_b, at=[at], media=media_b, expect_cached=at)  # the same video, another question: the prefix cache
+    cs = R.eng.cache_stats() if R.cache else None
+    if cs:
+        R.check("B's prompt was a prefix cache hit on A's checkpoint", cs["hits"] >= 1 and cs["cached_tokens"] >= at,
+                f"hits {cs['hits']}, cached_tokens {cs['cached_tokens']}")
+    R.turn1("C", make_prompt(R.docs, R.L, 5))  # another conversation: its prefill evicts the checkpoints of A and B
+    s1 = R.snap("after C's prefill (evicts A and B)")
+    R.eviction_check("C's prefill spilled the checkpoints with video ids to RAM", delta(s0, s1, "spilled") >= 1,
+                     f"spilled +{delta(s0, s1, 'spilled')}, in_ram {s1['in_ram']}")
+    R.turn2("A", make_prompt(R.docs, 1000, 9)[:FOLLOW])  # the whole video is inside the restored prefix
+    s2 = R.snap("after A's follow-up")
+    R.check("A's follow-up restored its checkpoint from RAM", delta(s1, s2, "restored") > 0, f"restored +{delta(s1, s2, 'restored')}")
+    n = export_ram(R.eng, spill_dir) if R.cache else 0
+    s3 = R.snap("RAM entries written to SPILL_DIR")
+    R.check("RAM entries written to SPILL_DIR", n > 0 and s3["on_disk"] > 0, f"{n} files, on_disk {s3['on_disk']}")
+    R.turn2("B", make_prompt(R.docs, 1000, 10)[:FOLLOW])
+    s4 = R.snap("after B's follow-up (read from the file)")
+    R.check("B's follow-up restored its checkpoint from the file", delta(s3, s4, "restored") > 0,
+            f"restored +{delta(s3, s4, 'restored')}")
+
+
+SCEN_FN = {"a": scen_a, "b": scen_b, "c": scen_c, "d": scen_d, "e": scen_a, "f": scen_f, "g": scen_g, "h": scen_h, "i": scen_h, "j": scen_j, "k": scen_k, "l": scen_l}
 
 
 # ---- worker: one process, one mode (ref | tiered), one phase
@@ -861,10 +1002,11 @@ def worker(a):
     if a.use_spec and not eng.has_draft:
         return write_json(a.out, {"skip": "the engine has no draft model"})
     grow_pinned(eng, a.mode == "tiered")
-    docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i", "j", "k"))
+    docs = load_docs(a.prompt_len, tile=a.scenario in ("h", "i", "j", "k", "l"))
     R = Run(eng, a.mode == "tiered", a.use_spec, a.tokens, docs, a.prompt_len, a.phase, print)
+    R.weights = a.weights
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
-    if len(heads) != 4 and a.scenario not in ("h", "i", "j", "k"):  # (h builds its own prompts, which share their first tokens)
+    if len(heads) != 4 and a.scenario not in ("h", "i", "j", "k", "l"):  # (h builds its own prompts, which share their first tokens)
         raise SystemExit("the prompts do not differ in their first 64 tokens")
     if a.prior:
         R.load_prior(a.prior)
@@ -887,6 +1029,7 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
     pool = a.pool_tokens or pool
     # (no interval checkpoints: only the explicit ones; the engine needs a multiple of 64)
     set_env = {"KV_POOL_TOKENS": str(pool), "CHECKPOINT_INTERVAL": str(-(-2 * max_tokens // 64) * 64)}
+    set_env.update(SCEN_ENV_ALL.get(scen, {}))  # (both modes)
     if mode == "ref":
         set_env["STATE_HOST_CACHE"] = "0"
     else:
@@ -943,10 +1086,11 @@ def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
 def scen_args(a, scen):
     """The arguments a scenario runs with: h and i need prompts longer than the shared prefix (and a pool that is still too
     small for two of them), so their length is raised and the pool re-sized for it (j too)."""
-    if scen not in ("h", "i", "j", "k") or a.pool_tokens:
+    if scen not in ("h", "i", "j", "k", "l") or a.pool_tokens:
         return a
     b = argparse.Namespace(**vars(a))
-    b.prompt_len = choose_prompt_len(max(a.prompt_len, H_PREFIX + H_MIN_TAIL), a.tokens, a.kv_dtype)
+    least = L_MIN_PROMPT if scen == "l" else H_PREFIX + H_MIN_TAIL
+    b.prompt_len = choose_prompt_len(max(a.prompt_len, least), a.tokens, a.kv_dtype)
     return b
 
 
@@ -963,7 +1107,7 @@ def main():
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
     ap.add_argument("--spec", choices=SPEC_CHOICES,
                     help="draft model of every engine (default: the server's: $SPEC, else dspine if downloaded, else dflash2, else none)")
-    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j,k", help="a,b,c,d,e,f,g,h,i,j,k")
+    ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j,k,l", help="a,b,c,d,e,f,g,h,i,j,k,l")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     ap.add_argument("--worker-cmd", metavar="SCENARIO",
                     help="print the exact worker command lines of a scenario (its reference and tiered runs) and exit")
@@ -985,7 +1129,7 @@ def main():
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
     for s in chosen:
         if s not in SCENARIOS:
-            ap.error(f"unknown scenario {s} (a-k)")
+            ap.error(f"unknown scenario {s} (a-l)")
     if a.pool_tokens:
         _, max_tokens = sizes(a.prompt_len, a.tokens)
         say("pool: " + describe_pool(a.prompt_len, a.tokens, a.kv_dtype, a.pool_tokens, max_tokens), flush=True)
@@ -1004,7 +1148,7 @@ def main():
     if a.worker_cmd:
         s_ = a.worker_cmd
         if s_ not in SCENARIOS:
-            ap.error(f"unknown scenario {s_} (a-k)")
+            ap.error(f"unknown scenario {s_} (a-l)")
         base = pathlib.Path(a.keep_dir or "KEEP_DIR")  # (a placeholder without --keep-dir)
         say(f"worker commands of scenario {s_} ({SCENARIOS[s_][0]}), as the driver runs them; the other SPILL_* and cache")
         say("variables of your environment are unset. Windows cmd: set each NAME=VALUE first. Replace KEEP_DIR if needed.")
@@ -1029,7 +1173,8 @@ def main():
         spill_dir.mkdir(parents=True)
         sa = scen_args(a, s)
         if sa is not a:
-            say(f"prompt-len {a.prompt_len} -> {sa.prompt_len} for scenario {s} (a prefix of {H_PREFIX} shared tokens + tails)")
+            say(f"prompt-len {a.prompt_len} -> {sa.prompt_len} for scenario {s} " +
+                ("(a text prefix, the video and a question)" if s == "l" else f"(a prefix of {H_PREFIX} shared tokens + tails)"))
         ref = run_worker(sa, s, "ref", "full", "", work / f"ref_{s}.json")
         if "error" in ref:
             say(f"FAIL {s}: the reference run exited {fmt_rc(ref['error'])}", flush=True)
