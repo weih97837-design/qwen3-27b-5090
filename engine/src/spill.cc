@@ -236,6 +236,13 @@ uint64_t Model::spill_fingerprint() const {
     const int dl[4] = {kCkptLayout, draft_ ? int(draft_->kind()) + 1 : 0, draft_ ? draft_->window() : 0, ddims::kRingPad};
     h = fnv(h, dl, sizeof dl);
   }
+  // Images and videos: the ids of a run of media tokens encode the content (sha256 of the bytes), the grid, the size and,
+  // for a video, the plan and the pair (reference/qwen27b/image_tokens.py), so IMAGE_MAX_PIXELS, VIDEO_MAX_TOKENS /
+  // VIDEO_MAX_FRAMES and a request's fps all reach the ids and need no fingerprint of their own. The vision tower's
+  // numerics do not: VISION=host and bf16 give the same embeddings bit for bit, but fp8 widens E4M3 weights (about 3x the
+  // embedding error, answers can change), so KV computed behind it must not be restored into another mode, or the other
+  // way round. Hashed only for fp8, so the fingerprints of host / bf16 / off (and the files written so far) stay valid.
+  if (opt_.vision == 3) h = fnv(h, "vision-fp8", 10);
   // The weights themselves: replacing the files at the same path must not reuse KV files computed with other
   // weights. The names and sizes of the files in each directory, and the bytes of the model's config.json.
   for (const std::string& dir : {opt_.model_dir, opt_.draft_dir}) {

@@ -70,6 +70,11 @@ Copy-Item scripts\download_weights.py, scripts\windows\start_package.py, scripts
 Copy-Item scripts\tiered_cache_test.py, scripts\tiered_cache_bench.py, scripts\native_env.py "$app\scripts\"
 New-Item -ItemType Directory -Force "$app\bench\golden" | Out-Null
 Copy-Item bench\golden\prompts.jsonl "$app\bench\golden\"
+# The image and video API test against a running server (vision_api_test.py, docs/deploy-windows.md) and its media; the
+# smoke test of the workflow probes colors.mp4 through q27.dll (the demuxer needs no GPU)
+Copy-Item scripts\vision_api_test.py "$app\scripts\"
+New-Item -ItemType Directory -Force "$app\bench\vision" | Out-Null
+Copy-Item bench\vision\astronaut.jpg, bench\vision\chart.png, bench\vision\colors.mp4 "$app\bench\vision\"
 Copy-Item engine\build\q27.dll "$app\engine\build\"
 Set-Content -Encoding ascii -NoNewline -Path (Join-Path $app "VERSION") -Value $Version  # (update.ps1 compares it with the release)
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force

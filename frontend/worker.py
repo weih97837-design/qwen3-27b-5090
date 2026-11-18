@@ -157,6 +157,7 @@ class Seq:
         self.dead = False
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
+        self.held_reason = None  # why: "kv" (room in the KV pool) or "speed" (MIN_SEQ_TPS), shown in the stats rows
         self._bytes = None
         self.begun = None        # time of the first prefix_begin
         self.restoring = None    # the restore record this request waits for (Scheduler.maybe_restore), or None
@@ -380,6 +381,9 @@ class Scheduler:
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
+        if (why := self.never_fits(s)):
+            self.send("error", rid, why, 400)
+            return
         s.best = self.best_history(s.prompt)  # (and where it diverges: the log in begin)
         s.reusable = max(0, min(s.best[0], len(s.prompt) - 1))
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
@@ -424,6 +428,25 @@ class Scheduler:
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def never_fits(self, s):
+        """Why request s cannot run even alone (the message of its HTTP 400), or None: its prompt and the output the
+        admission reserves (min(max_tokens, kv_reserve)) take more pages than the whole KV pool has. The server's
+        context check (MAX_TOKENS, lowered to what the pool holds) normally keeps such a request out; this catches a
+        pool smaller than the context (KV_POOL_TOKENS set low, MIN_KV_TOKENS) and a prompt of long videos, which the
+        admission would otherwise run and suspend again and again, or keep waiting at the head of the queue."""
+        try:
+            pool = int(self.engine.cache_stats().get("pool_pages") or 0)
+        except Exception:  # noqa: BLE001 - no statistics: the admission decides, as before
+            return None
+        need = -(-len(s.prompt) // PAGE) + -(-min(s.max_new, self.kv_reserve) // PAGE)
+        if not pool or need <= pool:
+            return None
+        media = sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0
+        return (f"the request needs {need * PAGE:,} tokens of KV cache ({len(s.prompt):,} of prompt"
+                + (f", {media:,} of them images and video" if media else "")
+                + f", and the output) but the KV pool holds {pool * PAGE:,}: shorten the prompt"
+                + (" (cut the video, lower its fps, or set VIDEO_MAX_TOKENS lower)" if media else ""))
 
     def note_checkpoints(self, s, ids, positions):
         """(The tiered cache's retention does not use this: the engine tags each checkpoint with its agent, set_owner / agent.owner_id.)
@@ -596,6 +619,7 @@ class Scheduler:
                 reason = "kv"
             elif self.min_tps > 0 and self.predicted_rate(len(self.alive) + 1) < self.min_tps:
                 reason = "speed"
+        s.held_reason = reason if reason else s.held_reason
         if reason and not s.held:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
@@ -1499,6 +1523,7 @@ class Scheduler:
                          "decode_wall": (now - s.first_token) if s.first_token else 0.0,
                          "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
+                         "wait": s.held_reason if s.held and s in self.waiting else None,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id})
             if s.restoring is not None:

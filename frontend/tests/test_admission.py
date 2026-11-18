@@ -213,3 +213,33 @@ def test_malformed_request_fails_alone():
         sch.submit(rid, req)
         assert sch.conn.sent[-1][:2] == ("error", rid) and sch.conn.sent[-1][-1] == 400
     assert not sch.waiting
+
+
+def test_a_request_that_cannot_fit_the_pool_even_alone_is_refused_at_once():
+    """A prompt (a long video's, say) plus the output reserve above the whole KV pool gets an error, not a wait."""
+    eng = FakeEngine(free=1000)
+    eng.st["pool_pages"] = 1000  # 64,000 tokens
+    sch = scheduler(eng)
+    sch.touch = lambda: None
+    sch.agent_notes = {}
+    fits, big = seq(1, 50_000, max_new=100), seq(2, 63_000, max_new=100_000)  # 782 + 1 pages; 985 + 64 pages
+    assert sch.never_fits(fits) is None
+    why = sch.never_fits(big)
+    assert why and "64,000" in why and "VIDEO_MAX_TOKENS" not in why  # (no media: no video advice)
+    big.images = ([(0, 100, 100)], [], [])  # 10,000 tokens of images and videos
+    why = sch.never_fits(big)
+    assert "10,000 of them images and video" in why and "VIDEO_MAX_TOKENS" in why
+    # the output reserve is the smaller of max_new and kv_reserve
+    assert sch.never_fits(seq(3, 63_900, max_new=10)) is None
+    # no statistics or no pool size: the admission decides, as before
+    eng.st.pop("pool_pages")
+    assert sch.never_fits(big) is None
+
+
+def test_the_wait_reason_is_in_the_stats_row():
+    sch = scheduler(FakeEngine(free=0))
+    sch.alive = [seq(1, 64, started=True, fed=64)]
+    new = seq(2, 6400)
+    sch.waiting.append(new)
+    assert not sch.admit(new)
+    assert new.held and new.held_reason == "kv"
