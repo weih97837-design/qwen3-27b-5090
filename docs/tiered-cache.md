@@ -165,7 +165,7 @@ $SPILL_DIR/
 | --- | --- | --- |
 | `SPILL_PINNED_GIB` | `8` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉（v0.3.2 起預設 8） |
 | `SPILL_ASYNC_IO` | `1` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
-| `SPILL_ASYNC_PROMOTE` | `1` | `1`：命中已 spill 的 checkpoint 時，請求進入「載入快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
+| `SPILL_ASYNC_PROMOTE` | `1` | `1`：命中已 spill 的 checkpoint 時，請求進入「載回快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
 | `SPILL_PINNED_SLAB_MIB` | `1024` | 每次 pin 的區塊大小（MiB）：閒置時每輪只 pin 一個區塊，所以也是單次停頓的上限；一般不需調整 |
 
 - **SPILL_PINNED_GIB**：pin 記憶體很慢（WSL2 上約每 GiB 0.45 秒，期間其他 CUDA 呼叫都要等），所以絕不在請求處理中進行：
@@ -187,7 +187,7 @@ $SPILL_DIR/
   1. 排程器在放行等待中的請求之前呼叫 `spill_match`（唯讀）找出比 KV 池自己的命中更深的 spill entry。
   2. 值得載入的話呼叫 `spill_restore_begin`：RAM 的項目立刻配好頁並把 H2D 排在 I/O stream 上（回傳 1）；
      只在 SSD 的項目由引擎執行緒配好緩衝區（可 pinned），再由一條背景執行緒**只做** `fread`（回傳 2；該執行緒不碰任何引擎狀態與 CUDA）。
-  3. 請求進入 `restoring` 狀態（UI：「載入快取」，Slot 標題顯示「載入中 N」），**仍保留排隊順序，但被跳過**，後面的請求照常放行
+  3. 請求進入 `restoring` 狀態（UI：「載回快取」，Slot 標題顯示「載回中 N」），**仍保留排隊順序，但被跳過**，後面的請求照常放行
      （這就是 delay hit：等的是快取，不是 GPU）。每個排程迴圈與解碼步驟之間都會 `spill_restore_poll`（不阻塞）：
      檔案讀完就接著配頁並排入 H2D；H2D 的 event 完成後，載入中的 checkpoint 才變成可見（`loading=false`），
      entry 才被釋放，請求再度可被放行，它的 `prefix_begin` 就命中這個 checkpoint。

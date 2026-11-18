@@ -182,7 +182,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 
   <section class="card" id="slots-sec" hidden>
     <div class="row" style="justify-content:space-between;margin-bottom:8px">
-      <h2 style="margin:0">推理 Slot</h2>
+      <h2 style="margin:0">推論 Slot</h2>
       <span class="muted" id="slots-sum"></span>
     </div>
     <div class="slots" id="slots"></div>
@@ -586,7 +586,7 @@ function drawSessions() {
     ];
     return el("div", { class: "seq" },
       el("div", { class: "top" },
-        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), s.state === "restoring" ? `載入快取 · ${phase}` : `${s.state} · ${phase}`),
+        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), s.state === "restoring" ? `載回快取 · ${phase}` : `${s.state} · ${phase}`),
         el("span", { class: "rid" }, s.rid),
         el("span", { class: "sub" }, s.endpoint || ""),
         el("span", { class: "muted" }, s.client || ""),
@@ -679,12 +679,12 @@ const toDate = (v) => {
 const fmtUptime = (s) => {
   if (s == null || !isFinite(s)) return "–";
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return d ? `${d} 天 ${h} 時` : h ? `${h} 時 ${m} 分` : `${m} 分 ${Math.floor(s % 60)} 秒`;
+  return d ? `${d} 天 ${h} 小時` : h ? `${h} 小時 ${m} 分鐘` : `${m} 分鐘 ${Math.floor(s % 60)} 秒`;
 };
 const f2 = (v) => v == null ? "–" : v.toFixed(2);
 const fmtSetting = (v) => v == null ? "–" : typeof v === "number" ? v.toLocaleString() : typeof v === "boolean" ? (v ? "是" : "否") : String(v);
 
-const SLOT_STATE = { running: ["推理中", "--good"], parked: ["暫停", "--s1"], admitted: ["排隊", "--warning"], idle: ["閒置", "--muted"],
+const SLOT_STATE = { running: ["推論中", "--good"], parked: ["暫停", "--s1"], admitted: ["待命", "--warning"], idle: ["閒置", "--muted"],
   closed: ["未開放", "--muted"] };
 const PHASE_ZH = { prefill: "預填", decode: "解碼" };
 function slotTile(s, i) {
@@ -692,8 +692,8 @@ function slotTile(s, i) {
   const idle = key === "idle", closed = key === "closed";
   const head = el("div", { class: "head" },
     el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${color})` }), label),
-    el("span", { class: "lane" }, `第 ${s.lane ?? i + 1} 道`));
-  if (closed) return el("div", { class: "card slot closed" }, head, el("div", { class: "muted", style: "font-size:12px" }, "超過目前的併發上限，未開放"));
+    el("span", { class: "lane" }, `Slot ${s.lane ?? i + 1}`));
+  if (closed) return el("div", { class: "card slot closed" }, head, el("div", { class: "muted", style: "font-size:12px" }, "超過目前的同時處理上限，未開放"));
   const prompt = s.prompt, cached = s.cached;
   const pct = prompt && cached != null ? fmtPct(Math.min(cached, prompt) / prompt) : "–";
   return el("div", { class: "card slot" + (idle ? " idle" : "") },
@@ -701,11 +701,11 @@ function slotTile(s, i) {
     el("div", { class: "rid mono trunc", title: s.rid || "" }, s.rid || "–"),
     el("div", { class: "kv" },
       kvRow("階段", PHASE_ZH[s.phase] || s.phase || "–"),
-      kvRow("提示詞", prompt != null ? fmtTok(prompt) + " tok" : "–"),
+      kvRow("輸入（Prompt）", prompt != null ? fmtTok(prompt) + " tok" : "–"),
       kvRow("快取", cached != null ? `${fmtTok(cached)} (${pct})` : "–"),
       kvRow("輸出", s.out != null ? fmtTok(s.out) + " tok" : "–"),
-      kvRow("年齡", fmtS(s.age))),
-    el("div", { class: "speed num" }, s.tok_s == null ? "–" : fmtRate(s.tok_s), el("span", {}, "tok/s 吐字速度")));
+      kvRow("已執行時間", fmtS(s.age))),
+    el("div", { class: "speed num" }, s.tok_s == null ? "–" : fmtRate(s.tok_s), el("span", {}, "tok/s 生成速度")));
 }
 function drawSlots() {
   const slots = snapSlots(), sec = $("slots-sec");
@@ -715,13 +715,13 @@ function drawSlots() {
   const open = slots.filter((s) => s.open !== false).length;  // no "open" field (older server): every lane is open
   // Requests waiting while their cached prefix loads (SPILL_ASYNC_PROMOTE) are not in a lane: counted here.
   const loading = (state.tick?.seqs || []).filter((s) => s.state === "restoring").length;
-  $("slots-sum").textContent = `使用中 ${used} ／ 開放 ${open} ／ 上限 ${slots.length}` + (loading ? ` ／ 載入中 ${loading}` : "");
-  $("slots").replaceChildren(...(slots.length ? slots.map(slotTile) : [el("div", { class: "empty" }, "沒有推理 slot。")]));
+  $("slots-sum").textContent = `使用中 ${used} ／ 開放 ${open} ／ 上限 ${slots.length}` + (loading ? ` ／ 載回中 ${loading}` : "");
+  $("slots").replaceChildren(...(slots.length ? slots.map(slotTile) : [el("div", { class: "empty" }, "沒有推論 Slot。")]));
 }
 
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
-const TIER_COUNTERS = [["溢出 spilled", "spilled"], ["還原 restored", "restored"], ["寫入 SSD written", "written"],
-  ["已備份 backed_up", "backed_up"], ["背景還原 restored_async", "restored_async"], ["刪除 dropped", "dropped"], ["合併 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+const TIER_COUNTERS = [["擠出 spilled", "spilled"], ["載回 restored", "restored"], ["寫入 SSD written", "written"],
+  ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
 function tierCol(title, used, cap, note) {
   const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
   return el("div", { class: "tier" },
@@ -740,18 +740,18 @@ function drawTiers() {
   }
   const kids = [];
   if (t.error) kids.push(warnBox("錯誤", t.error));
-  sum.textContent = `RAM ${t.in_ram ?? "–"} 筆 · SSD ${t.on_disk ?? "–"} 筆`;
+  sum.textContent = `RAM ${t.in_ram ?? "–"} 份 · SSD ${t.on_disk ?? "–"} 份`;
   const n = (v) => v == null ? "–" : Number(v).toLocaleString();
   const cols = [];  // a bar only when its used bytes are known; a null cap shows as "X / –"
   // RAM dedup: ram_bytes is what the tier physically holds; the logical size is what the entries would take without sharing.
-  const dedup = t.ram_logical_bytes && t.ram_dedup_ratio ? ` · 邏輯 ${fmtGiB(t.ram_logical_bytes)}（去重 ${t.ram_dedup_ratio.toFixed(2)}×）` : "";
+  const dedup = t.ram_logical_bytes && t.ram_dedup_ratio ? ` · 去重前 ${fmtGiB(t.ram_logical_bytes)}（去重比 ${t.ram_dedup_ratio.toFixed(2)}×）` : "";
   // entries and bytes per tier, of which live backups (copies of checkpoints the VRAM pool still holds) and evicted ones
   const split = (p) => t[p + "_evicted_entries"] == null ? "" :
-    ` · 被逐出 ${n(t[p + "_evicted_entries"])} 筆 ${fmtGiB(t[p + "_evicted_bytes"])} · 備份 ${n(t[p + "_backup_entries"])} 筆 ${fmtGiB(t[p + "_backup_bytes"])}`;
-  if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 筆在 RAM${dedup}` + split("ram")));
+    ` · 由 VRAM 擠出 ${n(t[p + "_evicted_entries"])} 份 ${fmtGiB(t[p + "_evicted_bytes"])} · 備份 ${n(t[p + "_backup_entries"])} 份 ${fmtGiB(t[p + "_backup_bytes"])}`;
+  if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 份在 RAM${dedup}` + split("ram")));
   // SSD dedup: ssd_bytes is what the files physically take (each shared chunk once); logical is what the entries would take as separate files.
-  const ssdDedup = t.ssd_logical_bytes && t.ssd_dedup_ratio ? ` · 邏輯 ${fmtGiB(t.ssd_logical_bytes)}（去重 ${t.ssd_dedup_ratio.toFixed(2)}×）` : "";
-  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 筆在 SSD${ssdDedup} · 磁碟剩餘 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
+  const ssdDedup = t.ssd_logical_bytes && t.ssd_dedup_ratio ? ` · 去重前 ${fmtGiB(t.ssd_logical_bytes)}（去重比 ${t.ssd_dedup_ratio.toFixed(2)}×）` : "";
+  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 份在 SSD${ssdDedup} · 磁碟可用空間 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
   if (cols.length) kids.push(el("div", { class: "tiers-grid" }, ...cols));
   kids.push(el("div", { class: "kv", style: "margin-top:12px" },
     ...TIER_COUNTERS.map(([label, key]) => el("div", {},
@@ -760,16 +760,16 @@ function drawTiers() {
   // reuse rate = restored / entries received (RAM: spilled, SSD: written).
   const pct = (v) => v == null ? "–" : `${(v * 100).toFixed(1)}%`;
   const reuseRow = (label, p, rate, restored) => t[p + "_reused_entries"] == null ? [] : [kvRow(label,
-    `重用 ${n(t[p + "_reused_entries"])} 筆 ${fmtGiB(t[p + "_reused_bytes"])} · 未重用 ${n(t[p + "_never_entries"])} 筆 ${fmtGiB(t[p + "_never_bytes"])}` +
-    ` · 被取代 ${n(t[p + "_superseded_entries"])} 筆 ${fmtGiB(t[p + "_superseded_bytes"])} · 重用率 ${pct(t[rate])}${t[restored] == null ? "" : `（還原 ${n(t[restored])}）`}`)];
+    `曾重用 ${n(t[p + "_reused_entries"])} 份 ${fmtGiB(t[p + "_reused_bytes"])} · 從未重用 ${n(t[p + "_never_entries"])} 份 ${fmtGiB(t[p + "_never_bytes"])}` +
+    ` · 被取代 ${n(t[p + "_superseded_entries"])} 份 ${fmtGiB(t[p + "_superseded_bytes"])} · 重用率 ${pct(t[rate])}${t[restored] == null ? "" : `（載回 ${n(t[restored])}）`}`)];
   const reuse = [...reuseRow("RAM 重用", "ram", "ram_reuse_rate", "ram_restored"), ...reuseRow("SSD 重用", "disk", "ssd_reuse_rate", "ssd_restored")];
   if (reuse.length) kids.push(el("div", { class: "kv", style: "margin-top:10px" }, ...reuse,
-    kvRow("公平淘汰 SPILL_FAIR_AGENTS", t.fair_agents == null ? "–" : t.fair_agents ? "on" : "off")));
+    kvRow("依 Agent 公平淘汰 SPILL_FAIR_AGENTS", t.fair_agents == null ? "–" : t.fair_agents ? "on" : "off")));
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
-    kvRow("保留 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
-    kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 筆`),
-    ...(t.restoring || t.restored_async ? [kvRow("載入中", `${n(t.restoring)} 筆`),
-      kvRow("載入速度", t.restore_gbps == null ? "–" : `${t.restore_gbps.toFixed(1)} GB/s`)] : []),
+    kvRow("RAM 停留時間 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
+    kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 份`),
+    ...(t.restoring || t.restored_async ? [kvRow("載回中", `${n(t.restoring)} 份`),
+      kvRow("載回速度", t.restore_gbps == null ? "–" : `${t.restore_gbps.toFixed(1)} GB/s`)] : []),
     kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")));
   if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
   if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));
@@ -791,14 +791,14 @@ function drawDeploy() {
   kids.push(el("div", { class: "kv" },
     kvRow("引擎狀態", deployOk ? d.engine_state ?? "–" : "–"),
     kvRow("啟動時間", started ? started.toLocaleString([], { hour12: false }) : "–"),
-    kvRow("運作時間", fmtUptime(uptime)),
+    kvRow("已運行時間", fmtUptime(uptime)),
     kvRow("CPU 核心", hostOk ? h.cpu_count ?? "–" : "–"),
-    kvRow("負載 1 / 5 分", hostOk ? `${f2(h.load1)} / ${f2(h.load5)}` : "–")));
+    kvRow("負載（1 / 5 分鐘平均）", hostOk ? `${f2(h.load1)} / ${f2(h.load5)}` : "–")));
   if (hostOk && h.ram_total_bytes) {
     const total = h.ram_total_bytes, avail = h.ram_avail_bytes, used = avail == null ? 0 : total - avail;
     kids.push(el("div", { style: "margin-top:12px" },
       el("div", { class: "split" }, el("span", { class: "sub" }, "主機 RAM"),
-        el("span", { class: "num" }, `${fmtGiB(total)} 總計 · ${fmtGiB(avail)} 可用`)),
+        el("span", { class: "num" }, `共 ${fmtGiB(total)} · 可用 ${fmtGiB(avail)}`)),
       el("div", { class: "meter" }, el("div", { style: `width:${(Math.min(1, used / total) * 100).toFixed(1)}%` }))));
   }
   if (deployOk && d.settings && typeof d.settings === "object") {
@@ -910,7 +910,7 @@ const MEDIA_OPTS = [
     help: "Frames sampled from a video at most (2 per second until then), and the most a request's num_frames may ask for. Empty: 2,048 (the checkpoint's own is 768)." },
 ];
 const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
-const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
