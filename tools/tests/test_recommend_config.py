@@ -225,3 +225,23 @@ def test_main_json_output_is_json_only(monkeypatch, capsys, tmp_path):
     assert rc.main(["--json", "--spill-dir", str(tmp_path)]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["recommendation"]["env"]["MAX_SEQS"] == "4"
+
+
+def test_video_max_tokens_follows_the_ram():
+    assert rc.recommend(detected(ram_gib=48.0))["env"]["VIDEO_MAX_TOKENS"] == "131072"  # (the default)
+    assert rc.recommend(detected(ram_gib=32.0))["env"]["VIDEO_MAX_TOKENS"] == "131072"
+    rec = rc.recommend(detected(ram_gib=24.0))
+    assert rec["env"]["VIDEO_MAX_TOKENS"] == "32768" and any("VIDEO_MAX_TOKENS" in w for w in rec["warnings"])
+    assert rc.recommend(detected(ram_gib=12.0))["env"]["VIDEO_MAX_TOKENS"] == "12288"
+    assert rc.recommend(detected(ram_gib=None))["env"]["VIDEO_MAX_TOKENS"] == "131072"
+    # the default's media buffers (1.25 GiB table + 0.75 GiB frames) come off the RAM tier's room
+    assert rc.media_host_gib(131072) == 2.0
+    assert rc.spill_ram_gib(48.0, 2.0) == 24
+
+
+def test_video_max_tokens_default_is_the_launcher_one():
+    import sys
+    root = rc.Path(__file__).resolve().parents[2]
+    sys.path[:0] = [str(root / "frontend"), str(root / "reference")]
+    import launch
+    assert rc.DEFAULT_VIDEO_MAX_TOKENS == launch.MEDIA_DEFAULTS["video_max_tokens"]

@@ -415,3 +415,48 @@ def test_tiers_block_ssd_dedup_fields(tmp_path):
     # an older policy / engine (flat files): the new figures are absent, not zero
     old = stats.tiers_block(FakeEngine(), FakeTiers(tmp_path), environ={})
     assert old["ssd_logical_bytes"] is None and old["ssd_physical_bytes"] is None and old["ssd_dedup_ratio"] is None
+
+
+# ------------------------------------------------------------ media of a request (images and videos)
+
+IMAGES = ([(10, 16, 16), (400, 20, 30), (1500, 20, 30)],  # an image of 256 tokens; two pairs of a video of 600 each
+          [("image", b"x", (512, 512), ()), ("video", 0, 0, ()), ("video", 0, 1, ())],
+          [(b"video", object())])
+
+
+def test_media_of_counts_images_videos_and_tokens():
+    assert stats.media_of(None) is None
+    assert stats.media_of(IMAGES) == {"images": 1, "videos": 1, "tokens": 256 + 600 + 600}
+    assert stats.media_of(([], [], [])) == {"images": 0, "videos": 0, "tokens": 0}
+
+
+def test_request_rows_carry_the_media_and_the_wait_reason():
+    now = time.time()
+    a, w = seq("a", now), seq("w", now, started=False)
+    a.images = IMAGES
+    w.held, w.held_reason = True, "kv"
+    snap = make_sched(StubEngine(), FakeTiers(None), [a], [w], cur=a).stats()
+    rows = {r["rid"]: r for r in snap["seqs"]}
+    assert rows["a"]["media"] == {"images": 1, "videos": 1, "tokens": 1456} and rows["a"]["images"] == 1456
+    assert rows["w"]["media"] is None and rows["w"]["wait"] == "kv" and rows["a"]["wait"] is None
+    json.dumps(snap)
+
+
+def test_the_log_record_has_the_media_in_its_meta():
+    hub = stats.Hub()
+    hub.local.meta = stats.request_meta("/v1/chat/completions", {}, {"messages": [{"role": "user", "content": "describe"}]})
+    hub.local.meta["media"] = stats.media_of(IMAGES)  # (server.Generation does this before it submits)
+    hub.submitted("req-1")
+    hub.finished("req-1", "stop", {"prompt_tokens": 2000, "cached_tokens": 0, "completion_tokens": 5, "total": 1.0,
+                                   "computed_tokens": 2000, "prefill_s": 0.5, "steps": 3})
+    done = [e for e in hub.log if e["kind"] == "done"][-1]
+    assert done["rec"]["meta"]["media"] == {"images": 1, "videos": 1, "tokens": 1456}
+    assert [e for e in hub.log if e["kind"] == "submit"][-1]["meta"]["media"]["videos"] == 1
+    json.dumps(done)
+
+
+def test_the_log_table_has_a_media_column():
+    html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
+    assert 'el("th", { class: "r" }, "Media")' in html and "fmtMedia(m.media)" in html
+    # the event rows span the table: 15 columns (Time, Result, Request, Endpoint, Agent, eight figures, Media, Last user message)
+    assert html.count('colspan: 15') == 2 and 'colspan: 10, class: "prev"' in html

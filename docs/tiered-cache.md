@@ -245,6 +245,95 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 對照表，SSD 上舊 entry 的 owner 仍然是同一個 agent。（`Scheduler.agent_of_ids` / `note_checkpoints` 是較早的指紋方案，保留但保留策略不使用：`spill_list` 沒有
 token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表有 RAM／SSD 位元組與筆數；不屬於任何已知 agent 的 owner（未知，或前一次執行的 agent）合併顯示為 `unknown`。
 
+## 影片輸入
+
+伺服器接受影片（OpenAI 風格的 `video_url`，與 vLLM 相同）。影片在引擎內由 GPU 的 NVDEC 解碼，抽出的畫面縮放後交給視覺塔；每兩張畫面是語言模型眼中的一張「圖」，前面帶著它的時間（文字 `<12.5 seconds>`）。設定的完整說明見 `docs/configuration.md` 的「Long videos」，給用戶端開發者的版本見 `docs/agent-client-guide.md`。
+
+### 格式與限制
+
+- 容器：MP4／MOV（含 fragmented）、Matroska／WebM；編碼：H.264、HEVC、AV1、VP9（8 或 10 位元，4:2:0；H.264 與 HEVC 也支援 4:2:2，HEVC 4:4:4）。手機影片的旋轉資訊會套用。
+- 一支影片最大 **256 MB**（解碼 base64 後的位元組數）；圖片 32 MB。超過回 HTTP 400（`video larger than 256 MiB`）。
+- 來源是 `data:video/mp4;base64,...` 資料 URL 或 `http(s)` URL（伺服器自己下載，逾時 120 秒）。其他 URL 回 HTTP 400。
+- 一個請求中所有圖片與影片的 token 合計超過 `IMAGE_TOKENS`（預設 131,072）回 HTTP 400（`the images and videos take N tokens, more than IMAGE_TOKENS`）。影片加文字還必須放得進上下文（`MAX_TOKENS`）。
+- 引擎以 `VISION=off` 啟動時，帶圖片或影片的請求回 HTTP 400。
+- 原生 Windows：影片用 NVIDIA 驅動程式的 `nvcuvid.dll` 解碼，需要安裝驅動程式（見 `docs/deploy-windows.md` 第 8 節）。
+
+### 怎麼送
+
+`POST /v1/chat/completions`，`content` 陣列放 `video_url` 部分與文字：
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAAIGZ0eXBpc29t..."}},
+      {"type": "text", "text": "請依時間順序說明影片裡發生了什麼。"}
+    ]}
+  ],
+  "mm_processor_kwargs": {"fps": 1, "max_frames": 600},
+  "max_tokens": 512
+}
+```
+
+`mm_processor_kwargs`（可省略；也適用於 `/v1/responses`）：
+
+| 鍵 | 值 | 意義 |
+| --- | --- | --- |
+| `fps` | 大於 0、至多 60 的數字（預設 2） | 每秒取幾張畫面 |
+| `num_frames` | 整數，1 到 `VIDEO_MAX_FRAMES` | 直接指定張數（與 `fps` 互斥） |
+| `min_frames`、`max_frames` | 整數，1 到 `VIDEO_MAX_FRAMES` | `fps` 算出的張數的下限與上限 |
+| `size.longest_edge` | 正整數 | 這支影片所有畫面合計的像素上限，每 token 2,048 像素（`VIDEO_MAX_TOKENS` 乘 2,048 即預設值） |
+
+畫面張數會進位到偶數；不認得的鍵會被忽略；壞值回 HTTP 400。每個請求的 `size.longest_edge` 只改變畫面大小，總 token 數仍受 `IMAGE_TOKENS` 限制。`/v1/messages`（Anthropic 格式）沒有這個欄位，只用預設值。
+
+### 長度怎麼換成 token
+
+預設 `VIDEO_MAX_TOKENS`＝T＝131,072、`VIDEO_MAX_FRAMES`＝F＝2,048（檢查點自己的是 12,288 與 768）。n 是取出的畫面張數（時長 × fps，限制在 4 到 F 之間，進位成偶數）；每兩張畫面（一對）最多 768 token。
+
+| 區間 | 條件 | 每對的 token | 影片總 token | 預設（fps 2） | 檢查點自己的值（fps 2） |
+| --- | --- | --- | --- | --- | --- |
+| A：每對上限 | n ≤ 2T / 768 | 影片本身大小，至多 768（16:9 的 1080p、4K 為 720：1152×640） | 對數 × 每對，隨長度增加，小於 T | n ≤ 341，約 170 秒以內 | n ≤ 32，約 16 秒以內 |
+| B：總 token 上限 | 2T / 768 < n < F | 約 2T / n：影片越長畫面越小 | 約 T | 170 秒到約 17 分鐘 | 16 秒到約 6.4 分鐘 |
+| C：張數上限 | 時長 × fps ≥ F | 約 2T / F | 約 T | 約 17 分鐘以上：時間間隔變粗 | 約 6.4 分鐘以上 |
+
+幾個例子（1080p 或 4K 的 16:9）：
+
+| 影片 | 預設（T 131,072、F 2,048） | 檢查點自己的值（T 12,288、F 768） |
+| --- | --- | --- |
+| 10 秒，2 fps | 10 對 × 720 ＝ 7,200（A） | 同左 |
+| 60 秒，2 fps | 60 × 720 ＝ 43,200（A） | 60 × 190（608×320）＝ 11,400（B） |
+| 10 分鐘，1 fps | 300 × 405（864×480）＝ 121,500（B） | 300 × 32（256×128）＝ 9,600（B） |
+| 10 分鐘，2 fps | 600 × 209（608×352）＝ 125,400（B），每 1.0 秒一對 | 384 × 28（224×128）＝ 10,752（C），每 1.6 秒一對 |
+| 1 小時，2 fps | 1,024 × 120（480×256）＝ 122,880（C），每 3.5 秒一對 | 384 × 28 ＝ 10,752（C），每 9.4 秒一對 |
+
+另外每一對還有 8 到 11 個文字 token（時間與開始／結束標記）。短於約 2.8 分鐘的影片兩種設定完全一樣。
+
+### 記憶體
+
+- **IMAGE_TOKENS 的嵌入表**：每 token 10 KiB 的 pinned 主機記憶體，引擎啟動時配置：131,072 時 1.25 GiB。
+- **編碼時的縮圖畫面**：每 token 6 KiB 的一般主機記憶體，只在編碼那支影片時佔用：131,072 時約 0.75 GiB。
+- **NVDEC 的暫存**：解碼時向 KV 池借用（`kv_lend`），數十到數百 MiB（解析度與編碼而定），解完歸還；借不到時才佔用預算之外的 VRAM。
+- **KV**：和文字一樣，每 token 18 KiB（NVFP4 KV）。43,200 token 的影片約 0.77 GiB；T＝131,072 的影片約 2.3 GiB。存成快取 entry 還要加每筆約 190 MiB 的遞迴狀態。
+- **原生 Windows**：pinned 記憶體計入 GPU 共用記憶體（約為 RAM 的一半）。`STATE_HOST_CACHE`（8 GiB）、`SPILL_PINNED_GIB`、視覺塔（`VISION=host`，0.86 GiB）與嵌入表（1.25 GiB）加起來要留在其中。RAM 在 32 GiB 以下時把 `VIDEO_MAX_TOKENS` 改成 32768（嵌入表 0.31 GiB）；`tools/recommend_config.py` 會這樣建議，並把影片緩衝從 RAM 層可用量中扣除。
+
+### 快取行為
+
+- 影片的每一對畫面在提示詞裡的 id 由「影片位元組的 sha256、取樣計畫（格點、大小、第幾對、來源畫面）」決定（`reference/qwen27b/image_tokens.py`），所以**同一支影片、同一個取樣計畫，得到同樣的 id**；不同的影片、不同的 fps／`max_frames`，id 不同，不會誤命中。這些 id 走和圖片相同的前綴快取與 chunk 鍵鏈（`kVocab` 以上的 id），所以影片的 KV 與一般文字一樣溢出到 RAM、SSD 並還原。
+- **同一支影片再問一次便宜**：落在已快取前綴內的對，不會再解碼、不會再過視覺塔、也不會再 prefill。多回合對話（把上一回合的回覆原樣帶回，見 `docs/agent-client-guide.md`）整支影片都在快取內，只算新的文字。同一支影片換一個問題：最後一則使用者訊息裡最後一段圖片或影片的結尾（含收尾的 `<|vision_end|>`）有自己的檢查點（`Scheduler.checkpoints`，與其他檢查點一樣向下對齊 64 token），所以第二個問題從影片結尾續起，不再解碼、編碼或 prefill 影片的任何一對（對齊造成的最多 63 個 token，可能讓最後一對在續起點之後，只重算那一對）；只有問題文字重新 prefill。條件：影片與問題在同一則最後的使用者訊息、影片在問題之前；影片在較早的訊息裡時，由多回合對話的回合結尾檢查點涵蓋。這個檢查點與其他位置保持 64 token 以上的間隔（太近則不加；與生成提示起點同一個 64 區塊附近時取代它），多個媒體部分只取最後一個的結尾。每個檢查點約佔一筆 190 MiB 的狀態槽，所以一個影片提示詞只多一個。
+- 例子：一支 4K 60 秒的影片（預設 2 fps，60 對 × 720 ＝ 43,200 token）。第一次要完整解碼、編碼 60 對並 prefill 約 43.8K token；存下的 entry 約 0.95 GiB，超過 `SPILL_SSD_MIN_TOKENS`（32,768），閒置 `SPILL_RAM_RETENTION_S` 後會寫到 SSD。之後同一個對話（或同一支影片）再來，從 VRAM、RAM 或 SSD 還原該 entry，不需重算那 43K token。
+- 取樣計畫不同的同一支影片（例如把 `fps` 從 2 改成 1）是另一份 id，不共用。要讓不同請求共用快取，請固定影片位元組與 `mm_processor_kwargs`。
+- 保留策略與公平性不為影片特別處理：entry 屬於送出請求的代理（`X-Agent-Id`），與文字相同。
+- `spill_fingerprint`（快取檔案的身分）不含 `VIDEO_MAX_*`、`IMAGE_MAX_PIXELS`、fps：它們都已經反映在 id 裡（格點、大小、取樣計畫）。視覺塔的數值不在 id 裡，所以 `VISION=fp8`（權重 E4M3，嵌入誤差約為 `bf16` 的 3 倍）會讓指紋不同；`host` 與 `bf16` 逐位元相同，指紋不變（既有的快取檔照常使用）。
+- 單一請求放不進整個 KV 池（提示詞加輸出預留超過池）時，直接回 HTTP 400，訊息列出需要與池的 token 數與影片佔了多少；其他請求佔住池而暫時放不下時會排隊，統計頁的請求列顯示「waits for: KV room」。
+
+### 建議
+
+- 預設下，約 17 分鐘（fps 2；fps 1 為約 34 分鐘）以內的影片時間間隔不變，只是超過約 170 秒（fps 2）後畫面逐漸變小（B）；再長時間間隔變粗（C）。**超過 10 分鐘的影片請先剪成段落，或調低 `fps`**（例如 `"mm_processor_kwargs": {"fps": 0.5}`），否則 prefill 與記憶體都以十萬 token 計。
+- 一支 T 這麼大的影片，prefill 時間與同樣長度的長文字提示詞相同（未針對影片實測）；影片只在第一次付出這個成本。
+- 模型在比檢查點預設（768 張、12,288 token）多得多的畫面與 token 上的答題品質，是模型的事，不是引擎的：請用自己的影片比較。
+- 要少用記憶體：調低 `VIDEO_MAX_TOKENS`（也同時降低 `IMAGE_TOKENS`）。
+
 ## 保留策略（價值導向逐出）
 
 實測（v0.3.1，無去重）：RAM 層 64 GiB 全滿、175 筆；SSD 200 GiB 全滿、624 筆（平均約 320 MB，一半是約 150–190 MiB 的遞迴狀態）；962 筆溢出到 RAM、只有
@@ -314,6 +403,7 @@ python3 tools/recommend_config.py --json             # 機器可讀的輸出
 - 具名磁碟區 `kvcache` 位於 WSL 虛擬磁碟。要測量它，請把 `--spill-dir` 指向該磁碟區的主機路徑。`.env` 中的 `SPILL_DIR` 一律寫入容器內路徑。
 - 偵測不到的值使用 `compose.yaml` 預設值，並在報告中註明。
 - 計算 VRAM 前請先停止正在執行的 serve，否則其用量會被當成「其他程式」。
+- 報告也含 `VIDEO_MAX_TOKENS`：RAM 32 GiB 以上為預設的 131072，16 GiB 以上 32768，更少為檢查點自己的 12288；影片緩衝（每 token 16 KiB）會從 RAM 層的可用量扣除。
 - 若報告提示 WSL VM 記憶體不足，依提示在 `%UserProfile%\.wslconfig` 設定 `memory=`，再於 Windows 執行 `wsl --shutdown`。
 
 ## 真機測試
@@ -339,7 +429,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
 ```
 
-`tiered_cache_test.py` 有十一個情境（a–k），各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
+`tiered_cache_test.py` 有十二個情境（a–l），各自在獨立的行程中執行（環境變數在引擎建立時讀取）：
 
 | 情境 | 強制走的路徑 | 檢查的計數器 |
 | --- | --- | --- |
@@ -355,6 +445,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | i RAM 去重＋pinned＋async | 同 h，加 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`，全部經 `spill_match` / `spill_restore_*` 還原 | 同 h |
 | j SSD 去重 | 4 段共用前綴的對話全部 `spill_export` 到 `SPILL_DIR`（兩個行程）：第一個行程寫出，第二個行程（新的 Engine、同一個目錄）`spill_import`、`spill_sweep`，丟棄一筆後從檔案還原其他筆（兩筆走 `prefix_begin` 的同步 promote，一筆走 `spill_restore_begin`） | `spill_disk_usage` 實體 < 0.6 × 邏輯、`.kvc` 檔數少於 chunk 參照數；重啟後仍然成立；丟棄釋放的位元組恰為 `unique_disk_bytes` 且共用的 `.kvc` 仍在；還原的 token 與參考相同；最後一筆還原後沒有殘留檔案 |
 | k 保留策略 | 兩個 agent（`set_owner`）：一個有很多大的 entry（含被取代與從未重用者），一個只有幾個；RAM 層壓力（小的 `SPILL_RAM_GIB`）下 | 小 agent 的 entry 全數留在 RAM、大 agent 被逐出的是被取代／從未重用的；`spill_meta` 的 owner／hits／superseded 與 `spill_agents` 位元組一致；還原後 token 與參考相同 |
+| l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一，prefill 存下 `Scheduler.checkpoints` 規劃的影片結尾檢查點與問題前最後一個 4096 倍數處的檢查點；B 同一支影片、問題二，從影片結尾檢查點續起（`cached` 不小於影片結尾向下對齊 64 的位置，影片不再解碼與編碼，最多重算最後一對）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 不小於影片結尾（向下對齊 64）、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片） |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
 

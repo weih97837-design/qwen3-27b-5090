@@ -157,6 +157,7 @@ class Seq:
         self.dead = False
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
+        self.held_reason = None  # why: "kv" (room in the KV pool) or "speed" (MIN_SEQ_TPS), shown in the stats rows
         self._bytes = None
         self.begun = None        # time of the first prefix_begin
         self.restoring = None    # the restore record this request waits for (Scheduler.maybe_restore), or None
@@ -187,6 +188,48 @@ class Seq:
         return self._bytes
 
 
+def media_end(prompt, lo, hi, vision_end=None):
+    """The position after the last media placeholder (an id >= VOCAB: an image or a pair of video frames) in
+    prompt[lo:hi], with the vision-end token that closes the span when it follows; 0 without media. Everything of the
+    media is before this position, the text after it (the question) is not."""
+    j = next((i for i in range(hi - 1, lo - 1, -1) if prompt[i] >= VOCAB), -1)
+    if j < 0:
+        return 0
+    return j + 2 if vision_end is not None and j + 1 < hi and prompt[j + 1] == vision_end else j + 1
+
+
+def plan_checkpoints(prompt, reusable, im_start, user, breaks, vision_end=None):
+    """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
+    and tools), the starts of the last message and of the generation prompt (a retried request, or a
+    client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
+    prefix shared inside a message), and, in a final user message, the end of its last image or video (the next
+    question about the same media shares all of it: no pair past the cached prefix is decoded, encoded or
+    prefilled again) and after its last blank line (a document followed by a question: the next question about it
+    shares the document). The end of the generation is saved after it."""
+    starts = [i for i, t in enumerate(prompt) if t == im_start]
+    at = set(starts[1:2] + starts[-2:])
+    if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == user:
+        # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
+        # the document and miss a follow-up question that differs only after it)
+        g = starts[-1] // 64 * 64
+
+        def add(pos):
+            # (a new position must keep more than 64 tokens from the other planned positions, our sibling share's
+            # `reusable` included: a chunk of <= 64 tokens between two checkpoints takes the decode GEMMs)
+            r = pos // 64 * 64
+            others = [q // 64 * 64 for q in at | ({reusable} if reusable > 0 else set()) if q != starts[-1]]
+            if pos and 0 < r < g and all(abs(r - q) > 64 for q in others):
+                if g - r <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
+                    at.discard(starts[-1])
+                at.add(pos)
+
+        add(media_end(prompt, starts[-2], starts[-1], vision_end))
+        add(next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in breaks), 0))
+    if reusable > 0:
+        at.add(reusable)
+    return sorted(at)
+
+
 class Scheduler:
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
@@ -194,6 +237,7 @@ class Scheduler:
     returns = ()  # (video loans to give back; __init__ makes the deque)
     user = None  # the id of "user" and the ids of blank-line tokens (checkpoints: after the last blank line of a final user message)
     breaks = frozenset()
+    vision_end = None  # the id of <|vision_end|> (checkpoints: the end of a media span)
     last_active = 0.0
     backup_done = False
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
@@ -248,6 +292,7 @@ class Scheduler:
         self.im_start = cfg["im_start"]
         self.user = cfg.get("user")
         self.breaks = frozenset(cfg.get("breaks", ()))
+        self.vision_end = cfg.get("vision_end")
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
         self.slot_lanes = {}     # rid -> UI lane (1-based) in the last stats snapshot (slot_rows keeps lanes still)
@@ -380,6 +425,9 @@ class Scheduler:
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
+        if (why := self.never_fits(s)):
+            self.send("error", rid, why, 400)
+            return
         s.best = self.best_history(s.prompt)  # (and where it diverges: the log in begin)
         s.reusable = max(0, min(s.best[0], len(s.prompt) - 1))
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
@@ -424,6 +472,27 @@ class Scheduler:
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def never_fits(self, s):
+        """Why request s cannot run even alone (the message of its HTTP 400), or None: its prompt and the output the
+        admission reserves (min(max_tokens, kv_reserve)) take more pages than the whole KV pool has. The server's
+        context check (MAX_TOKENS, lowered to what the pool holds) normally keeps such a request out; this catches a
+        pool smaller than the context (KV_POOL_TOKENS set low, MIN_KV_TOKENS) and a prompt of long videos, which the
+        admission would otherwise run and suspend again and again, or keep waiting at the head of the queue."""
+        try:
+            # (pool_pages includes the parking areas: alone, a request has them, they are lent to the KV cache while unused)
+            pool = int(self.engine.cache_stats().get("pool_pages") or 0)
+        except Exception:  # noqa: BLE001 - no statistics: the admission decides, as before
+            return None
+        # (one ceiling over the whole length; a verify block writes up to kSpecBlock = 16 positions past the committed length)
+        need = -(-(len(s.prompt) + min(s.max_new, self.kv_reserve) + 16) // PAGE)
+        if not pool or need <= pool:
+            return None
+        media = sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0
+        return (f"the request needs {need * PAGE:,} tokens of KV cache ({len(s.prompt):,} of prompt"
+                + (f", {media:,} of them images and video" if media else "")
+                + f", and the output) but the KV pool holds {pool * PAGE:,}: shorten the prompt"
+                + (" (cut the video, lower its fps, or set VIDEO_MAX_TOKENS lower)" if media else ""))
 
     def note_checkpoints(self, s, ids, positions):
         """(The tiered cache's retention does not use this: the engine tags each checkpoint with its agent, set_owner / agent.owner_id.)
@@ -596,6 +665,8 @@ class Scheduler:
                 reason = "kv"
             elif self.min_tps > 0 and self.predicted_rate(len(self.alive) + 1) < self.min_tps:
                 reason = "speed"
+        if reason:
+            s.held_reason = reason
         if reason and not s.held:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
@@ -907,29 +978,8 @@ class Scheduler:
             return f"?({type(e).__name__})", ""
 
     def checkpoints(self, prompt, reusable):
-        """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
-        and tools), the starts of the last message and of the generation prompt (a retried request, or a
-        client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
-        prefix shared inside a message), and after the last blank line of a final user message (a document followed
-        by a question: the next question about it shares the document). The end of the generation is saved
-        after it."""
-        starts = [i for i, t in enumerate(prompt) if t == self.im_start]
-        at = set(starts[1:2] + starts[-2:])
-        if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
-            # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
-            # the document and miss a follow-up question that differs only after it)
-            b = next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in self.breaks), 0)
-            g = starts[-1] // 64 * 64
-            # (b must also keep more than 64 tokens from the other planned positions, our sibling share's `reusable`
-            # included: a chunk of <= 64 tokens between two checkpoints takes the decode GEMMs)
-            others = [q // 64 * 64 for q in at | ({reusable} if reusable > 0 else set()) if q != starts[-1]]
-            if b and b // 64 * 64 < g and all(abs(b // 64 * 64 - q) > 64 for q in others):
-                if g - b // 64 * 64 <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
-                    at.discard(starts[-1])
-                at.add(b)
-        if reusable > 0:
-            at.add(reusable)
-        return sorted(at)
+        """Checkpoints of a prompt (docs/architecture.md §9); see plan_checkpoints."""
+        return plan_checkpoints(prompt, reusable, self.im_start, self.user, self.breaks, self.vision_end)
 
     # ------------------------------------------------------------ scheduling
 
@@ -1479,7 +1529,7 @@ class Scheduler:
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
-        from stats import agents_block, slot_rows, tiers_block  # (the frontend dir is on sys.path)
+        from stats import agents_block, media_of, slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
         if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
             self.slot_lanes = {}
@@ -1499,7 +1549,9 @@ class Scheduler:
                          "decode_wall": (now - s.first_token) if s.first_token else 0.0,
                          "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
+                         "wait": getattr(s, "held_reason", None) if s.held and s in self.waiting else None,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
+                         "media": media_of(s.images),
                          "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id})
             if s.restoring is not None:
                 rec = s.restoring

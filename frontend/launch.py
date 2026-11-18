@@ -58,10 +58,37 @@ TIER_SETTINGS = {
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down
 TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
+
+# ----- Video / image media settings: THE place of their defaults ------------------------------------------------------
+# image_tokens (IMAGE_TOKENS), video_max_tokens (VIDEO_MAX_TOKENS) and video_max_frames (VIDEO_MAX_FRAMES) are start
+# settings. An unset or empty variable, and null in the admin API, is MEDIA_DEFAULTS[key]; this fork's defaults are
+# the video budget of a long video (131,072 tokens, 2,048 frames; the checkpoint's own are 12,288 and 768, which a
+# setting of those numbers gives back; short videos, up to about 2.8 minutes at 2 frames per second, are the same
+# with either) and image_tokens None: IMAGE_TOKENS (16,384), or video_max_tokens when that is more (131,072).
+# To change the defaults change MEDIA_DEFAULTS and, to keep the documentation true, the same numbers in compose.yaml
+# (the three lines after IMAGE_TOKENS), scripts/windows/settings.example.ini, docs/configuration.md and the zh-TW
+# docs; frontend/tests/test_launch.py::test_media_defaults_are_the_documented_ones compares compose.yaml and the tables. Costs: 10 KiB of
+# pinned host memory per image_tokens (1.25 GiB for 131,072, allocated when the engine starts), 6 KiB of host memory
+# per token of a video while it is encoded; the video settings change nothing in the engine's pools (only the server
+# reads VIDEO_MAX_*). tools/recommend_config.py lowers VIDEO_MAX_TOKENS for machines with little RAM.
+IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
+MEDIA_DEFAULTS = {"image_tokens": None, "video_max_tokens": 131072, "video_max_frames": 2048}
+MEDIA_SETTINGS = {"image_tokens": ("IMAGE_TOKENS", 1, MAX_CONTEXT),         # (key: variable, least, most)
+                  "video_max_tokens": ("VIDEO_MAX_TOKENS", 1, MAX_CONTEXT),
+                  "video_max_frames": ("VIDEO_MAX_FRAMES", 2, 16384)}
+MEDIA_ENV = frozenset(v[0] for v in MEDIA_SETTINGS.values())
+VIDEO_ENV = frozenset({"VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"})  # (read by the server's video processor only: no pool)
+
+
+def image_tokens_env(s):
+    """IMAGE_TOKENS the engine starts with for settings s: the setting, else 16,384 or video_max_tokens when more."""
+    return s["image_tokens"] if s["image_tokens"] is not None else max(IMAGE_TOKENS, s["video_max_tokens"] or 0)
+
+
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
              "max_tokens": "MAX_TOKENS", "vram_reserve_gib": "VRAM_RESERVE_GIB",
-             **{k: v[0] for k, v in TIER_SETTINGS.items()}}
+             **{k: v[0] for k, v in MEDIA_SETTINGS.items()}, **{k: v[0] for k, v in TIER_SETTINGS.items()}}
 
 
 def spill_dir_default(platform=os.name, env=os.environ):
@@ -76,21 +103,17 @@ def engine_env_defaults(platform=os.name, env=os.environ):
     return dict(ENGINE_ENV_DEFAULTS, SPILL_DIR=spill_dir_default(platform, env))
 
 
-IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
-
-
 def set_engine_env(root):
     """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package).
-    IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when that is more (one video of that many tokens, its
-    time stamps aside). Raises ValueError for a VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES that is not a positive integer.
+    Raises ValueError for a VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES that is not a positive integer. IMAGE_TOKENS is not set
+    here: an unset or empty one is a start setting (None) that follows VIDEO_MAX_TOKENS (image_tokens_env), so that
+    a changed video setting moves it too; Launch.config puts the value in the engine's environment.
     Called before the engine process is spawned (it copies os.environ) and before TierPolicy.from_env reads it."""
     for k, v in engine_env_defaults().items():
         os.environ.setdefault(k, v)
     for k in ("VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"):
         if (v := os.environ.get(k)) and not (v.isdigit() and int(v) > 0):
             raise ValueError(f"{k} must be a positive integer, got {v!r}")
-    if not os.environ.get("IMAGE_TOKENS"):
-        os.environ["IMAGE_TOKENS"] = str(max(IMAGE_TOKENS, int(os.environ.get("VIDEO_MAX_TOKENS") or 0)))
     vocab = root / "bench/draft-vocab/vocab-128k.txt"
     if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
@@ -153,9 +176,24 @@ def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     reserve = env("VRAM_RESERVE_GIB")
-    return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
+    return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()},
+            **{k: parse_media(k, env(v[0])) for k, v in MEDIA_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": parse_reserve(reserve)}
+
+
+def parse_media(key, text, warn=None):
+    """The media setting `key` from the text of its variable: unset or empty is MEDIA_DEFAULTS[key]; text that is not an
+    integer in the setting's range gives that too, with a warning (the engine reads IMAGE_TOKENS with atoi, and the
+    server refuses a bad VIDEO_MAX_*: set_engine_env raises before this is reached)."""
+    var, lo, hi = MEDIA_SETTINGS[key]
+    if text is None or not text.strip():
+        return MEDIA_DEFAULTS[key]
+    t = text.strip()
+    if t.isdigit() and lo <= int(t) <= hi:
+        return int(t)
+    (warn or (lambda m: print(m, file=sys.stderr, flush=True)))(f"{var}={text!r} is not an integer from {lo} to {hi}: using the default")
+    return MEDIA_DEFAULTS[key]
 
 
 def parse_reserve(value):
@@ -188,7 +226,7 @@ class Launch:
     """The settings the next engine start uses (changed with a start, restart or save from the admin API; they last
     until the server restarts, which starts from the variables again) and their plans."""
 
-    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_reserve_gib", *TIER_SETTINGS)
+    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_reserve_gib", *MEDIA_SETTINGS, *TIER_SETTINGS)
 
     def __init__(self, base, settings, tokenizer=None):
         self.base = base            # the rest of the engine's configuration (prefill chunk, scheduling, ...)
@@ -231,6 +269,8 @@ class Launch:
         s = dict(base or getattr(self, "settings", {}), **changes)
         for k, (_, default, kind) in TIER_SETTINGS.items():  # (settings made without the tier ones: the defaults)
             s.setdefault(k, spill_dir_default() if kind == "path" else default)
+        for k in MEDIA_SETTINGS:  # (and without the media ones)
+            s.setdefault(k, MEDIA_DEFAULTS[k])
         unknown = set(changes) - set(self.KEYS)
         if unknown:
             raise ValueError(f"unknown setting {sorted(unknown)[0]!r} (settings: {', '.join(self.KEYS)})")
@@ -254,6 +294,12 @@ class Launch:
             s["vram_reserve_gib"] = round(float(b), 2)
             if check_budget and device is not None and s["vram_reserve_gib"] * GiB > device[1]:
                 raise ValueError(f"vram_reserve_gib: at most the device's memory, {device[1] / GiB:.2f} GiB")
+        for k, (_, lo, hi) in MEDIA_SETTINGS.items():
+            v = s[k]
+            if v is None:  # (null: the default)
+                s[k] = v = MEDIA_DEFAULTS[k]
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi):
+                raise ValueError(f"{k}: null (the default) or an integer from {lo} to {hi}")
         for k, (_, _, kind) in TIER_SETTINGS.items():
             v = s[k]
             if kind == "num":
@@ -280,6 +326,10 @@ class Launch:
                "VRAM_RESERVE_GIB": None if s["vram_reserve_gib"] is None else f"{s['vram_reserve_gib']:g}",
                # (a legacy VRAM_BUDGET_GIB inherited from settings.ini would cap the budget unseen: the reserve rules)
                "VRAM_BUDGET_GIB": None,
+               # (image / video tokens: the engine reads IMAGE_TOKENS; the server's own processors read VIDEO_MAX_*
+               # from this environment (server.Server.images))
+               "IMAGE_TOKENS": str(image_tokens_env(s)),
+               **{MEDIA_SETTINGS[k][0]: str(s[k]) for k in ("video_max_tokens", "video_max_frames")},
                # (the tiered cache: the engine and worker.TierPolicy read these when the engine process loads)
                **{TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS},
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
@@ -304,7 +354,7 @@ class Launch:
                     continue
                 job = {"model": cfg["model"], "draft": cfg["draft"], "max_tokens": s["max_tokens"],
                        "prefill_chunk": cfg["prefill_chunk"], "kv_dtype": s["kv_dtype"],
-                       "env": {k: v for k, v in cfg["env"].items() if k not in TIER_ENV},  # (no pool depends on them)
+                       "env": {k: v for k, v in cfg["env"].items() if k not in TIER_ENV | VIDEO_ENV},  # (no pool depends on them)
                        "free": free, "total": total}
                 key = json.dumps(job, sort_keys=True)
                 if key in self.plans_cache:

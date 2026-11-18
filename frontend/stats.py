@@ -90,6 +90,17 @@ def group_items(items, key, top=6):
     return [{"name": k, "bytes": n} for k, n in out]
 
 
+def media_of(images):
+    """The media of a request for the log and the request rows: {"images": n, "videos": n, "tokens": n} (tokens: the rows
+    of image / video embeddings, the pairs of a video's frames included; the pairs' time stamps are text and not counted),
+    or None without any. images: server.Images.prepare's (spans [(start, gh, gw)], sources, videos) as the worker has it."""
+    if not images:
+        return None
+    spans, srcs, videos = images
+    n_images = sum(1 for s in srcs if s and s[0] == "image")
+    return {"images": n_images, "videos": len(videos), "tokens": sum(gh * gw for _, gh, gw in spans)}
+
+
 def request_meta(path, headers, body):
     """What the log shows of a request: endpoint, client, options and the start of the last user message."""
     msgs = body.get("messages") or body.get("input") or []
@@ -157,7 +168,8 @@ UNKNOWN_AGENT = "unknown"
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
                    "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS",
-                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "VRAM_BACKUP_IDLE_S")
+                   "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "VRAM_BACKUP_IDLE_S",
+                   "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")
 DAY_S = 86400.0
 
 

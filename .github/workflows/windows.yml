@@ -17,6 +17,8 @@ on:
       - scripts/native_env.py
       - scripts/tiered_cache_test.py
       - scripts/tiered_cache_bench.py
+      - scripts/vision_api_test.py
+      - bench/vision/**
       - bench/golden/**
       - scripts/windows/**
       - windows/tray/**
@@ -109,6 +111,13 @@ jobs:
           if ($LASTEXITCODE) { throw "tiered_cache_test.py --help failed" }
           & $py "$app\scripts\tiered_cache_bench.py" --help | Out-Null
           if ($LASTEXITCODE) { throw "tiered_cache_bench.py --help failed" }
+          # Video input without a GPU: the server's video processor (videoproc.py, Pillow in site-packages) probes an MP4
+          # through q27.dll's demuxer (the MSVC build of video_mp4.cc / video_mkv.cc; NVDEC itself loads nvcuvid.dll from
+          # the driver at the first decode, which this runner has not) and the launcher's defaults are there.
+          & $py -c "import sys, pathlib; a = pathlib.Path(r'$app'); sys.path[:0] = [str(a / 'engine' / 'python'), str(a / 'frontend'), str(a / 'reference')]; import videoproc, launch, PIL; t, fps, w, h = videoproc.probe((a / 'bench' / 'vision' / 'colors.mp4').read_bytes()); assert t > 0 and fps > 0 and w > 0 and h > 0, (t, fps, w, h); print('ok video probe', t, fps, w, h, launch.MEDIA_DEFAULTS)"
+          if ($LASTEXITCODE) { throw "the video probe through q27.dll failed" }
+          & $py "$app\scripts\vision_api_test.py" --help | Out-Null
+          if ($LASTEXITCODE) { throw "vision_api_test.py --help failed" }
           $tray = Start-Process "dist\qwen3-27b-5090-windows-x64\qwen3-27b-tray.exe" -ArgumentList "--check" -Wait -PassThru
           if ($tray.ExitCode) { throw "the tray app does not find the package ($($tray.ExitCode))" }
           $errs = $null

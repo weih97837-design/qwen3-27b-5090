@@ -116,11 +116,19 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_SSD_GIB` | `100` | SSD 層的上限（GiB），超過時刪除最舊的檔案 |
 | `WEIGHTS` | `gdnfp4` | 權重版本 |
 | `HOST` / `PORT` | `127.0.0.1` / `46320` | 監聽位址與埠 |
-| `SPILL_PINNED_GIB` | `0` | pinned 記憶體（GiB），預設關閉 |
-| `SPILL_ASYNC_IO` | `0` | 預設關閉 |
-| `SPILL_ASYNC_PROMOTE` | `0` | 預設關閉 |
+| `VIDEO_MAX_TOKENS` | `131072` | 一支影片最多的 token 數（檢查點自己的是 12288）。`IMAGE_TOKENS` 預設跟著它：每 token 10 KiB 的 pinned 主機記憶體，131072 時 1.25 GiB；編碼影片時另有每 token 6 KiB 的縮圖畫面（0.75 GiB）。RAM 32 GiB 以下建議改 `32768` |
+| `VIDEO_MAX_FRAMES` | `2048` | 一支影片最多取幾張畫面（檢查點自己的是 768） |
+| `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後（閒置時）才寫入 SSD |
+| `SPILL_SSD_MIN_FREE_GIB` | `10` | SSD 所在磁碟保留的最小可用空間（GiB） |
+| `SPILL_SSD_MIN_TOKENS` | `32768` | 短於此 token 數的 checkpoint 不寫入 SSD（`0`：不設下限） |
+| `SPILL_TTL_DAYS` | `7` | 未被重用的 SSD 檔案保留天數 |
+| `VRAM_BACKUP_IDLE_S` | `60` | 引擎閒置多久後把 VRAM checkpoint 備份到 RAM（`0`：關閉） |
+| `SPILL_PINNED_GIB` | `8` | pinned 記憶體（GiB）；`0` 關閉（v0.3.2 起預設 8） |
+| `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
+| `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
+| `SPILL_FAIR_AGENTS` | `1` | RAM／SSD 層滿時，從用量最大的 agent 挑逐出對象；`0` 關閉 |
 
-`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 只在 `test.cmd` 全部通過後才建議開啟（見 `docs/tiered-cache.md`）。
+`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 自 v0.3.2 起預設開啟；pinned 記憶體在 Windows 上計入 GPU 共用記憶體，記憶體吃緊時可設 `SPILL_PINNED_GIB=0`（見 `docs/tiered-cache.md`）。
 `HOST=0.0.0.0` 會讓區網其他電腦連線；第一次啟動時 Windows 防火牆會詢問是否允許 Python，允許前請確認網路環境。
 
 ---
@@ -131,8 +139,10 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 
 | 指令 | 做什麼 |
 | --- | --- |
-| `test.cmd` | 精確性測試：七個情境（a–g）全部執行 |
+| `test.cmd` | 精確性測試：全部情境（a–l）執行 |
 | `test.cmd --scenarios a,c` | 只執行指定情境 |
+| `test.cmd --scenarios l` | 只執行情境 l（影片輸入：同一支影片的前綴命中、溢出到 RAM 與 SSD 後還原；需要視覺塔與 NVDEC） |
+| `python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:8080` | 對**執行中**的伺服器測試圖片與影片請求（見下）。埠換成 `settings.ini` 的 `PORT`（預設 `46320`；本文件的範例伺服器用 `8080`） |
 | `bench.cmd` | 耗時：32K、128K、256K token 的 checkpoint |
 | `bench.cmd --sizes 32768` | 只測指定大小 |
 | `bench.cmd --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"` | 比較數個變數組合（每個引數是 `名稱=值`） |
@@ -142,6 +152,14 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 **權重從哪裡讀**：與 `start.cmd` 相同——`settings.ini` 的 `HF_HOME`，否則程式包內的 `huggingface\`。測試的預設 `--weights` 是 `settings.ini`（或環境變數）的 `WEIGHTS`，否則 `gdnfp4`。權重不在預期位置時，腳本會報錯 `... is not in ...hub`，請先確認 `start.cmd` 已下載完成。
 
 **`test.cmd` 的 PASS 代表什麼**：每個情境的輸出 token（貪婪解碼）都與關閉快取的參考完全相同，而且所有檢查都通過，代表確實走了該情境的路徑（細節見 `docs/tiered-cache.md` 「真機測試」）。最後一行顯示 `all passed` 時結束碼為 0；任一情境 FAIL 時為 1。
+
+**`vision_api_test.py`（圖片與影片 API 測試）**：與 `test.cmd` 相反，它需要伺服器**正在執行**（`start.cmd` 或托盤），透過 HTTP 送請求，不載入引擎、只用標準函式庫。在程式包資料夾的命令提示字元執行（不會自動暫停）：
+
+```
+python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:8080
+```
+
+`--base-url` 是伺服器的位址與埠（預設 `http://127.0.0.1:46320`）。測試包含：圖表圖片的問答、同一對話第二回合命中前綴快取（圖片不再編碼）、換圖片不命中、兩張圖片、非資料 URL 的 HTTP 400，以及 `bench\vision\colors.mp4`（紅、綠、藍各 3 秒）：答案要依序說出三種顏色、換色約在 3 秒、圖片加影片同一則訊息、不是影片的位元組得到 HTTP 400。腳本最後以結束碼回報成功或失敗。引擎以 `VISION=off` 啟動時這些請求會被拒絕。
 
 **情境 e（推測解碼）**：需要 DFlash2 草稿模型。`SPEC=none` 或草稿未下載時，該情境顯示 `SKIP`，這不是失敗。
 
@@ -158,6 +176,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 - **`The weights could not be downloaded.`**：網路中斷或 Hugging Face 無法連線。重新執行 `start.cmd`，下載會續傳。
 - **`python\python.exe` 找不到**：zip 沒有完整解開。請把整個 zip 解開到一個資料夾，不要只執行 zip 內的檔案。
 - **`Not enough VRAM to load the model`**：VRAM 不足，見 `docs/deploy-launcher.md` 第 7 節。執行 `test.cmd` 時，若伺服器仍在執行也會發生，先停止伺服器。
+- **影片請求回 HTTP 400，訊息含 `NVDEC (libnvcuvid) is not available`**：影片由 NVIDIA 驅動程式的 `nvcuvid.dll`（在 `C:\Windows\System32`）解碼，程式包不含它。安裝或更新 NVIDIA 驅動程式（Game Ready 或 Studio 皆可；訊息為 `lacks entry points` 表示驅動程式太舊）。
 - **測試顯示無法載入 q27.dll（`Could not find module` 之類的錯誤）**：確認 `app\engine\build\q27.dll` 存在。
 - **托盤程式被 Windows SmartScreen 攔截**：程式未簽章（`README.md` 說明），需確認來源後再執行。嵌入式 Python 由 python.org 簽章。
 - **`is not in ...hub`**：權重不在測試使用的 `HF_HOME`。檢查 `settings.ini` 的 `HF_HOME`，並確認 `start.cmd` 的下載已完成。
@@ -170,4 +189,5 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 - 第 2 節 A 的 Actions 與 Artifacts 操作、SHA-256 核對指令。
 - 第 4 節的啟動流程與檔案位置（由程式碼推得，未在 Windows 上執行）。
 - 第 7 節的 `test.cmd` / `bench.cmd` 實際執行結果、耗時與所需 RAM。
+- 影片輸入在原生 Windows 的實際解碼（`nvcuvid.dll` 的載入、WDDM 下 KV 池借出給 NVDEC）、情境 l 與 `vision_api_test.py` 的執行結果：程式碼有 Windows 分支，CI 只驗證 MSVC 編譯與不需 GPU 的 MP4 探測。
 - 第 1 節的約 150 GB 與 16 GB RAM 建議（由設定預設值推算）。

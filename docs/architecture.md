@@ -318,7 +318,8 @@ convolution, the draft's context ring: 189.9 MiB).
   blank line of a final user message (a document followed by a question: a second question about the same document
   reuses all of it; without this the generation prompt's checkpoint, rounded down to 64, often fell just past the
   document and the next question resumed from the last interval checkpoint, up to one interval back), where the prompt diverges from the previous
-  one, every `CHECKPOINT_INTERVAL` (4,096) tokens inside a long prompt (the last four), and at the end of each
+  one, after the last image or video of a final user message (its last media id plus the closing `<|vision_end|>`; the
+  same media with another question resumes there and decodes, encodes and prefills none of it), every `CHECKPOINT_INTERVAL` (4,096) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 8 GiB = about 42 checkpoints). Saving copies the
   state to one staging buffer on the GPU and then to the host on a copy stream; restoring copies from the host
@@ -385,7 +386,7 @@ images.
 
 **Videos.** The checkpoint's video processor samples 2 frames per second (4 to 768, an even count), resizes all of
 them to one size and caps the pixels per frame as qwen-vl-utils does (at most 768 tokens per pair of frames, 12,288
-per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video).
+per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video: this fork's defaults are 131,072 and 2,048).
 Each pair of frames (the temporal patch) is, to the language model,
 an image of its own after its time as text, `<1.3 seconds><|vision_start|>...<|vision_end|>`, with the M-RoPE
 positions of an image (transformers' `get_rope_index` splits a video the same way), so the engine's image path

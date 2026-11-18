@@ -96,7 +96,10 @@ def probe(raw):
 class VideoProcessor:
     """video_preprocessor_config.json of a model directory (the processor class's defaults where it has none)."""
 
-    def __init__(self, path):
+    def __init__(self, path, env=None):
+        """env: where VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES are read (default os.environ; the server passes the
+        environment of the engine settings it runs, launch.Launch.config, so a changed setting applies)."""
+        env = os.environ if env is None else env
         d = pathlib.Path(path)
         f = d / "video_preprocessor_config.json"
         c = json.loads((f if f.exists() else d / "preprocessor_config.json").read_text(encoding="utf-8"))
@@ -107,9 +110,9 @@ class VideoProcessor:
         self.max_video_tokens = c["max_video_tokens"]  # (of a pair of frames)
         # VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES: the server's own bounds of a video in place of the checkpoint's
         # (12,288 tokens = its size.longest_edge, 768 frames); a request may ask up to VIDEO_MAX_FRAMES frames.
-        if tokens := os.environ.get("VIDEO_MAX_TOKENS"):
+        if tokens := env.get("VIDEO_MAX_TOKENS"):
             self.max_pixels = _positive("VIDEO_MAX_TOKENS", tokens) * self.pixels_per_token
-        if frames := os.environ.get("VIDEO_MAX_FRAMES"):
+        if frames := env.get("VIDEO_MAX_FRAMES"):
             self.max_frames = _positive("VIDEO_MAX_FRAMES", frames)
         rescale = c.get("rescale_factor", 1 / 255)
         mean = [_f32(_f32(v) * _f32(1.0 / rescale)) for v in c.get("image_mean", [0.5] * 3)]

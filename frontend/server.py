@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT / "reference"))
 import structured  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
-from stats import HUB, request_meta  # noqa: E402
+from stats import HUB, media_of, request_meta  # noqa: E402
 from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
                   openai_call, parse_output, parse_tool_calls, responses_messages, responses_template_kwargs,
@@ -102,10 +102,11 @@ class Images:
 
     MAX_BYTES = {"image": 32 << 20, "video": 256 << 20}
 
-    def __init__(self, path, max_pixels, max_tokens=16384):
+    def __init__(self, path, max_pixels, max_tokens=16384, env=None):
         from imageproc import ImageProcessor
 
         self.path = path
+        self.env = env  # (VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES: videoproc.VideoProcessor; None: os.environ)
         self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
         self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
@@ -116,7 +117,7 @@ class Images:
         if self._video is None:
             from videoproc import VideoProcessor
 
-            self._video = VideoProcessor(self.path)
+            self._video = VideoProcessor(self.path, self.env)
         return self._video
 
     @staticmethod
@@ -595,6 +596,9 @@ class Generation:
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
         # skip_special_tokens does)
         self.hide = set(getattr(server.engine, "cfg", {}).get("eos", ())) if sampling.get("ignore_eos") else set()
+        meta = getattr(HUB.local, "meta", None)
+        if meta is not None and images:  # (the log's media column: how many images and videos, and their tokens)
+            meta["media"] = media_of(images)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock, MARKS if marked else None)
         self.text, self.sent = "", 0
@@ -746,6 +750,7 @@ class Server:
         self.tok_lock = threading.Lock()
         self.images_lock = threading.Lock()
         self._images = None
+        self._images_key = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
         self.pads = tuple(tok.token_id(t) for t in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
@@ -766,10 +771,14 @@ class Server:
         cfg = self.engine.cfg
         if cfg["env"]["VISION"] == "off":
             return None
+        env = {k: cfg["env"].get(k) or None for k in ("IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")}
         with self.images_lock:
-            if self._images is None:
+            # (rebuilt when an engine start changed these settings: the engine's IMAGE_TOKENS rows and the server's
+            # video bounds must be the same ones)
+            if self._images is None or self._images_key != (cfg["model"], tuple(env.items())):
                 self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)),
-                                      int(os.environ.get("IMAGE_TOKENS", 16384)))
+                                      int(env["IMAGE_TOKENS"] or os.environ.get("IMAGE_TOKENS") or 16384), env)
+                self._images_key = (cfg["model"], tuple(env.items()))
             return self._images
 
     def encode(self, text):
@@ -1797,7 +1806,7 @@ def main():
     base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
             "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
             "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
-            "user": tok.encode("user")[0], "breaks": tok.paragraph_breaks(),
+            "user": tok.encode("user")[0], "breaks": tok.paragraph_breaks(), "vision_end": tok.token_id("<|vision_end|>"),
             "engine_python": str(ROOT / "engine/python"), "tokenizer": str(pathlib.Path(path) / "tokenizer.json")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
     launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,

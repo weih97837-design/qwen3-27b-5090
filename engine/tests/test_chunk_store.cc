@@ -776,8 +776,148 @@ static void test_churn() {
   CHECK(sc.store.size() == 0 && sc.phys() == 0 && sc.store.orphan_count() == 0);
 }
 
+
+// ---------------------------------------------------------------- video prompts (frontend/server.py Images.prepare)
+
+// A video in the prompt is, for each pair of frames: the pair's time as text, <|vision_start|>, gh*gw/4 ids >= kVocab
+// derived from sha256(video bytes) and (grid, size, pair, source frames), <|vision_end|>
+// (reference/qwen27b/image_tokens.py image_token_ids). Here the hash is a splitmix64 of the same inputs: what matters
+// to the cache is that the ids are content-unique, consecutive per pair, and >= kVocab, like an image's.
+static constexpr int32_t kVocabIds = 248320, kVStart = 248053, kVEnd = 248054;  // (common.h kVocab; the vision tokens)
+
+static uint64_t mix64(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+// `video`: the digest of its bytes; `plan`: its sampling plan (fps / frame bound / size); `pairs` pairs of `n` tokens.
+static void append_video(std::vector<int32_t>& out, uint64_t video, uint64_t plan, int pairs, int n) {
+  for (int g = 0; g < pairs; g++) {
+    for (int c = 0; c < 6; c++) out.push_back(int32_t(1000 + (g * 7 + c) % 90));  // "<12.5 seconds>": text ids of the time
+    out.push_back(kVStart);
+    const uint64_t h = mix64(video ^ mix64(plan ^ mix64(uint64_t(g))));
+    const uint64_t span = uint64_t(INT32_MAX) - kVocabIds;
+    for (int j = 0; j < n; j++) out.push_back(int32_t(kVocabIds + (h + uint64_t(j)) % span));
+    out.push_back(kVEnd);
+  }
+}
+
+static std::vector<int32_t> video_prompt(const std::vector<int32_t>& system, uint64_t video, uint64_t plan, int pairs, int n,
+                                         uint32_t question) {
+  std::vector<int32_t> v = system;
+  append_video(v, video, plan, pairs, n);
+  const auto q = make_ids(question, 300);
+  v.insert(v.end(), q.begin(), q.end());
+  return v;
+}
+
+// The chunks (full 4096-token blocks) of ids a store lists for them: resident ones as they are, the others registered.
+static std::vector<Ch*> acquire_all(Store& st, const std::vector<int32_t>& ids, size_t* fresh_n = nullptr) {
+  std::vector<Ch*> refd;
+  std::vector<std::pair<size_t, Ch*>> fresh;
+  chunk_acquire(st, chunk_seed(0x1234, kChunkPages), ids.data(), ids.size() / kChunkTokens, kChunkTokens, kChunkBytes,
+                [](size_t bytes) { return alloc_kv(nullptr, bytes); }, refd, fresh);
+  if (fresh_n) *fresh_n = fresh.size();
+  return refd;
+}
+
+// Two different videos never share a chunk that holds any of their ids (also with the same system prompt, the same times as
+// text, the same question and the same grid); the same video, plan and prefix share every chunk before the first difference;
+// another plan of the same bytes (fps, frame bound) is another video; and a video at another position shares nothing, as
+// the chain of keys carries the whole prefix.
+static void test_video_ids() {
+  const auto system = make_ids(5, 2 * kChunkTokens + 123);  // a system prompt of two chunks and a bit
+  const int pairs = 60, n = 190;                            // ~11.4K tokens of video: about three chunks
+  const uint64_t A = 0xA11CE, B = 0xB0B, plan = 0x2F85;
+  Store st;
+
+  // ids >= kVocab, and every pair's run is consecutive (the identity the cache relies on for images)
+  auto a1 = video_prompt(system, A, plan, pairs, n, 1);
+  size_t video_ids = 0;
+  for (size_t i = 0; i < a1.size(); i++)
+    if (a1[i] >= kVocabIds) video_ids++;
+  CHECK(video_ids == size_t(pairs) * n);
+  CHECK(a1.size() / kChunkTokens >= 4);
+
+  size_t fresh_a = 0, fresh_b = 0, fresh_a2 = 0, fresh_plan = 0;
+  const auto ca = acquire_all(st, a1, &fresh_a);
+  CHECK(fresh_a == ca.size() && ca.size() == a1.size() / kChunkTokens);  // an empty store: all new
+
+  // (1) the same video, another question: every chunk before the question is the same chunk object
+  const auto a2 = video_prompt(system, A, plan, pairs, n, 2);
+  const auto ca2 = acquire_all(st, a2, &fresh_a2);
+  const size_t before_question = (a1.size() - 300) / kChunkTokens;  // full chunks that end before the question starts
+  CHECK(before_question >= 3);
+  for (size_t c = 0; c < before_question; c++) CHECK(ca2[c] == ca[c]);
+  // the chunk the question starts in differs (the question's ids are in it), unless the question starts on a boundary
+  if ((a1.size() - 300) % kChunkTokens) CHECK(ca2[before_question] != ca[before_question]);
+  CHECK(fresh_a2 == ca2.size() - before_question);
+  // (2) identical prompt: all chunks hit
+  size_t fresh_same = 0;
+  const auto ca3 = acquire_all(st, a1, &fresh_same);
+  CHECK(fresh_same == 0 && ca3 == ca);
+
+  // (3) another video, the same everything else: the system prompt's chunks are shared, none that holds a video id
+  const auto b1 = video_prompt(system, B, plan, pairs, n, 1);
+  const auto cb = acquire_all(st, b1, &fresh_b);
+  const size_t text_chunks = system.size() / kChunkTokens;  // chunks of the system prompt alone: 2
+  CHECK(text_chunks == 2);
+  for (size_t c = 0; c < text_chunks; c++) CHECK(cb[c] == ca[c]);
+  for (size_t c = text_chunks; c < cb.size(); c++) {
+    for (Ch* x : ca) CHECK(cb[c] != x);                      // never the same chunk
+    bool has_video_id = false;
+    for (int32_t t : cb[c]->ids) has_video_id = has_video_id || t >= kVocabIds;
+    CHECK(has_video_id || c * kChunkTokens < system.size()); // (a chunk past the system prompt holds the video)
+  }
+  CHECK(fresh_b == cb.size() - text_chunks);
+  // chunks of different videos hold different ids (a hit is verified against them: no wrong KV on a key collision either)
+  for (size_t c = text_chunks; c < std::min(ca.size(), cb.size()); c++) CHECK(ca[c]->ids != cb[c]->ids);
+
+  // (4) the same bytes with another plan (fps, frame bound or size): other ids, nothing shared past the text
+  const auto p1 = video_prompt(system, A, 0x2F86, pairs, n, 1);
+  const auto cp = acquire_all(st, p1, &fresh_plan);
+  for (size_t c = 0; c < text_chunks; c++) CHECK(cp[c] == ca[c]);
+  for (size_t c = text_chunks; c < cp.size(); c++)
+    for (Ch* x : ca) CHECK(cp[c] != x);
+
+  // (5) the same video after a longer text prefix: shifted by 1000 tokens, so its chunks hold other tokens and have another
+  // parent: no sharing (the cache matches a prefix, not a part)
+  auto system2 = system;
+  const auto extra = make_ids(6, 1000);
+  system2.insert(system2.end(), extra.begin(), extra.end());
+  const auto s1 = video_prompt(system2, A, plan, pairs, n, 1);
+  size_t fresh_shift = 0;
+  const auto cs = acquire_all(st, s1, &fresh_shift);
+  for (size_t c = 0; c < text_chunks; c++) CHECK(cs[c] == ca[c]);
+  for (size_t c = text_chunks; c < cs.size(); c++)
+    for (Ch* x : ca) CHECK(cs[c] != x);
+
+  // (6) the same video where the text before it differs inside chunk 0: nothing at all is shared (the chain)
+  auto system3 = system;
+  system3[17] ^= 1;
+  const auto d1 = video_prompt(system3, A, plan, pairs, n, 1);
+  size_t fresh_d = 0;
+  const auto cd = acquire_all(st, d1, &fresh_d);
+  CHECK(fresh_d == cd.size());
+  for (Ch* x : cd)
+    for (Ch* y : ca) CHECK(x != y);
+
+  // (7) two videos and an image-like run in one prompt: the second video's chunks follow the first's identity
+  auto two = video_prompt(system, A, plan, 20, 190, 1);
+  append_video(two, B, plan, 40, 190);
+  auto two_swapped = video_prompt(system, B, plan, 20, 190, 1);
+  append_video(two_swapped, A, plan, 40, 190);
+  size_t f1 = 0, f2 = 0;
+  const auto c2 = acquire_all(st, two, &f1);
+  const auto c2s = acquire_all(st, two_swapped, &f2);
+  for (size_t c = text_chunks; c < std::min(c2.size(), c2s.size()); c++) CHECK(c2[c] != c2s[c]);
+}
+
 int main() {
   test_keys();
+  test_video_ids();
   test_collision();
   test_refcounts_accounting();
   test_ragged();

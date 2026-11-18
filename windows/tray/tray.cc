@@ -1004,12 +1004,12 @@ struct Row {
 enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
 enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
 
-constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 24;
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12, ROW_TIER_LAST = 24, ROW_MEDIA_LAST = 27;
 
 struct SettingsWindow {
     HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
     HWND browse = nullptr, fix_links = nullptr, keep_text = nullptr, keep_button = nullptr, message = nullptr, apply = nullptr, close = nullptr, open_ini = nullptr;
-    HWND groups[4] = {};
+    HWND groups[5] = {};
     HFONT font = nullptr;
     std::vector<Row> rows;
     Json engine;                // the last GET /admin/engine
@@ -1062,6 +1062,12 @@ std::vector<Row> make_rows() {
         {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
         {L"Fair agents (evict from the biggest)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
         {L"SSD folder", L"SPILL_DIR", "spill_dir", K::edit, T::engine, nullptr},
+        // Images and videos (docs/configuration.md, "Long videos"): numbers or empty (the default; the numbers are
+        // frontend/launch.py MEDIA_DEFAULTS: 131,072 and 2,048, IMAGE_TOKENS following the first). IMAGE_TOKENS is read by the engine, VIDEO_MAX_* by the server's video
+        // processor, from the engine's settings: all reload the engine.
+        {L"Media tokens per request", L"IMAGE_TOKENS", "image_tokens", K::edit, T::engine, L"Empty: follows video tokens"},
+        {L"Video tokens at most", L"VIDEO_MAX_TOKENS", "video_max_tokens", K::edit, T::engine, L"Empty: 131,072 (default)"},
+        {L"Video frames at most", L"VIDEO_MAX_FRAMES", "video_max_frames", K::edit, T::engine, L"Empty: 2,048 (default)"},
     };
 }
 
@@ -1085,7 +1091,27 @@ bool tier_number_row(const Row& row) {
 bool tier_flag_row(const Row& row) {
     return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote") || !strcmp(row.key, "spill_fair_agents"));
 }
-bool tier_row(const Row& row) { return tier_number_row(row) || tier_flag_row(row) || (row.key && !strcmp(row.key, "spill_dir")); }
+// The rows of the images and videos: a whole number within the setting's range, or empty (the default).
+bool media_row(const Row& row) {
+    return row.key && (!strcmp(row.key, "image_tokens") || !strcmp(row.key, "video_max_tokens") || !strcmp(row.key, "video_max_frames"));
+}
+// The rows that are free to edit once the server's settings are known and have no plan choices.
+bool tier_row(const Row& row) { return tier_number_row(row) || tier_flag_row(row) || media_row(row) || (row.key && !strcmp(row.key, "spill_dir")); }
+
+// A media number as text ("0100" is "100"; anything that is not digits stays as typed, "" is the default).
+std::wstring media_number_text(const std::wstring& text) {
+    if (text.empty() || text.size() > 7 || !std::all_of(text.begin(), text.end(), iswdigit)) return text;
+    return std::to_wstring(_wtoi(text.c_str()));
+}
+// Whether the text is a good value of a media row (launch.py MEDIA_SETTINGS: IMAGE_TOKENS and VIDEO_MAX_TOKENS 1 to
+// 262,144, VIDEO_MAX_FRAMES 2 to 16,384).
+bool media_text_ok(const Row& row, const std::wstring& text) {
+    if (text.empty()) return true;
+    std::wstring number = media_number_text(text);
+    if (number.size() > 7 || !std::all_of(number.begin(), number.end(), iswdigit)) return false;
+    int value = _wtoi(number.c_str()), least = !strcmp(row.key, "video_max_frames") ? 2 : 1, most = !strcmp(row.key, "video_max_frames") ? 16384 : 262144;
+    return value >= least && value <= most;
+}
 
 // A number of the tiered cache as text: finite and 0 or more ("" if it is not).
 std::wstring tier_number_text(const std::wstring& text) {
@@ -1198,6 +1224,7 @@ bool values_differ(const Row& row, const std::wstring& value, const std::wstring
         std::wstring a = tier_number_text(value), b = tier_number_text(other);
         if (!a.empty() && !b.empty()) return a != b;
     }
+    if (media_row(row)) return media_number_text(value) != media_number_text(other);
     return value != other;
 }
 
@@ -1262,6 +1289,8 @@ std::wstring check_values() {
     if (!is_number(value_of(*row_of(L"MIN_KV_TOKENS")))) return L"Smallest KV pool: a number of tokens, 0 or more.";
     for (const auto& row : settings.rows) {
         if (tier_number_row(row) && row.known && tier_number_text(value_of(row)).empty()) return std::wstring(row.label) + L": a number, 0 or more.";
+        if (media_row(row) && row.known && !media_text_ok(row, value_of(row)))
+            return std::wstring(row.label) + (!strcmp(row.key, "video_max_frames") ? L": empty, or a number from 2 to 16,384." : L": empty, or a number from 1 to 262,144.");
         if (row.key && !strcmp(row.key, "spill_dir") && row.known && value_of(row).find_first_of(L"\"") != std::wstring::npos)
             return L"SSD folder: a path without quotes (empty: RAM only).";
     }
@@ -1374,6 +1403,7 @@ void load_rows() {
             row.initial = number;
         }
         if (row.known && tier_number_row(row) && !tier_number_text(row.initial).empty()) row.initial = tier_number_text(row.initial);  // (24.0 and 24)
+        if (row.known && media_row(row)) row.initial = media_number_text(row.initial);  // (0100 and 100)
         if (row.known && tier_flag_row(row)) row.initial = _wtoi(row.initial.c_str()) != 0 ? L"1" : L"0";  // (the engine: atoi(value) != 0)
     }
 }
@@ -1589,6 +1619,9 @@ std::string settings_json() {
             std::wstring number = tier_number_text(value);
             if (number.empty()) continue;  // (not a number yet: the server keeps its own, and Apply says what is wrong)
             text = narrow(number);
+        } else if (media_row(row)) {
+            if (!media_text_ok(row, value)) continue;  // (Apply says what is wrong)
+            text = value.empty() ? "null" : narrow(media_number_text(value));  // (empty: the default)
         } else if (tier_flag_row(row)) text = value == L"1" ? "true" : "false";
         else text = json_quote(value);
         out += (out.empty() ? "\"" : ",\"") + std::string(row.key) + "\":" + text;
@@ -1902,6 +1935,12 @@ void layout_settings() {
     y += 20;
     place_rows(ROW_LOAD_LAST + 1, ROW_TIER_LAST, TIER_LEFT, TIER_WIDTH);
     group(3, top, TIER_LEFT, TIER_WIDTH);
+    // Under it, the images and videos: the right column ends at 38 + 20 + 12 x 28 + 16 + 20 + 3 x 28 + 16 = 530 DIP, above
+    // the left one's 648, so the window stays 768 DIP tall.
+    top = y;
+    y += 20;
+    place_rows(ROW_TIER_LAST + 1, ROW_MEDIA_LAST, TIER_LEFT, TIER_WIDTH);
+    group(4, top, TIER_LEFT, TIER_WIDTH);
     y = std::max(y, left_bottom);
 
     // Under both columns.
@@ -1932,6 +1971,7 @@ void create_settings_controls(HWND window) {
     settings.groups[0] = child(L"BUTTON", L"Engine: what it loads", BS_GROUPBOX);
     settings.groups[1] = child(L"BUTTON", L"When it holds the VRAM", BS_GROUPBOX);
     settings.groups[3] = child(L"BUTTON", L"Tiered cache (RAM and SSD): changing these reloads the engine", BS_GROUPBOX);
+    settings.groups[4] = child(L"BUTTON", L"Images and videos: changing these reloads the engine", BS_GROUPBOX);
     settings.rows = make_rows();
     int id = IDC_ROW;
     for (auto& row : settings.rows) {

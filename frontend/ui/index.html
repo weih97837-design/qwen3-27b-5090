@@ -580,7 +580,8 @@ function drawSessions() {
       ["age", fmtS(s.age)],
       ["cache hit", s.prompt ? fmtPct(Math.min(s.cached, s.prompt) / s.prompt) : "–"],
       ["max new", fmtTok(s.max_new)],
-      ...(s.images ? [["image tokens", fmtTok(s.images)]] : []),
+      ...(s.media ? [["media", fmtMedia(s.media)]] : s.images ? [["image tokens", fmtTok(s.images)]] : []),
+      ...(s.wait ? [["waits for", s.wait === "kv" ? "KV room" : s.wait === "speed" ? "speed limit" : s.wait]] : []),
       ...(s.preempted ? [["preempted", s.preempted + "×"]] : []),
     ];
     return el("div", { class: "seq" },
@@ -599,6 +600,11 @@ function drawSessions() {
 
 // ---------------------------------------------------------------- log
 const LEVEL = { info: "--good", warn: "--warning", error: "--critical" };
+// Images, videos and their tokens of a request (stats.media_of): "2 img · 1 vid · 12.3K tok", "" without any.
+function fmtMedia(m) {
+  if (!m || !(m.images || m.videos)) return "";
+  return [m.images ? `${m.images} img` : null, m.videos ? `${m.videos} vid` : null, `${fmtTok(m.tokens)} tok`].filter(Boolean).join(" · ");
+}
 function logRow(e) {
   const r = e.rec, m = e.meta || r?.meta || {};
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
@@ -613,8 +619,9 @@ function logRow(e) {
     el("td", { class: "r" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
     el("td", { class: "r" }, r.accept ? r.accept.toFixed(2) : "–"),
     el("td", { class: "r" }, fmtS(r.total)),
+    el("td", { class: "r", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
     el("td", { class: "prev" }, m.preview || ""),
-  ] : [el("td", { colspan: 9, class: "prev", style: "max-width:none" }, e.text)];
+  ] : [el("td", { colspan: 10, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
     el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
   tr.title = "click for details";
@@ -623,7 +630,7 @@ function logRow(e) {
   if (state.open.has(e.n)) {
     tr.className += " sel";
     const detail = { ...e }; delete detail.n;
-    out.push(el("tr", { class: "sel" }, el("td", { colspan: 14 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
+    out.push(el("tr", { class: "sel" }, el("td", { colspan: 15 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
   }
   return out;
 }
@@ -633,8 +640,8 @@ function drawLog() {
   const tb = $("log"); tb.replaceChildren();
   tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"), el("th", {}, "Agent"),
     el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r" }, "TTFT"),
-    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", {}, "Last user message")));
-  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 14, class: "empty" }, "Nothing yet.")));
+    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", { class: "r" }, "Media"), el("th", {}, "Last user message")));
+  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 15, class: "empty" }, "Nothing yet.")));
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
   const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);
@@ -772,7 +779,7 @@ function drawTiers() {
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
   "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
-  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS"];
+  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
   const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
@@ -825,6 +832,8 @@ function drawHeader() {
     const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
     b.append([st.weights, `KV ${st.kv_dtype}`, ({ dspine: "DSpine", dflash2: "DFlash2" })[st.spec] || "no spec", `vision ${st.vision}`,
       `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM reserve ${fmtVal("vram_reserve_gib", st.vram_reserve_gib)}`,
+      ...(st.video_max_tokens != null || st.video_max_frames != null || st.image_tokens != null
+        ? [`media ${fmtVal("image_tokens", st.image_tokens)} / video ${fmtVal("video_max_tokens", st.video_max_tokens)} tok, ${fmtVal("video_max_frames", st.video_max_frames)} frames`] : []),
       ...(st.spill_ram_gib != null ? [st.spill_ram_gib ? `tier RAM ${st.spill_ram_gib} GiB` : "no tiered cache"] : [])].join(" · "));
     if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
   }
@@ -890,7 +899,18 @@ const TIER_OPTS = [
   { key: "spill_fair_agents", label: "Fair agents", note: "SPILL_FAIR_AGENTS", help: "When RAM or the SSD is full, evict from the agent using the most of it (then superseded, never-reused, oldest first). Off: that order over everything.", kind: "flag" },
   { key: "spill_dir", label: "SSD folder", note: "SPILL_DIR", help: "Where spilled checkpoints are written. Empty: RAM only.", kind: "path" },
 ];
-const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
+// Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's
+// (a pinned host table, so the plan changes); VIDEO_MAX_* are the server's. The defaults are launch.MEDIA_DEFAULTS.
+const MEDIA_OPTS = [
+  { key: "image_tokens", label: "Media tokens", note: "IMAGE_TOKENS", max: 262144, unit: "tokens",
+    help: "Image and video tokens of one request, at most; more gets HTTP 400. Pinned host RAM: 10 KiB per token, taken when the engine starts. Empty: the video tokens below, or 16,384 when that is less (131,072 by default: 1.25 GiB)." },
+  { key: "video_max_tokens", label: "Video tokens", note: "VIDEO_MAX_TOKENS", max: 262144, unit: "tokens",
+    help: "Tokens of one video at most (all its frames together, its pairs' time stamps aside); longer videos get smaller frames. While a video is encoded its resized frames take 6 KiB of host RAM per token. Empty: 131,072 (the checkpoint's own is 12,288)." },
+  { key: "video_max_frames", label: "Video frames", note: "VIDEO_MAX_FRAMES", max: 16384, unit: "frames",
+    help: "Frames sampled from a video at most (2 per second until then), and the most a request's num_frames may ask for. Empty: 2,048 (the checkpoint's own is 768)." },
+];
+const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -924,6 +944,26 @@ function replan() {
 }
 function setForm(k, v) { L.form = { ...L.form, [k]: v }; replan(); }
 function setTier(k, v) { L.form = { ...L.form, [k]: v }; drawLaunch(); }  // (no plan depends on these)
+function mediaRow(o) {
+  const row = el("div", { class: "choices" }), v = L.form[o.key];
+  if (v === undefined) return null;  // (a server without them)
+  const inp = el("input", { type: "number", min: "1", max: String(o.max), step: "1", placeholder: "default", "aria-label": o.label + " in " + o.unit });
+  if (v != null) inp.value = v;
+  inp.addEventListener("change", () => {
+    const t = inp.value.trim(), x = Number(t);
+    if (t === "") setForm(o.key, null);
+    else if (Number.isInteger(x) && x >= 1 && x <= o.max) setForm(o.key, x);
+    else drawLaunch();
+  });
+  row.append(el("label", { class: "opt", style: "cursor:default" }, inp, el("span", { class: "n" }, o.unit)));
+  const eff = o.key === "image_tokens" ? (v ?? mediaDefault(o.key)) : null;
+  if (eff) row.append(el("span", { class: "muted", style: "font-size:11px;align-self:center" },
+    `${eff.toLocaleString()} tokens = ${fmtGiB(eff * 10240)} pinned host RAM`));
+  else if (o.key === "video_max_tokens" && v) row.append(el("span", { class: "muted", style: "font-size:11px;align-self:center" },
+    `${fmtGiB(v * 6144)} host RAM while a video is encoded` + (L.form.image_tokens != null && L.form.image_tokens < v ? " · below the media tokens: a longer video gets HTTP 400" : "")));
+  row.append(el("div", { class: "muted", style: "flex-basis:100%;font-size:11px" }, o.help));
+  return row;
+}
 function tierRow(o) {
   const row = el("div", { class: "choices" }), v = L.form[o.key];
   if (v === undefined) return null;  // (a server without them)
@@ -1017,6 +1057,15 @@ function drawLaunch() {
     box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
   }
   box.append(el("div", { class: "k" }, "Unload when idle", el("small", {}, "applies at once")), idleRow());
+  if (MEDIA_OPTS.some((o) => L.form[o.key] !== undefined)) {
+    box.append(el("div", { class: "k", style: "grid-column:1/-1;margin-top:10px" }, "影片與圖片 Images and video",
+      el("small", {}, "How many tokens images and videos may take (docs/configuration.md, Long videos). Empty is the default. These apply when the engine restarts.")));
+    for (const o of MEDIA_OPTS) {
+      const row = mediaRow(o);
+      if (row) box.append(el("div", { class: "k" }, o.label, el("small", {}, o.note)), row);
+    }
+    if (L.form.vision === "off") box.append(el("div", { class: "muted", style: "grid-column:1/-1" }, "Vision tower off: images and videos are refused; these settings are not used."));
+  }
   if (TIER_OPTS.some((o) => L.form[o.key] !== undefined)) {
     box.append(el("div", { class: "k", style: "grid-column:1/-1;margin-top:10px" }, "分層快取 Tiered cache",
       el("small", {}, "Checkpoints the KV pool gives up go to RAM, then to SSD. These apply when the engine restarts.")));
