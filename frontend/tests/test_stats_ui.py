@@ -42,7 +42,7 @@ def test_slot_rows_pads_with_idle_and_truncates_to_lanes():
     assert out[0]["state"] == "admitted" and out[0]["rid"] == "x"
     for r in out[1:]:
         assert r == {"lane": r["lane"], "state": "idle", "open": True, "rid": None, "phase": None, "prompt": 0,
-                     "cached": 0, "out": 0, "tok_s": None, "age": 0.0}
+                     "cached": 0, "out": 0, "tok_s": None, "age": 0.0, "active": False}
     assert [r["lane"] for r in out] == [1, 2, 3, 4]
     assert len(stats.slot_rows([("admitted", None, row(str(i))) for i in range(5)], 3)) == 3
 
@@ -457,6 +457,50 @@ def test_the_log_record_has_the_media_in_its_meta():
 
 def test_the_log_table_has_a_media_column():
     html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
-    assert 'el("th", { class: "r" }, "Media")' in html and "fmtMedia(m.media)" in html
+    assert 'el("th", { class: "r lo" }, "Media")' in html and "fmtMedia(m.media)" in html
     # the event rows span the table: 15 columns (Time, Result, Request, Endpoint, Agent, eight figures, Media, Last user message)
     assert html.count('colspan: 15') == 2 and 'colspan: 10, class: "prev"' in html
+
+
+# ------------------------------------------------------------ active (stepping now) flag
+
+def test_stats_active_flag_for_batched_parked_sequences():
+    now = time.time()
+    a = seq("a", now, out=5, first_token=now - 2.0)                          # resident (cur)
+    b = seq("b", now, out=3, first_token=now - 2.0, area=1)                  # parked, DECODE, last ran 5 s ago (waiting its turn)
+    c = seq("c", now, area=2, phase="prefill")                               # parked PREFILL, stale last_run
+    d = seq("d", now, phase="prefill")                                       # admitted PREFILL, never ran (last_run 0.0)
+    e = seq("e", now, phase="prefill", area=3)                               # parked PREFILL that ran a chunk just now
+    b.last_run = now - 5.0
+    c.last_run = now - 30.0
+    e.last_run = now - 0.2
+    sched = make_sched(StubEngine(), FakeTiers(None), [a, b, c, d, e], [seq("w", now, started=False)], cur=a, engine_seqs=5)
+    snap = sched.stats()
+    act = {r["rid"]: r["active"] for r in snap["seqs"]}
+    assert act == {"a": True, "b": True, "c": False, "d": False, "e": True, "w": False}
+    assert {(r["rid"], r["state"], r["active"]) for r in snap["slots"] if r["rid"]} == {
+        ("a", "running", True), ("b", "parked", True), ("c", "parked", False), ("e", "parked", True), ("d", "admitted", False)}
+    assert [r["lane"] for r in snap["slots"] if r["rid"] in ("b", "c")] == [2, 3]  # lanes unchanged: area + 1
+    assert all(r["active"] is False for r in snap["slots"] if r["rid"] is None)
+
+
+def test_stats_active_window_boundary_for_prefill():
+    now = time.time()
+    a = seq("a", now)
+    b = seq("b", now, area=0, phase="prefill")
+    sched = make_sched(StubEngine(), FakeTiers(None), [a, b], [], cur=a)
+    b.last_run = time.time() - worker.ACTIVE_WINDOW_S + 0.3   # just inside the window
+    assert {r["rid"]: r["active"] for r in sched.stats()["seqs"]}["b"] is True
+    b.last_run = time.time() - worker.ACTIVE_WINDOW_S - 0.3   # just outside
+    assert {r["rid"]: r["active"] for r in sched.stats()["seqs"]}["b"] is False
+
+
+def test_slot_rows_pass_active_and_keep_lanes():
+    memory = {}
+    rows = [("running", None, dict(row("a", out=2, decode_wall=1.0), active=True)),
+            ("parked", 1, dict(row("b"), active=True)), ("admitted", None, row("c"))]
+    out = stats.slot_rows(rows, 4, last_lanes=memory)
+    assert [(r["lane"], r["rid"], r["active"]) for r in out] == [(1, "a", True), (2, "b", True), (3, "c", False), (4, None, False)]
+    rows2 = [("parked", 1, dict(row("b"), active=False)), ("running", None, dict(row("a", out=2, decode_wall=1.0), active=True))]
+    out2 = stats.slot_rows(rows2, 4, last_lanes=memory)
+    assert [(r["lane"], r["rid"], r["active"]) for r in out2 if r["rid"]] == [(1, "a", True), (2, "b", False)]

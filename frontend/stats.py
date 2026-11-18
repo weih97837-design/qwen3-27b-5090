@@ -182,7 +182,10 @@ def slot_rows(seqs, n, target=None, last_lanes=None):
     Lanes stay put between snapshots: a parked request keeps its lane, area + 1 (parking areas are 0 .. n - 2); a
     request that is not parked takes the lane it had in last_lanes (rid -> lane, 1-based) if that lane is free, and
     the rest take the free lanes in admission order. last_lanes, when given, is replaced with this snapshot's mapping,
-    so the rids that finished drop out of it."""
+    so the rids that finished drop out of it.
+
+    Each row may carry "active" (worker.Scheduler.stats: the request is being worked on: resident, decoding, or prefilling
+    a chunk lately); it is passed into the lane dict as "active" (False for idle / closed lanes) and does not affect placement."""
     target = n if target is None else target
     lanes = [None] * (n + 1)  # 1-based; lanes[0] unused
     rest = []
@@ -210,14 +213,14 @@ def slot_rows(seqs, n, target=None, last_lanes=None):
         held = lanes[i]
         if held is None:
             out.append({"lane": i, "state": "idle" if is_open else "closed", "open": is_open, "rid": None,
-                        "phase": None, "prompt": 0, "cached": 0, "out": 0, "tok_s": None, "age": 0.0})
+                        "phase": None, "prompt": 0, "cached": 0, "out": 0, "tok_s": None, "age": 0.0, "active": False})
             continue
         state, row = held
         decode_wall, out_n = row.get("decode_wall") or 0.0, row["out"]
         out.append({"lane": i, "state": state, "open": is_open, "rid": row["rid"], "phase": row["phase"],
                     "prompt": row["prompt"], "cached": row["cached"], "out": out_n,
                     "tok_s": (out_n - 1) / decode_wall if out_n > 1 and decode_wall > 0 else None,
-                    "age": row["age"]})
+                    "age": row["age"], "active": bool(row.get("active"))})
     return out
 
 
