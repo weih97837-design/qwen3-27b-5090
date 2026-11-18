@@ -158,9 +158,10 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .warnbox { border: 1px solid var(--warning); border-left-width: 4px; border-radius: 6px; padding: 6px 10px;
   color: var(--ink); background: var(--wash); font-size: 12px; overflow-wrap: anywhere; margin-top: 10px; }
 .warnbox b { font-weight: 600; }
-.slot { min-height: 232px; }
-.slot .speed { min-height: 30px; }
-.slot .speed small { margin-left: 0; display: block; font-size: 12px; font-weight: 400; min-height: 16px; }
+.slot { min-height: 232px; grid-template-columns: minmax(0, 1fr); min-width: 0; overflow: hidden; }
+.slot > * { min-width: 0; }
+.slot .speed { min-height: 30px; white-space: normal; }
+.slot .speed small { margin-left: 0; display: block; font-size: 12px; font-weight: 400; min-height: 16px; white-space: normal; overflow-wrap: anywhere; }
 .opts > .k small { white-space: normal; }
 .kvt td.r { white-space: normal; overflow-wrap: anywhere; }
 .kvt td.mono { overflow-wrap: anywhere; }
@@ -169,7 +170,8 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 @media (max-width: 700px) {
   .slots { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .slots > .empty { grid-column: 1 / -1; }
-  .slot { min-height: 0; }
+  .slot { min-height: 0; padding: 12px; }
+  .slot .speed small { min-height: 32px; }
   .opts { grid-template-columns: minmax(0, 1fr); }
   .opts > .k { white-space: normal; }
   .opts [style*="font-size:11px"], .opts [style*="font-size: 11px"], .opts > .k small, .opt .n, .opt .muted, .log pre { font-size: 12px !important; }
