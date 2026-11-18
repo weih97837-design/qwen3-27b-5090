@@ -60,8 +60,9 @@ checks the spill counters to show that the intended path was taken.
                       prefix and the video bench/vision/colors.mp4 sampled to ~9,000 tokens (num_frames: the frames are looped, so the
                       prompt has two or more 4096-token chunks of video ids) and a question, ~12K tokens in all (the engine's own
                       media path: server.Images.prepare, videoproc, mm_encode_frames, as worker.py runs it). A asks question 1; B the
-                      same video with question 2: B must resume at the checkpoint that A's prefill saved before the last pair of
-                      the video (the prefix cache hit; the pair after it is decoded and encoded again). C's prefill then evicts
+                      same video with question 2: B must resume at the checkpoint that A's prefill saved at the last multiple of 4096
+                      tokens before the question (the server's CHECKPOINT_INTERVAL; it lies inside the video: the prefix cache hit,
+                      and the pairs after it are decoded and encoded again). C's prefill then evicts
                       both to RAM; A's follow-up is restored from RAM (the whole video lies in the cached prefix: nothing is decoded
                       or encoded), the RAM entries are written to SPILL_DIR and B's follow-up is restored from the file. Every output
                       must equal the uncached reference (the reference decodes and encodes the video again each time). Runs with the
@@ -890,7 +891,7 @@ def scen_j(R, spill_dir):
 
 def l_prompts(R):
     """Scenario l's prompts: a text prefix, the video, a question. (ids A, ids B, media A, media B, at): the text prefix is sized so that
-    each prompt has R.L tokens, `at` is the multiple of 64 tokens before the last pair of the video (the checkpoint A's prefill saves)."""
+    each prompt has R.L tokens, `at` is the checkpoint the server's CHECKPOINT_INTERVAL (4096) saves inside A's prefill, the last multiple of 4096 before the question."""
     import base64
 
     sys.path.insert(0, str(ROOT / "frontend"))
@@ -926,7 +927,10 @@ def l_prompts(R):
     ids_a, spans, srcs, videos_a = prepare(prefix, qa, frames)
     ids_b, spans_b, srcs_b, videos_b = prepare(prefix, qb, frames)
     assert spans == spans_b and ids_a[:len(ids_a) - n] == ids_b[:len(ids_b) - n] and len(ids_a) == len(ids_b) == R.L
-    at = (spans[-1][0] - 16) // 64 * 64  # (inside the text before the last pair: that pair is encoded again by B)
+    # Where the server's CHECKPOINT_INTERVAL (4096) puts a checkpoint of A's prefill: the last multiple of 4096 before the
+    # question, where B diverges. It lies inside the video, so B decodes and encodes the pairs from there on again.
+    at = (len(ids_a) - n) // 4096 * 4096
+    assert spans[0][0] < at < spans[-1][0], (spans[0][0], at, spans[-1][0])
     return ids_a, ids_b, (spans, srcs, videos_a), (spans_b, srcs_b, videos_b), at
 
 

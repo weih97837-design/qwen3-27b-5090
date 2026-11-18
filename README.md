@@ -221,12 +221,14 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
   (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`; up to 256 MB): MP4 / MOV or Matroska / WebM
   with H.264, HEVC, AV1 or VP9 (4:2:0; H.264 and HEVC also 4:2:2, HEVC 4:4:4; 8 or 10 bits), decoded on the GPU's
   video decoder (NVDEC); a phone video's rotation is applied. A video is sampled
-  at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
-  with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
+  at 2 frames per second (4 to 2,048 frames) and costs at most 131,072 tokens in this fork (the checkpoint's own
+  bounds are 768 frames and 12,288 tokens, which only videos longer than about 2.8 minutes reach) with qwen-vl-utils'
+  per-frame cap; the model sees each second's pair of frames with its time
   ([Images and videos](docs/architecture.md#11-vision-tower)). A request can sample otherwise with vLLM's
   `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`, and `"size": {"longest_edge": N}`,
-  the pixels of all frames together: 2,048 per token). For long videos the server can take more:
-  `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` ([Long videos](docs/configuration.md#long-videos)).
+  the pixels of all frames together: 2,048 per token). The bounds are `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES`
+  (start settings; [Long videos](docs/configuration.md#long-videos); zh-TW: [影片輸入](docs/tiered-cache.md#影片輸入),
+  [agent client guide](docs/agent-client-guide.md)).
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
   turn markers. `/v1/completions` takes them as tokens.
 
