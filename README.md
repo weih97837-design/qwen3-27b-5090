@@ -169,8 +169,8 @@ first in either case.
   `docker image prune` deletes such images, including those of other projects, and asks first.
 
 The [Windows package](#windows-native) has no image. `update.cmd` downloads the latest release of the repository it
-names (`-Repo`, default this fork), quits the tray app and replaces the program. This fork has no Windows release yet,
-so it stops with a message until one is published (build the package with `scripts/windows/package.ps1`). The
+names (`-Repo`, default this fork), quits the tray app and replaces the program. Windows packages are published on the
+[Releases page](https://github.com/weih97837-design/qwen3-27b-5090/releases) (to build one yourself, use `scripts/windows/package.ps1`). The
 settings and the weights stay ([docs/configuration.md](docs/configuration.md#updating), also by hand).
 
 ### Windows (native)

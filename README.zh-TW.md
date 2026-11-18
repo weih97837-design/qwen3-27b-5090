@@ -24,14 +24,14 @@
 | 多機器計數 | 多台電腦共用一台伺服器時，請求可帶 `X-Client-Id`（或伺服器設定 `CLIENT_NAMES` 對照 IP），監控頁看得到誰在用。**只計數，不限制**，排隊方式不變 |
 | Agent 識別 | 請求可帶 `X-Agent-Id`，監控頁與快取淘汰以此分辨不同的代理 |
 | 影片輸入整合 | 影片設定可調（預設一支影片最多 131,072 token、2,048 張畫面）；影片結尾存檔點，同一支影片換問題時不重算影片 |
-| 繁體中文監控頁 | `/ui`，有針對窄螢幕的版面（手機排版；本文撰寫時未在手機上實測） |
+| 繁體中文監控頁 | `/ui`，有針對窄螢幕的版面（手機排版） |
 | 不同的預設值 | 同時 8 個 slot（`MAX_SEQS=8`）、KV 池自動取最大（`KV_POOL_TOKENS=0`）、VRAM 預留 1 GiB（`VRAM_RESERVE_GIB=1.0`）、RAM 層 64 GiB（上限）、SSD 層上限預設 100 GiB |
 | Windows 原生程式包 | 不需要 WSL 或 Docker；`start.cmd`、托盤程式與 `update.cmd` 更新 |
 | 托盤程式設定視窗 | 在 Windows 托盤選單的 **Settings...** 改設定，不必手動編輯檔案 |
 
-**版本命名：** 這個 fork 的版本是「上游版本.修訂-cache-tier」。例如 `v0.5.0.1-cache-tier` 是以上游 `v0.5.0` 為基礎。
+**版本命名：** 這個 fork 的版本是「上游版本.修訂-cache-tier」。例如 `v0.6.2.1-cache-tier` 是以上游 `v0.6.2` 為基礎的第 1 個修訂。
 
-> 部分 Windows 步驟在文件中標示為「未驗證」（撰寫環境是 Linux，沒有在 Windows 實機跑過），見 [docs/deploy-windows.md](docs/deploy-windows.md) 開頭與結尾。
+> Windows 程式包的安裝、更新與分層快取測試（`test.cmd`）已在 RTX 5090 的 Windows 電腦上實機跑過；文件裡個別標示「未驗證」的步驟是較早期的寫法，見 [docs/deploy-windows.md](docs/deploy-windows.md)。
 
 ## 需求
 
@@ -47,13 +47,13 @@
 - 權重約 23 GB（預設的 gdnfp4 權重約 19.5 GB，加上草稿模型約 3.5–4.1 GB）。見 [README.md](README.md) 與 [docs/deploy-cli.md](docs/deploy-cli.md)。
 - SSD 快取預設最多再用 100 GiB（`SPILL_SSD_GIB`），並保留 10 GiB 以上的可用空間（`SPILL_SSD_MIN_FREE_GIB`）；資料夾在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`。
 - [docs/deploy-windows.md](docs/deploy-windows.md) 估計 Windows 上約需 150 GB 可用空間（文件自己標示為由預設值推算）。不想佔這麼多，把 `SPILL_SSD_GIB` 調小。
-- Windows 程式包約 28 MB。把它解壓到有寫入權限、路徑只有 ASCII 的資料夾（不要放 `Program Files`）。
+- Windows 程式包約 35 MB（不含權重）。把它解壓到有寫入權限、路徑只有 ASCII 的資料夾（不要放 `Program Files`）。
 
 **RAM**
 
 | 項目 | 數字 |
 | --- | --- |
-| 最低建議 | 16 GB（README 與 docs/deploy-launcher.md） |
+| 最低建議 | 16 GB（要把下面列出的設定調低）；用預設設定，建議 32 GB 以上 |
 | 分層快取的 RAM 層 | 預設 `SPILL_RAM_GIB=64`。這是**上限**，不是必要用量，用多少佔多少 |
 | pinned（鎖定）記憶體，預設值 | `STATE_HOST_CACHE` 8 GiB、`SPILL_PINNED_GIB` 8 GiB、視覺塔 0.86 GiB、圖片影片嵌入表 1.25 GiB（`IMAGE_TOKENS` 131,072 時） |
 | Windows 的 pinned 上限 | pinned 記憶體計入 GPU 共用記憶體，約為 RAM 的一半，上述四項加起來要留在其中。四項預設值相加約 18 GiB（預估，由文件數字相加） |
@@ -70,7 +70,6 @@ RAM 不多的機器（32 GiB 以下）請調低這些設定（設定方法見下
 ## 快速開始（Windows 程式包）
 
 1. 到 [Releases](https://github.com/weih97837-design/qwen3-27b-5090/releases/latest) 下載 `qwen3-27b-5090-<版本>-windows-x64.zip` 與同名的 `.sha256`。
-   （[README.md](README.md) 寫過「這個 fork 還沒有 Windows Release」，但 [docs/deploy-launcher.md](docs/deploy-launcher.md) 寫從 `v0.3.0-cache-tiered` 起已有；以 Releases 頁面實際內容為準。）
 2. 核對 SHA-256（PowerShell），兩行的第一個欄位必須相同：
 
    ```powershell
@@ -213,7 +212,7 @@ curl -s http://127.0.0.1:46320/v1/chat/completions -H 'Content-Type: application
 | [docs/configuration.md](docs/configuration.md) | 所有設定 | 英文 |
 | [docs/benchmarks.md](docs/benchmarks.md) | 效能測量 | 英文 |
 | [docs/architecture.md](docs/architecture.md)、[docs/decisions.md](docs/decisions.md) | 設計與取捨 | 英文 |
-| [docs/releases/](docs/releases/) | 本 fork 的版本說明（目前有 `v0.3.0-cache-tiered`、`v0.3.1-cache-tiered`） | 繁體中文 |
+| [docs/releases/](docs/releases/) | 本 fork 較早版本的說明；新版本的說明看 [Releases 頁面](https://github.com/weih97837-design/qwen3-27b-5090/releases) | 繁體中文 |
 
 ## 測試
 
