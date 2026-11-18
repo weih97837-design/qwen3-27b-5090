@@ -75,6 +75,10 @@ h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
 .stack > div { min-width: 0; height: 100%; cursor: default; }
 .stack > div:hover { filter: brightness(1.12); }
 .stack.thin { height: 12px; }
+.et-rows { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto; gap: 4px 10px; align-items: center; margin-top: 10px; font-size: 13px; }
+.et-rows i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.et-rows .r { text-align: right; }
+.et-rows .zero { color: var(--muted); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; color: var(--ink2); font-size: 12px; }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
@@ -282,6 +286,17 @@ tr.act td { background: var(--wash); }
       <span class="muted" id="slots-sum"></span>
     </div>
     <div class="slots" id="slots"></div>
+  </section>
+
+  <section class="card" id="et-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">引擎時間分配</h2>
+      <span class="muted" id="et-sum"></span>
+    </div>
+    <div class="stack" id="et-bar" role="img" aria-label="引擎時間分配（近 60 秒）"></div>
+    <div class="et-rows" id="et-rows"></div>
+    <div class="sub" id="et-total" style="margin-top:10px"></div>
+    <div class="muted" style="font-size:12px;margin-top:4px">預填與解碼是輪流使用 GPU，不是同時。</div>
   </section>
 
   <section class="card">
@@ -1017,7 +1032,33 @@ function drawClients() {
     el("td", { class: "r g3 o1", "data-l": "錯誤" }, String(c.errors || 0) + (c.cancelled ? ` · 取消 ${c.cancelled}` : "")),
     el("td", { class: "r g6 o1", "data-l": "最後出現" }, fmtAgo(c.last_seen))));
 }
-function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawClients(); drawDeploy(); drawSessions(); }
+// Engine time split (worker EngineClock -> Hub.tick engine_time): shares of the last 60 s and since the engine started.
+const ET_KINDS = [["prefill", "預填（prefill）", "--s1"], ["decode", "解碼（decode）", "--s3"], ["restore", "載回（restore）", "--s2"],
+  ["spill", "寫入（spill）", "--s4"], ["media", "媒體", "--s5"], ["idle", "閒置", "--pending"], ["other", "其他", "--muted"]];
+const etPct = (v) => (v * 100).toFixed(1) + "%";
+function drawEngineTime() {
+  const et = block("engine_time"), sec = $("et-sec");
+  if (!et || typeof et !== "object" || !et.total) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const w = et.recent || et.total, bar = $("et-bar"), rows = $("et-rows");
+  bar.replaceChildren(); rows.replaceChildren();
+  $("et-sum").textContent = et.recent ? `近 ${fmtS(w.wall)}` : "自引擎啟動";
+  for (const [k, name, color] of ET_KINDS) {
+    const share = w.share?.[k] || 0, s = w.seconds?.[k] || 0;
+    if (share > 0.0005) {
+      const d = el("div", { style: `flex:${share} 1 0;background:var(${color})` });
+      hoverable(d, () => ({ title: name, rows: [[css(color), fmtS(s), fmtPct(share)]] }));
+      bar.append(d);
+    }
+    rows.append(el("i", { style: `background:var(${color})` }), el("span", {}, name),
+      el("span", { class: "r num" + (share > 0.0005 ? "" : " zero") }, etPct(share)),
+      el("span", { class: "r num muted" }, fmtS(s)));
+  }
+  const tot = et.total, top = ET_KINDS.map(([k, name]) => [name.replace(/（.*/, ""), tot.share?.[k] || 0]).filter((x) => x[1] >= 0.005);
+  $("et-total").textContent = `累計（${fmtS(tot.wall)}）：` + (top.map(([n, v]) => `${n} ${etPct(v)}`).join(" · ") || "–") +
+    (w.prefill_tokens || w.decode_tokens ? ` · 近期預填 ${fmtTok(w.prefill_tokens || 0)} tok、解碼 ${fmtTok(w.decode_tokens || 0)} tok` : "");
+}
+function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawEngineTime(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawClients(); drawDeploy(); drawSessions(); }
 
 async function engineAction(a) {
   const n = state.tick?.seqs?.length || 0, changes = launchChanges();

@@ -76,6 +76,66 @@ PREFILL_TPS_SMOOTH = 0.2        # weight of a new prefill chunk's speed
 RESTORE_POLL_S = 0.005          # the loop's wait for a message while only restores are pending
 
 
+ENGINE_TIME_KINDS = ("prefill", "decode", "restore", "spill", "media", "idle", "other")
+
+
+class EngineClock:
+    """Where the engine loop's wall-clock time goes (status page 引擎時間分配). Cumulative seconds per kind:
+    prefill / decode (a turn, less what ran inside it), restore (a synchronous tier restore in prefix_begin), spill (the
+    tier policy's tick and the idle backups), media (image / video encode) and idle (waiting for a message or a restore);
+    `other` is the rest of the wall time (admission, polling, sending), so the kinds sum to the time since the start.
+    Not measurable from here: KV page writes and checkpoint saves the engine does inside a prefill or decode call (they
+    stay in prefill / decode). Costs two time reads per turn."""
+
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.sec = dict.fromkeys(ENGINE_TIME_KINDS[:-1], 0.0)
+        self.kind = None      # the turn in progress
+        self.t_turn = 0.0
+        self.inner = 0.0      # seconds of other kinds inside the turn in progress
+
+    def add(self, kind, dt):
+        """dt seconds of `kind` (inside a turn they leave the turn's own share)."""
+        if dt > 0:
+            self.sec[kind] += dt
+            if self.kind is not None:
+                self.inner += dt
+
+    def enter(self, kind):
+        self.kind, self.t_turn, self.inner = kind, time.perf_counter(), 0.0
+
+    def leave(self):
+        if self.kind is not None:
+            self.sec[self.kind] += max(0.0, time.perf_counter() - self.t_turn - self.inner)
+            self.kind = None
+
+    def snapshot(self):
+        """{"wall": s, "seconds": {kind: s}} including the turn in progress (a long single decode turn shows up while it runs)."""
+        now = time.perf_counter()
+        sec = dict(self.sec)
+        if self.kind is not None:
+            sec[self.kind] += max(0.0, now - self.t_turn - self.inner)
+        wall = now - self.t0
+        sec["other"] = max(0.0, wall - sum(sec.values()))
+        return {"wall": wall, "seconds": sec}
+
+
+class NullClock:
+    """The clock of a Scheduler built without __init__ (tests): measures nothing."""
+
+    def add(self, kind, dt):
+        pass
+
+    def enter(self, kind):
+        pass
+
+    def leave(self):
+        pass
+
+    def snapshot(self):
+        return None
+
+
 def step_ms(n):
     """Time of a batched step for n requests (short contexts, gdnfp4 + KV nvfp4, P7-11: 12.40 / 13.76 / 16.39 /
     21.99 ms for 1 / 2 / 4 / 8): scales a measured rate per request to a number of requests not measured yet."""
@@ -234,6 +294,7 @@ def plan_checkpoints(prompt, reusable, im_start, user, breaks, vision_end=None):
 
 
 class Scheduler:
+    clock = NullClock()  # (__init__ makes the real EngineClock)
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
     dec_tok = None  # the plain tokenizer of the divergence log (made with the first divergence)
@@ -309,6 +370,7 @@ class Scheduler:
         # here when it is done.
         self.returns = collections.deque()
         self.m = collections.Counter()
+        self.clock = EngineClock()
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
         self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
@@ -1050,7 +1112,10 @@ class Scheduler:
         while True:
             idle = not self.alive and not self.waiting and not self.restores
             # A backup due now is one copy per iteration, so the poll does not wait (a request is admitted after it).
+            tp = time.perf_counter()
             self.poll(block=idle, wait=0.0 if self.backup_due() else self.backup_wait())
+            if idle:  # (the wait for a message: nothing to run)
+                self.clock.add('idle', time.perf_counter() - tp)
             head = self.head()
             if head is None or self.held_until[0] is not head:
                 self.blocked = None
@@ -1059,16 +1124,22 @@ class Scheduler:
             if job:
                 self.guarded(*job)
             elif self.restores:  # (only restores to wait for: a message wakes this up early)
+                tp = time.perf_counter()
                 self.conn.poll(RESTORE_POLL_S)
+                self.clock.add('idle', time.perf_counter() - tp)
             elif self.backup_due():  # (still idle after the poll: no request arrived)
+                tp = time.perf_counter()
                 self.backup_one()
+                self.clock.add('spill', time.perf_counter() - tp)
             # (stats also once more when the work is done, and after each idle wait)
             self.report(force=not (self.alive or self.waiting))
             if self.tiers is not None:
+                tp = time.perf_counter()
                 try:
                     self.tiers.tick(idle=not self.alive and not self.waiting)
                 except Exception as e:  # noqa: BLE001 - the cache policy must not stop the engine
                     log(f"tiered cache: {e}")
+                self.clock.add('spill', time.perf_counter() - tp)
 
     def report(self, force=False):
         """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
@@ -1111,9 +1182,11 @@ class Scheduler:
         """Runs a turn; KV pool full: preempts another request and retries; engine errors end the request."""
         t0 = time.time()
         self.touch()
+        self.clock.enter("prefill" if kind == "prefill" else "decode")
         try:
             return self._guarded(kind, s)
         finally:
+            self.clock.leave()
             self.touch()
             self.m["q27:engine_busy_seconds_total"] += time.time() - t0
 
@@ -1194,6 +1267,16 @@ class Scheduler:
         if not s.started:
             self.begin(s)
 
+    def restored_count(self):
+        """The engine's count of restored tier entries (None without tiers or an engine that does not report it): a
+        prefix_begin that changes it did a synchronous restore."""
+        if self.tiers is None:
+            return None
+        try:
+            return self.engine.spill_stats()["restored"]
+        except Exception:  # noqa: BLE001 - only the time split depends on it
+            return None
+
     def begin(self, s):
         """prefix_begin: restores the deepest cached prefix (the engine's state is reset first)."""
         self.cur = None  # (prefix_begin drops whatever the engine held)
@@ -1203,9 +1286,13 @@ class Scheduler:
         set_owner = getattr(self.engine, "set_owner", None)
         if set_owner is not None:
             set_owner(agents.owner_id(s.agent))
+        tr = time.perf_counter()
+        restored0 = self.restored_count()
         try:
             cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
         finally:
+            if restored0 is not None and self.restored_count() != restored0:  # (a tier restore ran in it: the loop was blocked)
+                self.clock.add("restore", time.perf_counter() - tr)
             if s.no_sync:
                 self.engine.spill_sync_lookup(True)
         self.release_restored(s)  # (a hit has cleared it; if prefix_begin took another checkpoint, release this one)
@@ -1245,6 +1332,7 @@ class Scheduler:
             spans, srcs, _ = s.images
             self.engine.mm_set(spans)
             t0, encoded, waited = time.time(), 0, 0.0
+            tm = time.perf_counter()
 
             def pixels(key, g=0):
                 """The image's pixels, or the video's frames from its pair g on."""
@@ -1287,6 +1375,7 @@ class Scheduler:
                 self.engine.mm_encode_frames(i, frames[k][:2 * (j - i)], src[3])
                 i, encoded = j, encoded + j - i
             frames.clear()
+            self.clock.add("media", time.perf_counter() - tm)
             self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
                 f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
@@ -1568,6 +1657,9 @@ class Scheduler:
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
         out.update(self.client_metrics())
+        et = self.clock.snapshot()
+        if et:  # (cumulative engine seconds per kind; the server keeps them like any counter)
+            out.update({f'q27:engine_seconds_total{{kind="{k}"}}': v for k, v in et["seconds"].items()})
         if self.tiers is not None:
             sp, ts = self.engine.spill_stats(), self.tiers.status()
             out.update({"q27:tier_ram_bytes": sp["ram_bytes"], "q27:tier_in_ram": sp["in_ram"],
@@ -1633,6 +1725,7 @@ class Scheduler:
                 "agents": agents_block(seqs, self.__dict__.get("agent_totals", {}),
                                        getattr(getattr(self, "tiers", None), "agent_rows", None)),
                 "clients": clients_block(seqs, self.__dict__.get("client_totals", {}), now),
+                "engine_time": self.clock.snapshot(),
                 "hits": {"requests": self.m["q27:requests_total"], "prompt_tokens": self.m["q27:prompt_tokens_total"],
                          "cached_tokens": self.m["q27:cached_tokens_total"],
                          "turn2_requests": self.m["q27:turn2_requests_total"],

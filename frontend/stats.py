@@ -385,6 +385,35 @@ def deploy_info(started, engine_state, environ=None):
             "settings": {k: env.get(k) for k in DEPLOY_SETTINGS}}
 
 
+ENGINE_TIME_WINDOW_S = 60.0   # the recent window of the engine time split (引擎時間分配)
+
+
+def engine_time_block(hist, window=ENGINE_TIME_WINDOW_S):
+    """The engine time split from the worker's cumulative seconds per kind (snapshot["engine_time"]: wall + seconds).
+    hist: (wall, seconds, prefilled, generated) per snapshot, oldest first. Shares are of the engine's own wall time, so
+    they sum to 1: "recent" over the last window seconds (at least the last two snapshots), "total" since the engine
+    started. None before a snapshot carries it (an older engine: the UI hides the card)."""
+    if not hist:
+        return None
+    last = hist[-1]
+    first = hist[0]
+    for h in hist:
+        if last[0] - h[0] <= window:
+            first = h
+            break
+    if first is last and len(hist) > 1:
+        first = hist[-2]
+
+    def part(a, b):
+        wall = b[0] - a[0]
+        sec = {k: max(0.0, b[1][k] - a[1].get(k, 0.0)) for k in b[1]}
+        total = sum(sec.values()) or 1.0
+        return {"wall": wall, "seconds": sec, "share": {k: v / total for k, v in sec.items()},
+                "prefill_tokens": max(0, b[2] - a[2]), "decode_tokens": max(0, b[3] - a[3])}
+    zero = (0.0, {}, 0, 0)
+    return {"window_s": window, "recent": part(first, last) if first is not last else None, "total": part(zero, last)}
+
+
 class Hub:
     def __init__(self):
         self.lock = threading.Condition()
@@ -395,6 +424,7 @@ class Hub:
         self.baseline_used = None           # NVML used bytes before the engine process started
         self.snap = None                    # the last engine snapshot (worker.Scheduler.stats)
         self.snap_prev = None
+        self.engine_hist = collections.deque()  # (wall, seconds, prefilled, generated) of the snapshots in the window
         self.rates = {}                     # rid -> recent decode / prefill tok/s (from successive snapshots)
         self.meta = {}                      # rid -> request_meta
         self.samples = collections.deque(maxlen=int(HISTORY_S / max(SAMPLE_S, 0.1)))
@@ -426,6 +456,7 @@ class Hub:
         with self.lock:
             self.engine_state = "loading"
             self.snap = self.snap_prev = None
+            self.engine_hist.clear()
             self.device = None
             self.ready_t = self.engine_overhead = None
             if self.nvml:
@@ -453,6 +484,7 @@ class Hub:
             self.engine_state = state
             if state == "stopped":
                 self.snap = self.snap_prev = None
+                self.engine_hist.clear()
                 self.rates.clear()
             self.lock.notify_all()
         self.add_log("engine", None, text)
@@ -473,6 +505,13 @@ class Hub:
                 self.device = (d["free_at_start"], d["total"])
                 if self.baseline_used is not None and self.nvml_total:
                     self.context_bytes = max(0, self.nvml_total - self.baseline_used - d["free_at_start"])
+            et = snap.get("engine_time")
+            if et:
+                if self.engine_hist and et["wall"] < self.engine_hist[-1][0]:  # (a new engine: its counters start again)
+                    self.engine_hist.clear()
+                self.engine_hist.append((et["wall"], et["seconds"], snap.get("prefilled", 0), snap.get("generated", 0)))
+                while len(self.engine_hist) > 2 and et["wall"] - self.engine_hist[1][0] > 2 * ENGINE_TIME_WINDOW_S:
+                    self.engine_hist.popleft()
             prev = self.snap
             if prev is not None:
                 dt = snap["t"] - prev["t"]
@@ -665,6 +704,7 @@ class Hub:
                     "slots": slots,
                     "agents": snap.get("agents", []) if snap else [],
                     "clients": snap.get("clients", []) if snap else [],
+                    "engine_time": engine_time_block(list(self.engine_hist)) if snap and snap.get("engine_time") else None,
                     "tiers": snap.get("tiers") if snap else None,
                     "prefix": prefix_block(snap, self.memory),
                     "host": host_info(self.started),
