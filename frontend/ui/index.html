@@ -177,14 +177,58 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
   label.chk { min-height: 32px; }
   th { white-space: normal; }
   th, td { padding: 4px 5px; }
-  td.r, th.r { white-space: normal; }
-  .log td.r, .log th.r, .log td.num { white-space: nowrap; }
+  td.r, th.r { white-space: nowrap; }
   .log th { white-space: nowrap; }
-  td, .mono { overflow-wrap: anywhere; }
   .lo { display: none; }
   .seq .preview { white-space: normal; overflow-wrap: anywhere; }
   .seq .rid { overflow-wrap: anywhere; }
   .tile .value { white-space: normal; overflow-wrap: anywhere; }
+}
+.brk { display: none; }
+.nar { display: none; }
+.slot .kv b { white-space: nowrap; }
+@media (max-width: 600px) {
+  .wid { display: none; }
+  .nar { display: inline; }
+  #deploy-body > .kv > div > span { display: block; }
+  /* Log: one two-line item per request */
+  .log, .log tr, .log td { display: block; }
+  .log tr:first-child { display: none; }
+  .log tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1px 8px; padding: 6px 2px; border-bottom: 1px solid var(--grid); }
+  .log td { border: 0; padding: 0; white-space: nowrap; text-align: left; }
+  .log td.lo { display: none; }
+  .log td.lo.keep { display: block; }
+  .log td:empty { display: none; }
+  .log td.brk { display: block; flex-basis: 100%; height: 0; }
+  .log td.c-agent { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; text-align: right; }
+  .log td.c-cached::before { content: "\2192\00a0"; color: var(--muted); }
+  .log td.c-out::before { content: "out\00a0"; color: var(--muted); }
+  .log td.c-ttft::before { content: "TTFT\00a0"; color: var(--muted); }
+  .log td.c-dec::before { content: "dec\00a0"; color: var(--muted); }
+  .log td.c-total::before { content: "total\00a0"; color: var(--muted); }
+  .log td[colspan] { flex: 1 1 100%; white-space: normal; overflow-wrap: anywhere; max-width: none; }
+  .log td.prev { white-space: normal; overflow: visible; text-overflow: clip; }
+  .log tr.sel td { background: transparent; }
+  .log tr.sel { background: var(--wash); }
+  .log tr:hover td { background: transparent; }
+  /* Agents: name, then a grid of figures */
+  #agents, #agents tr, #agents td { display: block; }
+  #agents tr:first-child { display: none; }
+  #agents tr { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  #agents td { border: 0; padding: 0; text-align: left; white-space: nowrap; }
+  #agents td::before { content: attr(data-l); display: block; color: var(--muted); font-size: 12px; font-family: system-ui, sans-serif; }
+  #agents td.ag-name { grid-column: 1 / -1; white-space: normal; word-break: normal; overflow-wrap: break-word; font-weight: 600; }
+  #agents td.ag-name::before { display: none; }
+  #agents td.lo { display: none; }
+  #agents td.g2 { grid-column: span 2; }
+  #agents td.g3 { grid-column: span 3; }
+  /* settings table: key above value */
+  .kvt, .kvt tr, .kvt td { display: block; }
+  .kvt tr:first-child { display: none; }
+  .kvt tr { padding: 5px 0; border-bottom: 1px solid var(--grid); }
+  .kvt td { border: 0; padding: 0; text-align: left; }
+  .kvt td.mono { overflow-wrap: normal; word-break: normal; color: var(--ink2); }
+  .kvt td.r { white-space: normal; overflow-wrap: break-word; word-break: normal; font-weight: 600; }
 }
 </style>
 </head>
@@ -619,7 +663,7 @@ function drawSessions() {
     ];
     return el("div", { class: "seq" },
       el("div", { class: "top" },
-        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), s.state === "restoring" ? `載回快取 · ${phase}` : `${s.state} · ${phase}`),
+        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[(s.state === "parked" || s.state === "admitted") && s.active === true ? "running" : s.state] || "--muted"})` }), s.state === "restoring" ? `載回快取 · ${phase}` : `${(s.state === "parked" || s.state === "admitted") && s.active === true ? "running" : s.state} · ${phase}`),
         el("span", { class: "rid" }, s.rid),
         el("span", { class: "sub" }, s.endpoint || ""),
         el("span", { class: "muted" }, s.client || ""),
@@ -642,21 +686,22 @@ function logRow(e) {
   const r = e.rec, m = e.meta || r?.meta || {};
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
   const cells = r ? [
-    el("td", { class: "mono", title: r.agent_id || "" }, r.agent || ""),
-    el("td", { class: "r" }, fmtTok(r.prompt_tokens)),
-    el("td", { class: "r", title: r.diverged_at != null ? `diverges from an earlier sequence at token ${r.diverged_at}` : "" },
+    el("td", { class: "mono c-agent", title: r.agent_id || "" }, r.agent || ""),
+    el("td", { class: "brk" }),
+    el("td", { class: "r c-prompt" }, fmtTok(r.prompt_tokens)),
+    el("td", { class: "r c-cached", title: r.diverged_at != null ? `diverges from an earlier sequence at token ${r.diverged_at}` : "" },
       `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})` + (r.diverged_at != null ? " ≠" : "")),
-    el("td", { class: "r" }, fmtTok(r.completion_tokens)),
-    el("td", { class: "r lo" }, fmtS(r.ttft)),
+    el("td", { class: "r c-out" }, fmtTok(r.completion_tokens)),
+    el("td", { class: "r lo keep c-ttft" }, fmtS(r.ttft)),
     el("td", { class: "r lo" }, r.prefill_tps ? fmtRate(r.prefill_tps) : "–"),
-    el("td", { class: "r" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
+    el("td", { class: "r c-dec" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
     el("td", { class: "r lo" }, r.accept ? r.accept.toFixed(2) : "–"),
-    el("td", { class: "r" }, fmtS(r.total)),
-    el("td", { class: "r lo", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
+    el("td", { class: "r c-total" }, fmtS(r.total)),
+    el("td", { class: "r lo keep", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
     el("td", { class: "prev lo" }, m.preview || ""),
   ] : [el("td", { colspan: 10, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
-    el("td", { class: "muted lo", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted lo" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
+    el("td", { class: "muted lo", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted lo" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono c-agent", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
   tr.title = "click for details";
   tr.addEventListener("click", () => { state.open.has(e.n) ? state.open.delete(e.n) : state.open.add(e.n); drawLog(); });
   const out = [tr];
@@ -702,6 +747,12 @@ async function loadUiState() {  // /ui/state: fallback source only; a failure ju
   catch (e) { state.ui = null; }
   drawSlots(); drawTiers(); drawDeploy();
 }
+// text with break opportunities after / \\ - . : _ (agent ids, paths) and none inside a word
+function wbrText(t) {
+  const f = document.createDocumentFragment();
+  String(t).split(/(?<=[/\\\-._:])/).forEach((part, i) => { if (i) f.append(document.createElement("wbr")); f.append(part); });
+  return f;
+}
 const kvRow = (k, v) => el("div", {}, el("span", {}, k + " "), el("b", {}, v));
 const warnBox = (title, text) => el("div", { class: "warnbox" }, el("b", {}, title + "："), String(text));
 const toDate = (v) => {
@@ -739,7 +790,7 @@ function slotTile(s, i) {
     el("div", { class: "rid mono trunc", title: s.rid || "" }, s.rid || "–"),
     el("div", { class: "kv" },
       kvRow("階段", PHASE_ZH[s.phase] || s.phase || "–"),
-      kvRow("輸入（Prompt）", prompt != null ? fmtTok(prompt) + " tok" : "–"),
+      el("div", {}, el("span", {}, el("span", { class: "wid" }, "輸入（Prompt）"), el("span", { class: "nar" }, "輸入"), " "), el("b", {}, prompt != null ? fmtTok(prompt) + " tok" : "–")),
       kvRow("快取", cached != null ? `${fmtTok(cached)} (${pct})` : "–"),
       kvRow("輸出", s.out != null ? fmtTok(s.out) + " tok" : "–"),
       kvRow("已執行時間", fmtS(s.age))),
@@ -844,7 +895,7 @@ function drawDeploy() {
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
       el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
-          el("td", { class: "r", style: "overflow-wrap:anywhere" }, fmtSetting(s[k])))))));
+          el("td", { class: "r" }, typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
   }
   body.replaceChildren(...kids);
 }
@@ -887,11 +938,11 @@ function drawAgents() {
   tb.append(el("tr", {}, el("th", {}, "Agent"), el("th", { class: "r" }, "Running"), el("th", { class: "r" }, "Waiting"),
     el("th", { class: "r lo" }, "Requests"), el("th", { class: "r lo" }, "Prompt tokens"), el("th", { class: "r" }, "Cached (hit)"),
     el("th", { class: "r" }, "RAM"), el("th", { class: "r" }, "SSD")));
-  for (const a of rows) tb.append(el("tr", {}, el("td", { style: "font-family:ui-monospace,monospace" }, a.agent),
-    el("td", { class: "r" }, String(a.running)), el("td", { class: "r" }, String(a.waiting)), el("td", { class: "r lo" }, String(a.requests)),
-    el("td", { class: "r lo" }, fmtTok(a.prompt_tokens)), el("td", { class: "r" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
-    el("td", { class: "r" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
-    el("td", { class: "r" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
+  for (const a of rows) tb.append(el("tr", {}, el("td", { class: "ag-name", style: "font-family:ui-monospace,monospace", title: a.agent }, wbrText(a.agent)),
+    el("td", { class: "r g2", "data-l": "Running" }, String(a.running)), el("td", { class: "r g2", "data-l": "Waiting" }, String(a.waiting)), el("td", { class: "r lo" }, String(a.requests)),
+    el("td", { class: "r lo" }, fmtTok(a.prompt_tokens)), el("td", { class: "r g2", "data-l": "Cached (hit)" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
+    el("td", { class: "r g3", "data-l": "RAM" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
+    el("td", { class: "r g3", "data-l": "SSD" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
 }
 function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawDeploy(); drawSessions(); }
 

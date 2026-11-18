@@ -182,7 +182,10 @@ def slot_rows(seqs, n, target=None, last_lanes=None):
     Lanes stay put between snapshots: a parked request keeps its lane, area + 1 (parking areas are 0 .. n - 2); a
     request that is not parked takes the lane it had in last_lanes (rid -> lane, 1-based) if that lane is free, and
     the rest take the free lanes in admission order. last_lanes, when given, is replaced with this snapshot's mapping,
-    so the rids that finished drop out of it."""
+    so the rids that finished drop out of it.
+
+    Each row may carry "active" (worker.Scheduler.stats: the request is being worked on: resident, decoding, or prefilling
+    a chunk lately); it is passed into the lane dict as "active" (False for idle / closed lanes) and does not affect placement."""
     target = n if target is None else target
     lanes = [None] * (n + 1)  # 1-based; lanes[0] unused
     rest = []

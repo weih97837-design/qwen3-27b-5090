@@ -466,26 +466,28 @@ def test_the_log_table_has_a_media_column():
 
 def test_stats_active_flag_for_batched_parked_sequences():
     now = time.time()
-    a = seq("a", now, out=5, first_token=now - 2.0)          # resident (cur)
-    b = seq("b", now, out=3, first_token=now - 2.0, area=1)  # parked, stepped in the batch just now
-    c = seq("c", now, area=2)                                # parked, last ran long ago
-    d = seq("d", now)                                        # admitted, never ran
-    b.last_run = now - 0.2
+    a = seq("a", now, out=5, first_token=now - 2.0)                          # resident (cur)
+    b = seq("b", now, out=3, first_token=now - 2.0, area=1)                  # parked, DECODE, last ran 5 s ago (waiting its turn)
+    c = seq("c", now, area=2, phase="prefill")                               # parked PREFILL, stale last_run
+    d = seq("d", now, phase="prefill")                                       # admitted PREFILL, never ran (last_run 0.0)
+    e = seq("e", now, phase="prefill", area=3)                               # parked PREFILL that ran a chunk just now
+    b.last_run = now - 5.0
     c.last_run = now - 30.0
-    sched = make_sched(StubEngine(), FakeTiers(None), [a, b, c, d], [seq("w", now, started=False)], cur=a, engine_seqs=4)
+    e.last_run = now - 0.2
+    sched = make_sched(StubEngine(), FakeTiers(None), [a, b, c, d, e], [seq("w", now, started=False)], cur=a, engine_seqs=5)
     snap = sched.stats()
     act = {r["rid"]: r["active"] for r in snap["seqs"]}
-    assert act == {"a": True, "b": True, "c": False, "d": False, "w": False}
-    assert [(r["rid"], r["state"], r["active"]) for r in snap["slots"] if r["rid"]] == [
-        ("a", "running", True), ("b", "parked", True), ("c", "parked", False), ("d", "admitted", False)]
+    assert act == {"a": True, "b": True, "c": False, "d": False, "e": True, "w": False}
+    assert {(r["rid"], r["state"], r["active"]) for r in snap["slots"] if r["rid"]} == {
+        ("a", "running", True), ("b", "parked", True), ("c", "parked", False), ("e", "parked", True), ("d", "admitted", False)}
     assert [r["lane"] for r in snap["slots"] if r["rid"] in ("b", "c")] == [2, 3]  # lanes unchanged: area + 1
-    assert snap["slots"][3]["active"] is False
+    assert all(r["active"] is False for r in snap["slots"] if r["rid"] is None)
 
 
-def test_stats_active_window_boundary():
+def test_stats_active_window_boundary_for_prefill():
     now = time.time()
     a = seq("a", now)
-    b = seq("b", now, area=0)
+    b = seq("b", now, area=0, phase="prefill")
     sched = make_sched(StubEngine(), FakeTiers(None), [a, b], [], cur=a)
     b.last_run = time.time() - worker.ACTIVE_WINDOW_S + 0.3   # just inside the window
     assert {r["rid"]: r["active"] for r in sched.stats()["seqs"]}["b"] is True

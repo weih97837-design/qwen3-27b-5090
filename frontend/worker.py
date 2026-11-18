@@ -53,7 +53,7 @@ AGENT_NOTES = 4096    # checkpoint fingerprints kept for Scheduler.agent_of_ids
 AGENT_STATS = 256     # agents the per-agent counters keep (the oldest go first)
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
-ACTIVE_WINDOW_S = 1.5  # s after a sequence last ran a step that the stats UI still shows it as active (parked ones are batched)
+ACTIVE_WINDOW_S = 1.5  # s after a PREFILL sequence last ran a chunk that the stats UI still shows it as active (a decoding one is always active)
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
 SHARE_MIN = 128      # tokens a sibling's prefix must reach past what the cache holds for a newcomer to wait for it
 STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
@@ -1554,8 +1554,10 @@ class Scheduler:
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "media": media_of(s.images),
                          "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id,
-                         # stepping now: the resident sequence, or one (parked, batched lanes) that ran within ACTIVE_WINDOW_S
-                         "active": s in self.alive and (s is self.cur or now - s.last_run <= ACTIVE_WINDOW_S)})
+                         # working now (stats UI 推論中): the resident sequence, any DECODE one (batched / quantum turns can be
+                         # longer than a window), or a PREFILL one that ran a chunk within ACTIVE_WINDOW_S (held ones are not)
+                         "active": s in self.alive and (s is self.cur or s.phase == DECODE
+                                                        or now - s.last_run <= ACTIVE_WINDOW_S)})
             if s.restoring is not None:
                 rec = s.restoring
                 seqs[-1]["restore"] = {"tokens": rec["pos"], "bytes": rec["bytes"], "on_disk": rec["on_disk"],
