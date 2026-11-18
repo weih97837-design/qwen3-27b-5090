@@ -446,12 +446,12 @@ def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
 
 # ---------------------------------------------------------------- the image / video settings
 
-def test_media_defaults_are_the_upstream_ones():
-    """The defaults live in launch.MEDIA_DEFAULTS (None: the checkpoint's 12,288 tokens and 768 frames, and
-    IMAGE_TOKENS 16,384 or VIDEO_MAX_TOKENS when more); compose.yaml and the documentation say the same."""
+def test_media_defaults_are_the_documented_ones():
+    """The defaults live in launch.MEDIA_DEFAULTS (131,072 video tokens, 2,048 frames, and IMAGE_TOKENS 16,384 or
+    VIDEO_MAX_TOKENS when more: 131,072); compose.yaml and the documentation say the same."""
     import re
-    assert launch.MEDIA_DEFAULTS == {"image_tokens": None, "video_max_tokens": None, "video_max_frames": None}
-    assert launch.IMAGE_TOKENS == 16384
+    assert launch.MEDIA_DEFAULTS == {"image_tokens": None, "video_max_tokens": 131072, "video_max_frames": 2048}
+    assert launch.IMAGE_TOKENS == 16384  # (the floor of IMAGE_TOKENS; the engine library's own default)
     compose = (ROOT / "compose.yaml").read_text()
     for key, (var, lo, hi) in launch.MEDIA_SETTINGS.items():
         m = re.search(rf"^\s+{var}: \$\{{{var}:-([^}}]*)\}}", compose, re.M)
@@ -459,14 +459,18 @@ def test_media_defaults_are_the_upstream_ones():
         want = launch.MEDIA_DEFAULTS[key]
         assert m.group(1) == ("" if want is None else str(want)), var
         assert launch.ENV_NAMES[key] == var and key in launch.Launch.KEYS
-    assert launch.image_tokens_env(DEFAULTS) == 16384
+    assert launch.image_tokens_env(DEFAULTS) == 131072
+    docs = (ROOT / "docs/configuration.md").read_text()
+    assert "| `VIDEO_MAX_TOKENS` | 131,072 " in docs and "| `VIDEO_MAX_FRAMES` | 2,048 " in docs
 
 
 def test_media_validate():
     lc = settings()
     s = lc.validate({"image_tokens": 32768, "video_max_tokens": 131072, "video_max_frames": 2048})
     assert (s["image_tokens"], s["video_max_tokens"], s["video_max_frames"]) == (32768, 131072, 2048)
-    assert lc.validate({"video_max_tokens": None})["video_max_tokens"] is None
+    assert lc.validate({"video_max_tokens": None})["video_max_tokens"] == 131072  # (null: the default)
+    assert lc.validate({"video_max_frames": None})["video_max_frames"] == 2048
+    assert lc.validate({"video_max_tokens": 12288, "video_max_frames": 768})["video_max_tokens"] == 12288  # (the checkpoint's)
     for bad in ({"image_tokens": 0}, {"image_tokens": -1}, {"image_tokens": 262145}, {"video_max_tokens": 1.5},
                 {"video_max_tokens": "131072"}, {"video_max_tokens": True}, {"video_max_frames": 1},
                 {"video_max_frames": 16385}, {"video_max_frames": float("nan")}):
@@ -478,10 +482,11 @@ def test_image_tokens_follow_the_video_setting_in_the_engine_env(monkeypatch, tm
     lc = settings()
     monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
     (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
-    for changes, want in (({}, ("16384", None, None)), ({"video_max_tokens": 8192}, ("16384", "8192", None)),
-                          ({"video_max_tokens": 131072, "video_max_frames": 2048}, ("131072", "131072", "2048")),
-                          ({"video_max_tokens": 131072, "image_tokens": 40000}, ("40000", "131072", None)),
-                          ({"image_tokens": 4096}, ("4096", None, None))):
+    for changes, want in (({}, ("131072", "131072", "2048")), ({"video_max_tokens": 8192}, ("16384", "8192", "2048")),
+                          ({"video_max_tokens": 12288, "video_max_frames": 768}, ("16384", "12288", "768")),
+                          ({"video_max_tokens": 262144, "video_max_frames": 4096}, ("262144", "262144", "4096")),
+                          ({"video_max_tokens": 131072, "image_tokens": 40000}, ("40000", "131072", "2048")),
+                          ({"image_tokens": 4096}, ("4096", "131072", "2048"))):
         env = lc.config(lc.validate(dict(changes, spec="none")))["env"]
         assert (env["IMAGE_TOKENS"], env["VIDEO_MAX_TOKENS"], env["VIDEO_MAX_FRAMES"]) == want, changes
 
@@ -496,6 +501,10 @@ def test_media_env_settings_are_read_from_the_variables(monkeypatch):
     monkeypatch.setenv("IMAGE_TOKENS", "")  # (empty: follows VIDEO_MAX_TOKENS)
     s = launch.env_settings()
     assert (s["image_tokens"], s["video_max_tokens"], s["video_max_frames"]) == (None, 131072, 2048)
+    monkeypatch.setenv("VIDEO_MAX_TOKENS", "")  # (empty: the default)
+    assert launch.env_settings()["video_max_tokens"] == 131072
+    monkeypatch.setenv("VIDEO_MAX_TOKENS", "12288")
+    assert launch.env_settings()["video_max_tokens"] == 12288
     monkeypatch.setenv("IMAGE_TOKENS", "-5")
     warned = []
     assert launch.parse_media("image_tokens", "-5", warn=warned.append) is None and warned
@@ -509,9 +518,9 @@ def test_video_env_is_not_part_of_a_plan_job_but_image_tokens_are(monkeypatch, t
     jobs = []
     monkeypatch.setattr(lc, "_run", lambda j: jobs.append(j) or [{"fits": True}] * len(j))
     base = lc.validate({"spec": "none"})
-    lc.plan_many([base, dict(base, video_max_tokens=8192, video_max_frames=100)], DEVICE)
+    lc.plan_many([base, dict(base, video_max_frames=100)], DEVICE)
     assert len(jobs) == 1 and len(jobs[0]) == 1
-    assert not set(jobs[0][0]["env"]) & launch.VIDEO_ENV and jobs[0][0]["env"]["IMAGE_TOKENS"] == "16384"
+    assert not set(jobs[0][0]["env"]) & launch.VIDEO_ENV and jobs[0][0]["env"]["IMAGE_TOKENS"] == "131072"
     lc.plan_many([dict(base, image_tokens=65536)], DEVICE)
     assert len(jobs) == 2 and jobs[1][0]["env"]["IMAGE_TOKENS"] == "65536"
 
@@ -519,7 +528,7 @@ def test_video_env_is_not_part_of_a_plan_job_but_image_tokens_are(monkeypatch, t
 def test_media_env_changes():
     lc = object.__new__(launch.Launch)
     lc.settings = lc.at_start = dict(DEFAULTS)
-    lc.settings = dict(lc.at_start, video_max_tokens=131072, video_max_frames=2048)
-    assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "131072", "VIDEO_MAX_FRAMES": "2048"}
-    lc.at_start, lc.settings = lc.settings, dict(lc.settings, video_max_tokens=None, image_tokens=50000)
-    assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "", "IMAGE_TOKENS": "50000"}
+    lc.settings = dict(lc.at_start, video_max_tokens=12288, video_max_frames=768)
+    assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "12288", "VIDEO_MAX_FRAMES": "768"}
+    lc.at_start, lc.settings = lc.settings, dict(lc.settings, image_tokens=50000)
+    assert lc.env_changes() == {"IMAGE_TOKENS": "50000"}

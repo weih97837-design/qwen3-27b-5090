@@ -145,9 +145,9 @@ everywhere above.
 | `CHECKPOINT_INTERVAL` | 4096 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
-| `IMAGE_TOKENS` | 16384 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more |
-| `VIDEO_MAX_TOKENS` | the checkpoint's 12,288 | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 16 pairs (16 s at 2 frames per second) keeps its size; longer ones get larger frames. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
-| `VIDEO_MAX_FRAMES` | the checkpoint's 768 | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
+| `IMAGE_TOKENS` | 131,072 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 1.25 GiB at 131,072; 160 MiB at 16,384). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more, so 131,072 by default. The engine library's own default (`q27lib.Engine`) is 16,384. See [Host memory](#host-memory-of-images-and-videos) |
+| `VIDEO_MAX_TOKENS` | 131,072 (the checkpoint's own: 12,288) | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 170 s at 2 frames per second (341 frames) keeps its size and longer ones get smaller frames; with the checkpoint's 12,288 that is 32 s. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
+| `VIDEO_MAX_FRAMES` | 2,048 (the checkpoint's own: 768) | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
 | `VRAM_RESERVE_GIB` | 1.5 | The minimum VRAM to keep unused, in GiB: the budget of the engine is the free VRAM minus this. It is for the desktop and other programs, and to stay below the point where Windows (WDDM) starts to page GPU memory to system RAM without an error, which slows inference about 7 times. 1.5 GiB is what the automatic budget was on an RTX 5090. Lowering it gives the KV pool more room (each 1 GiB is about 58K tokens of NVFP4 KV at 18 KiB per token) at the risk of that paging; a negative or unreadable value counts as 0. The log shows `reserve R GiB, budget B GiB`. The old `VRAM_BUDGET_GIB` (legacy, prefer `VRAM_RESERVE_GIB`) still works as an upper bound that can only lower the budget |
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
@@ -168,19 +168,21 @@ everywhere above.
 
 ## Long videos
 
-By default a video is sampled as the checkpoint's processor does it: 2 frames per second, at most 768 frames and
-12,288 tokens. That fits short clips, but a 10-minute 1080p video gets 224 x 128 pixels a frame. Two settings give a
-video more of the context, `VIDEO_MAX_TOKENS` (T below) and `VIDEO_MAX_FRAMES` (F), with the sampling rate (fps) of
-a request:
+A video is sampled at 2 frames per second (`fps`, a request's `mm_processor_kwargs` can change it), as the checkpoint's
+processor does, but with a larger budget than the checkpoint's own (12,288 tokens, 768 frames, where a 10-minute 1080p
+video gets 224 x 128 pixels a frame): `VIDEO_MAX_TOKENS` (T below) is 131,072 and `VIDEO_MAX_FRAMES` (F) 2,048 here.
+Videos up to about 2.8 minutes (341 frames at 2 fps) are the same with either: each pair of frames takes at most 768
+tokens. Set the checkpoint's numbers to get its behaviour back:
 
 ```bash
-VIDEO_MAX_TOKENS=131072 VIDEO_MAX_FRAMES=2048 docker compose up -d serve
+VIDEO_MAX_TOKENS=12288 VIDEO_MAX_FRAMES=768 docker compose up -d serve
 ```
 
-The same three are start settings of the stats page (`image_tokens`, `video_max_tokens`, `video_max_frames`, under
-"Images and video") and rows of the tray's Settings window; empty means the defaults above. The defaults are in one
-place, `MEDIA_DEFAULTS` in `frontend/launch.py` (all empty, the upstream's), and the video settings are read by the
-server's own processor from the settings of the engine that is running, so a restart with changed values applies them.
+The defaults are in one place, `MEDIA_DEFAULTS` in `frontend/launch.py` (`compose.yaml`, `settings.example.ini` and
+these tables say the same; `frontend/tests/test_launch.py` compares them). The same three are start settings of the
+stats page (`image_tokens`, `video_max_tokens`, `video_max_frames`, under "Images and video") and rows of the tray's
+Settings window; empty means the defaults. The server's own processor reads `VIDEO_MAX_*` from the settings of the
+engine that is running, so a restart with changed values applies them.
 
 Or per request, within `IMAGE_TOKENS` and `VIDEO_MAX_FRAMES`:
 `"mm_processor_kwargs": {"fps": 2, "max_frames": 2048, "size": {"longest_edge": 268435456}}`
@@ -203,7 +205,7 @@ sees time in steps of a pair: 2 / fps seconds, or 2 x duration / F once the fram
 
 | Regime | When | Tokens per pair | Tokens of the video | Time step of the pairs |
 | --- | --- | --- | --- | --- |
-| A: the per-pair cap | n <= 2T / 768 (32 frames by default) | 768 (1152 x 640 for 16:9), or the video's own size | pairs x 768: grows with duration x fps, below T | 2 / fps s |
+| A: the per-pair cap | n <= 2T / 768 (341 frames by default, 32 with the checkpoint's T) | 768 (1152 x 640 for 16:9), or the video's own size | pairs x 768: grows with duration x fps, below T | 2 / fps s |
 | B: the token bound | 2T / 768 < n < F | about 2T / n: smaller for longer videos and higher fps | about T | 2 / fps s |
 | C: the frame bound | duration x fps >= F | about 2T / F | about T | 2 x duration / F s: coarser for longer videos |
 
@@ -218,25 +220,37 @@ sees time in steps of a pair: 2 / fps seconds, or 2 x duration / F once the fram
 
 ### Examples (1080p unless noted; frame size in parentheses)
 
-| Video | Default (T 12,288, F 768) | T 131,072, F 2,048 |
+| Video | Default (T 131,072, F 2,048) | The checkpoint's (T 12,288, F 768) |
 | --- | --- | --- |
 | 10 s, 2 fps | 10 pairs x 720 (1152 x 640) = 7,200 (A) | the same, 7,200 (A) |
-| 60 s, 1 fps | 30 x 390 (832 x 480) = 11,700 (B) | 30 x 720 = 21,600 (A) |
-| 60 s, 2 fps | 60 x 190 (608 x 320) = 11,400 (B) | 60 x 720 = 43,200 (A) |
-| 60 s, 4 fps | 120 x 91 (416 x 224) = 10,920 (B) | 120 x 720 = 86,400 (A) |
-| 10 min, 1 fps | 300 x 32 (256 x 128) = 9,600 (B) | 300 x 405 (864 x 480) = 121,500 (B) |
-| 10 min, 2 fps | 384 x 28 (224 x 128) = 10,752; a pair every 1.6 s (C) | 600 x 209 (608 x 352) = 125,400; every 1.0 s (B) |
-| 1 hour, 2 fps | 384 x 28 = 10,752; a pair every 9.4 s (C) | 1,024 x 120 (480 x 256) = 122,880; every 3.5 s (C) |
-| 640 x 360, 60 s, 2 fps | 60 x 190 = 11,400 (B) | 60 x 220 (640 x 352, its own size) = 13,200 (A) |
+| 60 s, 1 fps | 30 x 720 = 21,600 (A) | 30 x 390 (832 x 480) = 11,700 (B) |
+| 60 s, 2 fps | 60 x 720 = 43,200 (A) | 60 x 190 (608 x 320) = 11,400 (B) |
+| 60 s, 4 fps | 120 x 720 = 86,400 (A) | 120 x 91 (416 x 224) = 10,920 (B) |
+| 10 min, 1 fps | 300 x 405 (864 x 480) = 121,500 (B) | 300 x 32 (256 x 128) = 9,600 (B) |
+| 10 min, 2 fps | 600 x 209 (608 x 352) = 125,400; every 1.0 s (B) | 384 x 28 (224 x 128) = 10,752; a pair every 1.6 s (C) |
+| 1 hour, 2 fps | 1,024 x 120 (480 x 256) = 122,880; every 3.5 s (C) | 384 x 28 = 10,752; a pair every 9.4 s (C) |
+| 640 x 360, 60 s, 2 fps | 60 x 220 (640 x 352, its own size) = 13,200 (A) | 60 x 190 = 11,400 (B) |
 
 For a long video, put it in B or C, where the total reaches T: raise T for detail in each frame, F (and fps) for
-finer time.
+finer time. Lower T and F (or the request's `fps`) for a machine with little memory or to keep the prefill short.
+
+### Host memory of images and videos
+
+The engine's pinned host memory is the sum of: the media embeddings (`IMAGE_TOKENS` x 10 KiB: 1.25 GiB at 131,072),
+the prefix cache's state checkpoints (`STATE_HOST_CACHE`, 8 GiB), the tiered cache's pinned slabs (`SPILL_PINNED_GIB`,
+8 GiB) and the vision tower's weights (`VISION=host`, 0.86 GiB): about 18 GiB with the defaults, of which the media
+table is 1.25 GiB. Resized frames (6 KiB per token, 0.75 GiB at 131,072) are ordinary host memory, held only while a
+video is encoded. On native Windows pinned memory counts against the GPU's shared memory (about half of the RAM), and
+Windows may page it out under pressure, which slows the engine: on a machine with 32 GiB of RAM or less, lower
+`VIDEO_MAX_TOKENS` (32,768 takes 0.31 GiB of table), `SPILL_PINNED_GIB` or `STATE_HOST_CACHE` rather than leaving all
+three at their defaults. `tools/recommend_config.py` does the first for machines with less than 32 GiB of RAM.
 
 ### Limits and costs
 
 - `IMAGE_TOKENS` follows `VIDEO_MAX_TOKENS` unless it is set: the embeddings take 10 KiB of pinned host memory per
   token (1.25 GiB for 131,072), allocated when the engine starts. A request with more tokens of images and videos
-  gets HTTP 400.
+  gets HTTP 400. A video of 131,072 tokens plus its text also needs a context (`MAX_TOKENS`, 262,144 by default) and
+  KV pool room: a request that cannot fit the pool at all gets HTTP 400 at once instead of waiting.
 - The tokens of the videos, their pairs' text included, must fit the context: 1,024 pairs add about 10K tokens of
   text.
 - A frame takes at least about 4,300 pixels (about 4 tokens), so with a very high F and a low T (more than about

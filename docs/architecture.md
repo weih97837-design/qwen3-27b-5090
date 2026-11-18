@@ -385,7 +385,7 @@ images.
 
 **Videos.** The checkpoint's video processor samples 2 frames per second (4 to 768, an even count), resizes all of
 them to one size and caps the pixels per frame as qwen-vl-utils does (at most 768 tokens per pair of frames, 12,288
-per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video).
+per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video: this fork's defaults are 131,072 and 2,048).
 Each pair of frames (the temporal patch) is, to the language model,
 an image of its own after its time as text, `<1.3 seconds><|vision_start|>...<|vision_end|>`, with the M-RoPE
 positions of an image (transformers' `get_rope_index` splits a video the same way), so the engine's image path

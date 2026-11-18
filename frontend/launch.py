@@ -61,18 +61,18 @@ TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
 
 # ----- Video / image media settings: THE place of their defaults ------------------------------------------------------
 # image_tokens (IMAGE_TOKENS), video_max_tokens (VIDEO_MAX_TOKENS) and video_max_frames (VIDEO_MAX_FRAMES) are start
-# settings; None (empty) is "the engine's default", which is the upstream's and what compose.yaml, settings.example.ini
-# and docs/configuration.md describe:
-#   video_max_tokens None: the checkpoint's 12,288 (video_preprocessor_config.json size.longest_edge / 2,048)
-#   video_max_frames None: the checkpoint's 768
-#   image_tokens     None: IMAGE_TOKENS (16,384), or video_max_tokens when that is more
-# To make a larger video budget the default (the user has not approved that yet), change MEDIA_DEFAULTS and, to keep the
-# documentation true, the same numbers in compose.yaml (the three lines after IMAGE_TOKENS), docs/configuration.md and
-# docs/deploy-launcher.md; frontend/tests/test_launch.py::test_media_defaults_are_the_upstream_ones compares them. Costs: 10 KiB of pinned host
-# memory per image_tokens (allocated when the engine starts), 6 KiB of host memory per token of a video while it is
-# encoded; the video settings change nothing in the engine's pools (only the server reads VIDEO_MAX_*).
+# settings. An unset or empty variable, and null in the admin API, is MEDIA_DEFAULTS[key]; this fork's defaults are
+# the video budget of a long video (131,072 tokens, 2,048 frames; the checkpoint's own are 12,288 and 768, which a
+# setting of those numbers gives back; short videos, up to about 2.8 minutes at 2 frames per second, are the same
+# with either) and image_tokens None: IMAGE_TOKENS (16,384), or video_max_tokens when that is more (131,072).
+# To change the defaults change MEDIA_DEFAULTS and, to keep the documentation true, the same numbers in compose.yaml
+# (the three lines after IMAGE_TOKENS), scripts/windows/settings.example.ini, docs/configuration.md and the zh-TW
+# docs; frontend/tests/test_launch.py::test_media_defaults_are_the_documented_ones compares compose.yaml and the tables. Costs: 10 KiB of
+# pinned host memory per image_tokens (1.25 GiB for 131,072, allocated when the engine starts), 6 KiB of host memory
+# per token of a video while it is encoded; the video settings change nothing in the engine's pools (only the server
+# reads VIDEO_MAX_*). tools/recommend_config.py lowers VIDEO_MAX_TOKENS for machines with little RAM.
 IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
-MEDIA_DEFAULTS = {"image_tokens": None, "video_max_tokens": None, "video_max_frames": None}
+MEDIA_DEFAULTS = {"image_tokens": None, "video_max_tokens": 131072, "video_max_frames": 2048}
 MEDIA_SETTINGS = {"image_tokens": ("IMAGE_TOKENS", 1, MAX_CONTEXT),         # (key: variable, least, most)
                   "video_max_tokens": ("VIDEO_MAX_TOKENS", 1, MAX_CONTEXT),
                   "video_max_frames": ("VIDEO_MAX_FRAMES", 2, 16384)}
@@ -296,6 +296,8 @@ class Launch:
                 raise ValueError(f"vram_reserve_gib: at most the device's memory, {device[1] / GiB:.2f} GiB")
         for k, (_, lo, hi) in MEDIA_SETTINGS.items():
             v = s[k]
+            if v is None:  # (null: the default)
+                s[k] = v = MEDIA_DEFAULTS[k]
             if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi):
                 raise ValueError(f"{k}: null (the default) or an integer from {lo} to {hi}")
         for k, (_, _, kind) in TIER_SETTINGS.items():
@@ -325,9 +327,9 @@ class Launch:
                # (a legacy VRAM_BUDGET_GIB inherited from settings.ini would cap the budget unseen: the reserve rules)
                "VRAM_BUDGET_GIB": None,
                # (image / video tokens: the engine reads IMAGE_TOKENS; the server's own processors read VIDEO_MAX_*
-               # from this environment (server.Server.images), None: the checkpoint's)
+               # from this environment (server.Server.images))
                "IMAGE_TOKENS": str(image_tokens_env(s)),
-               **{MEDIA_SETTINGS[k][0]: None if s[k] is None else str(s[k]) for k in ("video_max_tokens", "video_max_frames")},
+               **{MEDIA_SETTINGS[k][0]: str(s[k]) for k in ("video_max_tokens", "video_max_frames")},
                # (the tiered cache: the engine and worker.TierPolicy read these when the engine process loads)
                **{TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS},
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}

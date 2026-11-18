@@ -54,6 +54,12 @@ TOO_SMALL_POOL_TOKENS = 65536  # warn that the GPU is too small below this
 # RAM (pinned host memory of the engine: embeddings 2.4 + prefix state cache 4 + vision 0.9 + frontend).
 ENGINE_HOST_GIB = 8
 SYSTEM_RESERVE_GIB = 4
+# Images and videos (docs/configuration.md "Host memory of images and videos"): the media embedding table takes 10 KiB of
+# pinned host memory per token and the resized frames of a video 6 KiB while it is encoded. The defaults (frontend/launch.py
+# MEDIA_DEFAULTS) are 131,072 tokens: 2 GiB together. Machines with little RAM get less (RAM is the VM's in WSL).
+MEDIA_BYTES_PER_TOKEN = (10 + 6) * 1024
+DEFAULT_VIDEO_MAX_TOKENS = 131072
+VIDEO_TOKENS_BY_RAM = ((32.0, DEFAULT_VIDEO_MAX_TOKENS), (16.0, 32768), (0.0, 12288))  # (RAM at least GiB, VIDEO_MAX_TOKENS)
 SPILL_RAM_FRACTION = 0.75
 SPILL_RAM_STEP_GIB = 4
 SPILL_RAM_MAX_GIB = 64
@@ -95,6 +101,7 @@ MANAGED_KEYS = (
     "MAX_TOKENS",
     "MAX_SEQS",
     "KV_DTYPE",
+    "VIDEO_MAX_TOKENS",
     "SPILL_RAM_GIB",
     "SPILL_SSD_GIB",
     "SPILL_DIR",
@@ -266,9 +273,23 @@ def kv_pool_tokens(kv_gib: float) -> int:
     return min(steps * POOL_STEP_TOKENS, POOL_CAP_TOKENS)
 
 
-def spill_ram_gib(vm_gib: float) -> int:
-    """SPILL_RAM_GIB for a VM (or host) of vm_gib: what is left after the engine and system reserve, in steps of 4."""
-    usable = (vm_gib - ENGINE_HOST_GIB - SYSTEM_RESERVE_GIB) * SPILL_RAM_FRACTION
+def video_max_tokens(ram_gib: float | None) -> int:
+    """VIDEO_MAX_TOKENS for a machine of ram_gib (None: unknown, the default): 131,072 from 32 GiB, 32,768 from 16 GiB,
+    else the checkpoint's own 12,288."""
+    if ram_gib is None:
+        return DEFAULT_VIDEO_MAX_TOKENS
+    return next(tokens for least, tokens in VIDEO_TOKENS_BY_RAM if ram_gib >= least)
+
+
+def media_host_gib(tokens: int) -> float:
+    """Host memory of the media table and of the frames of a video of `tokens` tokens, GiB."""
+    return tokens * MEDIA_BYTES_PER_TOKEN / GiB
+
+
+def spill_ram_gib(vm_gib: float, media_gib: float = 0.0) -> int:
+    """SPILL_RAM_GIB for a VM (or host) of vm_gib: what is left after the engine, the media buffers (media_gib) and the
+    system reserve, in steps of 4."""
+    usable = (vm_gib - ENGINE_HOST_GIB - media_gib - SYSTEM_RESERVE_GIB) * SPILL_RAM_FRACTION
     value = math.floor(usable / SPILL_RAM_STEP_GIB) * SPILL_RAM_STEP_GIB
     return int(max(0, min(SPILL_RAM_MAX_GIB, value)))
 
@@ -320,16 +341,30 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
             f"池大於等於 {FULL_CONTEXT_TOKENS:,} tokens 時維持 {FULL_CONTEXT_TOKENS:,}，否則為池大小（向下取整到 1024）。"
         )
 
-    # --- RAM: SPILL_RAM_GIB ---
+    # --- RAM: VIDEO_MAX_TOKENS and SPILL_RAM_GIB ---
     ram = detected.get("ram_gib")
+    video_tokens = video_max_tokens(ram)
+    media_gib = media_host_gib(video_tokens)
+    env["VIDEO_MAX_TOKENS"] = str(video_tokens)
+    reasons["VIDEO_MAX_TOKENS"] = (
+        "RAM 未偵測，使用預設值。"
+        if ram is None
+        else f"RAM {ram:.1f} GiB：32 GiB 以上 131,072（預設），16 GiB 以上 32,768，更少為檢查點的 12,288。"
+        f"影片與圖片的固定主機記憶體（嵌入表 10 KiB + 編碼時的畫面 6 KiB 每 token）為 {media_gib:.2f} GiB。"
+    )
+    if ram is not None and video_tokens < DEFAULT_VIDEO_MAX_TOKENS:
+        warnings.append(
+            f"RAM 只有 {ram:.0f} GiB，VIDEO_MAX_TOKENS 下調為 {video_tokens:,}"
+            f"（預設 {DEFAULT_VIDEO_MAX_TOKENS:,} 的影片緩衝約 {media_host_gib(DEFAULT_VIDEO_MAX_TOKENS):.1f} GiB）。長影片的畫面會較小。"
+        )
     if ram is None:
         env["SPILL_RAM_GIB"] = str(DEFAULT_SPILL_RAM_GIB)
         reasons["SPILL_RAM_GIB"] = "RAM 未偵測，使用 compose.yaml 預設值。"
     else:
-        spill = spill_ram_gib(ram)
+        spill = spill_ram_gib(ram, media_gib)
         env["SPILL_RAM_GIB"] = str(spill)
         reasons["SPILL_RAM_GIB"] = (
-            f"RAM {ram:.1f} GiB 減去引擎 {ENGINE_HOST_GIB} 與系統保留 {SYSTEM_RESERVE_GIB}，"
+            f"RAM {ram:.1f} GiB 減去引擎 {ENGINE_HOST_GIB}、影片緩衝 {media_gib:.2f} 與系統保留 {SYSTEM_RESERVE_GIB}，"
             f"取 {int(SPILL_RAM_FRACTION * 100)}%，以 {SPILL_RAM_STEP_GIB} GiB 為單位，上限 {SPILL_RAM_MAX_GIB}。"
         )
         if spill == 0:
@@ -339,7 +374,7 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
         if detected.get("is_wsl") and host is not None:
             wsl_gib = round(host) - WSL_HOST_RESERVE_GIB
             if ram < wsl_gib - WSL_TOLERANCE_GIB:
-                wsl_spill = spill_ram_gib(wsl_gib)
+                wsl_spill = spill_ram_gib(wsl_gib, media_host_gib(video_max_tokens(wsl_gib)))
                 hints.append(
                     f"WSL VM 只有 {ram:.0f} GiB，建議 {wsl_gib} GiB（主機 {host:.0f} GiB 減去保留 {WSL_HOST_RESERVE_GIB}）。"
                     f"請在 %UserProfile%\\.wslconfig 的 [wsl2] 區段設定 memory={wsl_gib}GB，"

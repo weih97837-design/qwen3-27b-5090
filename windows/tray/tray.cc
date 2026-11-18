@@ -1062,12 +1062,12 @@ std::vector<Row> make_rows() {
         {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
         {L"Fair agents (evict from the biggest)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
         {L"SSD folder", L"SPILL_DIR", "spill_dir", K::edit, T::engine, nullptr},
-        // Images and videos (docs/configuration.md, "Long videos"): numbers or empty (the engine's default; the numbers are
-        // frontend/launch.py MEDIA_DEFAULTS). IMAGE_TOKENS is read by the engine, VIDEO_MAX_* by the server's video
+        // Images and videos (docs/configuration.md, "Long videos"): numbers or empty (the default; the numbers are
+        // frontend/launch.py MEDIA_DEFAULTS: 131,072 and 2,048, IMAGE_TOKENS following the first). IMAGE_TOKENS is read by the engine, VIDEO_MAX_* by the server's video
         // processor, from the engine's settings: all reload the engine.
-        {L"Media tokens per request", L"IMAGE_TOKENS", "image_tokens", K::edit, T::engine, L"Empty: 16,384 (10 KiB RAM each)"},
-        {L"Video tokens at most", L"VIDEO_MAX_TOKENS", "video_max_tokens", K::edit, T::engine, L"Empty: the checkpoint's 12,288"},
-        {L"Video frames at most", L"VIDEO_MAX_FRAMES", "video_max_frames", K::edit, T::engine, L"Empty: the checkpoint's 768"},
+        {L"Media tokens per request", L"IMAGE_TOKENS", "image_tokens", K::edit, T::engine, L"Empty: follows video tokens"},
+        {L"Video tokens at most", L"VIDEO_MAX_TOKENS", "video_max_tokens", K::edit, T::engine, L"Empty: 131,072 (default)"},
+        {L"Video frames at most", L"VIDEO_MAX_FRAMES", "video_max_frames", K::edit, T::engine, L"Empty: 2,048 (default)"},
     };
 }
 

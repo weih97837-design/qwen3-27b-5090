@@ -892,15 +892,15 @@ const TIER_OPTS = [
   { key: "spill_fair_agents", label: "Fair agents", note: "SPILL_FAIR_AGENTS", help: "When RAM or the SSD is full, evict from the agent using the most of it (then superseded, never-reused, oldest first). Off: that order over everything.", kind: "flag" },
   { key: "spill_dir", label: "SSD folder", note: "SPILL_DIR", help: "Where spilled checkpoints are written. Empty: RAM only.", kind: "path" },
 ];
-// Images and videos (docs/configuration.md "Long videos"): empty is the engine's default. IMAGE_TOKENS is the engine's
+// Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's
 // (a pinned host table, so the plan changes); VIDEO_MAX_* are the server's. The defaults are launch.MEDIA_DEFAULTS.
 const MEDIA_OPTS = [
   { key: "image_tokens", label: "Media tokens", note: "IMAGE_TOKENS", max: 262144, unit: "tokens",
-    help: "Image and video tokens of one request, at most; more gets HTTP 400. Pinned host RAM: 10 KiB per token, taken when the engine starts. Empty: 16,384, or the video tokens below when more." },
+    help: "Image and video tokens of one request, at most; more gets HTTP 400. Pinned host RAM: 10 KiB per token, taken when the engine starts. Empty: the video tokens below, or 16,384 when that is less (131,072 by default: 1.25 GiB)." },
   { key: "video_max_tokens", label: "Video tokens", note: "VIDEO_MAX_TOKENS", max: 262144, unit: "tokens",
-    help: "Tokens of one video at most (all its frames together, its pairs' time stamps aside); longer videos get smaller frames. While a video is encoded its resized frames take 6 KiB of host RAM per token. Empty: the checkpoint's 12,288." },
+    help: "Tokens of one video at most (all its frames together, its pairs' time stamps aside); longer videos get smaller frames. While a video is encoded its resized frames take 6 KiB of host RAM per token. Empty: 131,072 (the checkpoint's own is 12,288)." },
   { key: "video_max_frames", label: "Video frames", note: "VIDEO_MAX_FRAMES", max: 16384, unit: "frames",
-    help: "Frames sampled from a video at most (2 per second until then), and the most a request's num_frames may ask for. Empty: the checkpoint's 768." },
+    help: "Frames sampled from a video at most (2 per second until then), and the most a request's num_frames may ask for. Empty: 2,048 (the checkpoint's own is 768)." },
 ];
 const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
 const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : (v ? "on" : "off") : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
