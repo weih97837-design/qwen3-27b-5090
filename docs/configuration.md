@@ -25,7 +25,7 @@ What it takes for a setting to change depends on who reads it, and when:
 | Takes effect | Settings | Change it for now | Keep it |
 | --- | --- | --- | --- |
 | At once | `ENGINE_IDLE_UNLOAD_S` | Stats page, `POST /admin/engine/idle` | The file |
-| At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS` | `POST /admin/concurrency` | The file |
+| At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS`, `DECODE_SHARE` | `POST /admin/concurrency` (`DECODE_SHARE` also in the Stats page's start settings, 「預填時給解碼的時間比例」) | The file |
 | At once | `target_seqs` | `POST /admin/concurrency` | Cannot be kept: there is no variable (`MAX_SEQS` is the upper limit that can) |
 | When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB`, `IMAGE_TOKENS`, `VIDEO_MAX_TOKENS`, `VIDEO_MAX_FRAMES` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
 | When the server restarts | Everything else, such as `HOST`, `PORT`, `HF_HOME`, `ENGINE_AUTOSTART`, `MIN_KV_TOKENS`, `MAX_TOKENS_FIT`, `STATE_HOST_CACHE`, `PREFILL_CHUNK` | Not possible | The file |
@@ -277,9 +277,15 @@ three at their defaults. `tools/recommend_config.py` does the first for machines
 - Admin API (no authentication; Docker and the Windows package listen on 127.0.0.1 unless `HOST` says otherwise): `GET /admin/concurrency` returns the settings
   and the state (running, waiting, why requests wait, measured tok/s per number of running requests);
   `POST /admin/concurrency` changes `target_seqs` (1 to `MAX_SEQS`; lowering it does not stop running requests),
-  `min_seq_tps`, `admit_kv` and `kv_reserve`. Changes survive an engine restart, not a service restart.
+  `min_seq_tps`, `admit_kv`, `kv_reserve` and `decode_share` (0 to 10: seconds of decoding given to running requests per
+  second of prefill; higher keeps decoding from slowing during a prefill but makes long prompts prefill slower; NaN,
+  infinity, negative or above 10 are refused with 400). Changes survive an engine restart, not a service restart.
   Example: `curl -s -X POST localhost:46320/admin/concurrency -d '{"target_seqs": 4}'`.
-- `/metrics` (Prometheus): among others `q27:target_seqs`, `q27:admission_blocked{reason=...}`,
+  The answer (and `GET`) has the keys `target_seqs`, `engine_seqs`, `admit_kv`, `kv_reserve`, `min_seq_tps`, `decode_share`,
+  `rates`, `running`, `waiting` and `blocked`, e.g. `{"target_seqs": 4, "engine_seqs": 8, "admit_kv": true,
+  "kv_reserve": 4096, "min_seq_tps": 0.0, "decode_share": 1.5, "rates": {"1": 96.0}, "running": 1, "waiting": 0,
+  "blocked": null}`.
+- `/metrics` (Prometheus): among others `q27:target_seqs`, `q27:decode_share`, `q27:admission_blocked{reason=...}`,
   `q27:admission_waits_total{reason=...}`, `q27:cached_tokens_total`, `q27:reusable_tokens_total`.
 
 ## Stats page
