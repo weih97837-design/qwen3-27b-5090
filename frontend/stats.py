@@ -210,14 +210,14 @@ def slot_rows(seqs, n, target=None, last_lanes=None):
         held = lanes[i]
         if held is None:
             out.append({"lane": i, "state": "idle" if is_open else "closed", "open": is_open, "rid": None,
-                        "phase": None, "prompt": 0, "cached": 0, "out": 0, "tok_s": None, "age": 0.0})
+                        "phase": None, "prompt": 0, "cached": 0, "out": 0, "tok_s": None, "age": 0.0, "active": False})
             continue
         state, row = held
         decode_wall, out_n = row.get("decode_wall") or 0.0, row["out"]
         out.append({"lane": i, "state": state, "open": is_open, "rid": row["rid"], "phase": row["phase"],
                     "prompt": row["prompt"], "cached": row["cached"], "out": out_n,
                     "tok_s": (out_n - 1) / decode_wall if out_n > 1 and decode_wall > 0 else None,
-                    "age": row["age"]})
+                    "age": row["age"], "active": bool(row.get("active"))})
     return out
 
 

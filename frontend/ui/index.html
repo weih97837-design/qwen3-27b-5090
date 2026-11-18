@@ -46,7 +46,7 @@ h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
 .tile .label { color: var(--ink2); font-size: 12px; }
 .tile .value { font-size: 22px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
-.tile .note { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .meter { height: 6px; border-radius: 3px; background: var(--track); margin-top: 6px; overflow: hidden; }
 .meter > div { height: 100%; border-radius: 3px; background: var(--s1); }
 .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -153,6 +153,39 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .warnbox { border: 1px solid var(--warning); border-left-width: 4px; border-radius: 6px; padding: 6px 10px;
   color: var(--ink); background: var(--wash); font-size: 12px; overflow-wrap: anywhere; margin-top: 10px; }
 .warnbox b { font-weight: 600; }
+.slot.mini { padding: 6px 10px; gap: 0; }
+.slot.mini .head { justify-content: flex-start; gap: 6px 10px; flex-wrap: wrap; }
+.slot.mini .muted { font-size: 12px; }
+.opts > .k small { white-space: normal; }
+.kvt td.r { white-space: normal; overflow-wrap: anywhere; }
+.kvt td.mono { overflow-wrap: anywhere; }
+.opts { min-width: 0; }
+.opts > * { min-width: 0; }
+@media (max-width: 700px) {
+  .slots { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .slots > .slot:not(.mini), .slots > .empty { grid-column: 1 / -1; }
+  .slot.mini .lane { white-space: normal; }
+  .opts { grid-template-columns: minmax(0, 1fr); }
+  .opts > .k { white-space: normal; }
+  .opts [style*="font-size:11px"], .opts [style*="font-size: 11px"], .opts > .k small, .opt .n, .opt .muted, .log pre { font-size: 12px !important; }
+  .opts input[type="text"] { width: 100% !important; }
+  .opt { min-height: 40px; }
+  .opts input { height: 40px; font-size: 16px; }
+  .primary, .plain, .ctl button, .seg button, .cfgbtn { min-height: 40px; }
+  .ctl button { padding: 1px 14px; }
+  .seg button { padding: 2px 14px; }
+  label.chk { min-height: 32px; }
+  th { white-space: normal; }
+  th, td { padding: 4px 5px; }
+  td.r, th.r { white-space: normal; }
+  .log td.r, .log th.r, .log td.num { white-space: nowrap; }
+  .log th { white-space: nowrap; }
+  td, .mono { overflow-wrap: anywhere; }
+  .lo { display: none; }
+  .seq .preview { white-space: normal; overflow-wrap: anywhere; }
+  .seq .rid { overflow-wrap: anywhere; }
+  .tile .value { white-space: normal; overflow-wrap: anywhere; }
+}
 </style>
 </head>
 <body>
@@ -614,16 +647,16 @@ function logRow(e) {
     el("td", { class: "r", title: r.diverged_at != null ? `diverges from an earlier sequence at token ${r.diverged_at}` : "" },
       `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})` + (r.diverged_at != null ? " ≠" : "")),
     el("td", { class: "r" }, fmtTok(r.completion_tokens)),
-    el("td", { class: "r" }, fmtS(r.ttft)),
-    el("td", { class: "r" }, r.prefill_tps ? fmtRate(r.prefill_tps) : "–"),
+    el("td", { class: "r lo" }, fmtS(r.ttft)),
+    el("td", { class: "r lo" }, r.prefill_tps ? fmtRate(r.prefill_tps) : "–"),
     el("td", { class: "r" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
-    el("td", { class: "r" }, r.accept ? r.accept.toFixed(2) : "–"),
+    el("td", { class: "r lo" }, r.accept ? r.accept.toFixed(2) : "–"),
     el("td", { class: "r" }, fmtS(r.total)),
-    el("td", { class: "r", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
-    el("td", { class: "prev" }, m.preview || ""),
+    el("td", { class: "r lo", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
+    el("td", { class: "prev lo" }, m.preview || ""),
   ] : [el("td", { colspan: 10, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
-    el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
+    el("td", { class: "muted lo", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted lo" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
   tr.title = "click for details";
   tr.addEventListener("click", () => { state.open.has(e.n) ? state.open.delete(e.n) : state.open.add(e.n); drawLog(); });
   const out = [tr];
@@ -638,9 +671,9 @@ function drawLog() {
   const req = $("f-req").checked, sub = $("f-sub").checked, ev = $("f-ev").checked;
   const rows = state.log.filter((e) => e.kind === "done" ? req : e.kind === "submit" ? sub : ev).slice(-300).reverse();
   const tb = $("log"); tb.replaceChildren();
-  tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"), el("th", {}, "Agent"),
-    el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r" }, "TTFT"),
-    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", { class: "r" }, "Media"), el("th", {}, "Last user message")));
+  tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", { class: "lo" }, "Request"), el("th", { class: "lo" }, "Endpoint"), el("th", {}, "Agent"),
+    el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r lo" }, "TTFT"),
+    el("th", { class: "r lo" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r lo" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", { class: "r lo" }, "Media"), el("th", { class: "lo" }, "Last user message")));
   if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 15, class: "empty" }, "Nothing yet.")));
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
@@ -690,13 +723,18 @@ const PHASE_ZH = { prefill: "預填", decode: "解碼" };
 function slotTile(s, i) {
   const key = SLOT_STATE[s.state] ? s.state : "idle", [label, color] = SLOT_STATE[key];
   const idle = key === "idle", closed = key === "closed";
+  // A parked / admitted request that ran a step lately (batched decoding steps parked ones too) is working: 推論中.
+  const working = key === "running" || ((key === "parked" || key === "admitted") && s.active === true);
+  const [shownLabel, shownColor] = working ? SLOT_STATE.running : [label, color];
+  const lane = `Slot ${s.lane ?? i + 1}`;
+  if (idle || closed) return el("div", { class: "card slot mini " + key, title: closed ? "超過目前的同時處理上限，未開放" : "" },
+    el("div", { class: "head" }, el("span", { class: "dot", style: `background:var(${color})` }), el("span", { class: "lane" }, lane), el("span", { class: "muted" }, label)));
   const head = el("div", { class: "head" },
-    el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${color})` }), label),
-    el("span", { class: "lane" }, `Slot ${s.lane ?? i + 1}`));
-  if (closed) return el("div", { class: "card slot closed" }, head, el("div", { class: "muted", style: "font-size:12px" }, "超過目前的同時處理上限，未開放"));
+    el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${shownColor})` }), shownLabel),
+    el("span", { class: "lane" }, lane));
   const prompt = s.prompt, cached = s.cached;
   const pct = prompt && cached != null ? fmtPct(Math.min(cached, prompt) / prompt) : "–";
-  return el("div", { class: "card slot" + (idle ? " idle" : "") },
+  return el("div", { class: "card slot" },
     head,
     el("div", { class: "rid mono trunc", title: s.rid || "" }, s.rid || "–"),
     el("div", { class: "kv" },
@@ -804,7 +842,7 @@ function drawDeploy() {
   if (deployOk && d.settings && typeof d.settings === "object") {
     const s = d.settings;
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
-      el("table", {}, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
+      el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
           el("td", { class: "r", style: "overflow-wrap:anywhere" }, fmtSetting(s[k])))))));
   }
@@ -847,11 +885,11 @@ function drawAgents() {
   $("agents-sum").textContent = `${rows.length} agent${rows.length === 1 ? "" : "s"}`;
   const tb = $("agents"); tb.replaceChildren();
   tb.append(el("tr", {}, el("th", {}, "Agent"), el("th", { class: "r" }, "Running"), el("th", { class: "r" }, "Waiting"),
-    el("th", { class: "r" }, "Requests"), el("th", { class: "r" }, "Prompt tokens"), el("th", { class: "r" }, "Cached (hit)"),
+    el("th", { class: "r lo" }, "Requests"), el("th", { class: "r lo" }, "Prompt tokens"), el("th", { class: "r" }, "Cached (hit)"),
     el("th", { class: "r" }, "RAM"), el("th", { class: "r" }, "SSD")));
   for (const a of rows) tb.append(el("tr", {}, el("td", { style: "font-family:ui-monospace,monospace" }, a.agent),
-    el("td", { class: "r" }, String(a.running)), el("td", { class: "r" }, String(a.waiting)), el("td", { class: "r" }, String(a.requests)),
-    el("td", { class: "r" }, fmtTok(a.prompt_tokens)), el("td", { class: "r" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
+    el("td", { class: "r" }, String(a.running)), el("td", { class: "r" }, String(a.waiting)), el("td", { class: "r lo" }, String(a.requests)),
+    el("td", { class: "r lo" }, fmtTok(a.prompt_tokens)), el("td", { class: "r" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
     el("td", { class: "r" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
     el("td", { class: "r" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
 }
