@@ -54,7 +54,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
 ```
 
 - **成功判準**：結束碼 0，輸出含建議值（`KV_POOL_TOKENS`、`MAX_TOKENS`、`MAX_SEQS`、`KV_DTYPE`、`SPILL_*` 等）。偵測失敗時會印出註記，並保留 `compose.yaml` 的預設值（工具本身結束碼仍為 0）。
-- **審閱**：確認 `MAX_SEQS` 為 4、`KV_DTYPE` 為 `nvfp4`，以及 `KV_POOL_TOKENS` 與 `SPILL_RAM_GIB`、`SPILL_SSD_GIB` 符合你的記憶體與磁碟。
+- **審閱**：確認 `MAX_SEQS`（預設 8，GPU 放不下停放區時工具會建議較小值）、`KV_DTYPE` 為 `nvfp4`，以及 `KV_POOL_TOKENS`（`0` = 取 VRAM 預算剩下的全部，工具不再建議固定值）與 `SPILL_RAM_GIB`、`SPILL_SSD_GIB` 符合你的記憶體與磁碟。
 - **WSL 沒有 `%UserProfile%\.wslconfig` 時**：WSL2 預設只會看到約一半的主機 RAM（例如 96 GB 主機約 48 GB，**未驗證**：本 repo 無法在實機確認），因此建議的 `SPILL_RAM_GIB` 會較小。工具在 RAM 不足時會印出 `.wslconfig` 的 `memory=` 提示；依提示設定後執行 `wsl --shutdown`，再重新執行工具取得較大的建議值。
 - **寫入 `.env`（只在需要時）**：
 
@@ -65,7 +65,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
   - **成功判準**：`.env` 產生或更新，結束碼 0。若 `.env` 已存在，工具會先建立 `.env.bak`。
   - 只會更新工具管理的鍵：`KV_POOL_TOKENS`、`MAX_TOKENS`、`MAX_SEQS`、`KV_DTYPE`、`SPILL_RAM_GIB`、`SPILL_SSD_GIB`、`SPILL_DIR`、`SPILL_RAM_RETENTION_S`、`SPILL_TTL_DAYS`、`SPILL_TICK_S`。
   - **失敗時**：`--write` 失敗時結束碼為 1；檢查路徑與權限。
-- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=4`、`KV_POOL_TOKENS=524288`、`SPILL_RAM_GIB=64`、`SPILL_SSD_GIB=100` 等）。這是正常狀態，不是錯誤。
+- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=8`、`KV_POOL_TOKENS=0`、`SPILL_RAM_GIB=64`、`SPILL_SSD_GIB=100` 等）。這是正常狀態，不是錯誤。
 - **SSD 層所在磁碟的量測（第一次啟動後才能做）**：`kvcache` 是 Docker 具名磁碟區，位於 WSL 虛擬磁碟。取得其主機路徑後，用 `--spill-dir` 量測：
 
   ```bash
@@ -217,7 +217,7 @@ curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_'
 
 - **Base URL**：`http://127.0.0.1:46320/v1`，API key 可填任意值。
 - **模型名稱**：用下列指令查詢 `/v1/models` 回傳的名稱（預設 `qwen3.8-27b`）。
-- **並行**：用戶端同時送出的請求數最多為 `MAX_SEQS`（本 runbook 為 4）時可以並行執行；超過的請求排隊等候。
+- **並行**：用戶端同時送出的請求數最多為 `MAX_SEQS`（本 runbook 預設 8；7 個停放區約 190 MiB 各，未使用時借給 KV 快取）時可以並行執行；超過的請求排隊等候。
 
 ```bash
 curl -s http://127.0.0.1:46320/v1/models | python3 -m json.tool
@@ -295,5 +295,5 @@ README 也明確提醒這一點。
 | `/metrics` 沒有 `q27:tier_*` | 第 6.4 節的 `docker inspect` 指令 | `SPILL_RAM_GIB` 為 0 時分層關閉；確認 image 為本分支建置 |
 | SSD 層佔滿磁碟 | `docker volume inspect qwen3-27b-5090_kvcache --format '{{.Mountpoint}}'`；`curl -s .../metrics \| grep tier_ssd` | 引擎會自動刪除最舊的檔案（`SPILL_SSD_GIB` 上限、`SPILL_SSD_MIN_FREE_GIB` 保留）。要調整就改 `.env` 後 `scripts/serve.sh up` |
 | image 不是本分支本地建置的（例如拉到上游 image） | `docker image inspect local/qwen3-27b-5090-serve:tiered-kv-cache --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'` | 本地建置的 image 此欄位為空（README）。有值代表它不是本地建置：執行 `scripts/serve.sh up --build` |
-| 同時只有一個請求在跑 | `curl -s http://127.0.0.1:46320/admin/concurrency`（看 `target_seqs`） | 確認用戶端確實同時送出多個請求，且 `MAX_SEQS=4`（`target_seqs` 不會超過它） |
+| 同時只有一個請求在跑 | `curl -s http://127.0.0.1:46320/admin/concurrency`（看 `target_seqs`） | 確認用戶端確實同時送出多個請求，且 `MAX_SEQS` 夠大（預設 8；`target_seqs` 不會超過它） |
 | 生效的設定與預期不同 | `docker compose config`（解析後的 compose 設定）；`docker inspect ...`（容器實際環境） | `.env` 的值優先於 `compose.yaml` 預設值；shell 變數優先於 `.env`。修改後要 `up` 才會套用（`docker compose restart` 不會） |

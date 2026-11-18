@@ -31,11 +31,12 @@ GiB = 1 << 30
 # Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
 # unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
-# cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): a 512K-token KV pool, and
-# 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
+# cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): the largest KV pool the VRAM budget leaves
+# (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine about 590-600K tokens on an RTX 5090; the planner and the UI show the pool
+# the engine really got, from its cache_stats), and 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
 # Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
-ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "8", "KV_POOL_TOKENS": "524288",
+ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "8", "KV_POOL_TOKENS": "0",
                        "SPILL_RAM_GIB": "64", "SPILL_DIR": "/cache/kv"}
 # The tiered cache settings (docs/tiered-cache.md): key -> (variable, default, kind). They are start settings like the
 # rest: the engine process reads the engine's (SPILL_RAM_GIB, SPILL_PINNED_GIB, SPILL_ASYNC_*) and worker.TierPolicy
@@ -178,7 +179,7 @@ def env_settings():
     reserve = env("VRAM_RESERVE_GIB")
     return {**{k: parse_tier(k, env(v[0])) for k, v in TIER_SETTINGS.items()},
             **{k: parse_media(k, env(v[0])) for k, v in MEDIA_SETTINGS.items()}, "weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
-            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 4)), MAX_SEQS)),
+            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_reserve_gib": parse_reserve(reserve)}
 
 

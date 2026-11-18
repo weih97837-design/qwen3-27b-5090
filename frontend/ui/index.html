@@ -895,7 +895,7 @@ function drawDeploy() {
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
       el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
-          el("td", { class: "r" }, typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
+          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "auto (max)" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
   }
   body.replaceChildren(...kids);
 }

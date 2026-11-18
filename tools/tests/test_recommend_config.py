@@ -28,24 +28,26 @@ def detected(**overrides):
     return base
 
 
-def test_5090_wsl_vm_48_gib_recommends_full_pool_and_wslconfig_hint():
+def test_5090_wsl_vm_48_gib_recommends_auto_pool_and_wslconfig_hint():
     rec = rc.recommend(detected())
-    assert rec["env"]["KV_POOL_TOKENS"] == "524288"
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves (about 580K by this estimate)
+    assert "約 5" in rec["reasons"]["KV_POOL_TOKENS"]
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert rec["env"]["SPILL_RAM_GIB"] == "24"  # (48 - 8 - 4) * 0.75 = 27 -> 24
     assert len(rec["hints"]) == 1
     assert "memory=80GB" in rec["hints"][0]  # floor(96) - 16
     assert "SPILL_RAM_GIB 會是 48" in rec["hints"][0]  # spill at 80 GiB
-    assert rec["env"]["MAX_SEQS"] == "4"
+    assert rec["env"]["MAX_SEQS"] == "8"
     assert rec["env"]["KV_DTYPE"] == "nvfp4"
     assert rec["env"]["SPILL_RAM_RETENTION_S"] == "3600"
     assert rec["env"]["SPILL_TTL_DAYS"] == "7"
     assert rec["env"]["SPILL_TICK_S"] == "30"
 
 
-def test_96_gib_gpu_pool_capped_but_budget_is_real():
+def test_96_gib_gpu_pool_is_auto_and_budget_is_real():
     rec = rc.recommend(detected(vram_total_gib=96.0, vram_used_gib=0.5))
-    assert rec["env"]["KV_POOL_TOKENS"] == "524288"  # still capped at POOL_CAP_TOKENS
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"  # no cap: the engine takes what the budget leaves
+    assert rec["env"]["MAX_SEQS"] == "8"
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert "預算 94.00 GiB" in rec["reasons"]["KV_POOL_TOKENS"]  # 96 - 0.5 - 1.5 reserve
 
@@ -70,9 +72,21 @@ def test_spill_ram_is_clamped():
 
 def test_24_gib_gpu_lowers_pool_and_max_tokens_with_warning():
     rec = rc.recommend(detected(vram_total_gib=24.0, vram_used_gib=0.0))
-    assert rec["env"]["KV_POOL_TOKENS"] == "65536"  # 24 - 1.5 - 19.9 - 0.57 = 2.03 GiB -> 1 step
-    assert rec["env"]["MAX_TOKENS"] == "65536"
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"
+    # 24 - 1.5 - 19.9 = 2.6 GiB of pool (the parking areas are pages of it): about 152K tokens
+    assert rec["env"]["MAX_TOKENS"] == str(rc.kv_pool_tokens(24.0 - rc.VRAM_RESERVE_GIB - rc.NON_KV_GIB) // 1024 * 1024)
+    assert int(rec["env"]["MAX_TOKENS"]) < 262144
     assert any("262,144" in w for w in rec["warnings"])
+
+
+def test_max_seqs_drops_when_the_parking_areas_do_not_fit():
+    assert rc.max_seqs_that_fit(10.0) == 8
+    assert rc.max_seqs_that_fit(1.125 + 7 * rc.PARKING_AREA_GIB) == 8
+    assert rc.max_seqs_that_fit(1.125 + 4 * rc.PARKING_AREA_GIB) == 5
+    assert rc.max_seqs_that_fit(0.5) == 1
+    assert rc.max_seqs_that_fit(-3.0) == 1
+    assert rc.recommend(detected(vram_total_gib=16.0, vram_used_gib=0.0))["env"]["MAX_SEQS"] == "1"
+    assert 7 * rc.PARKING_AREA_GIB == pytest.approx(rc.PARKING_GIB)
 
 
 def test_budget_is_total_minus_used_minus_the_reserve():
@@ -81,9 +95,9 @@ def test_budget_is_total_minus_used_minus_the_reserve():
     assert rc.VRAM_RESERVE_GIB == 1.5
 
 
-def test_gpu_too_small_warns_and_never_emits_zero():
+def test_gpu_too_small_warns_and_never_emits_a_zero_context():
     rec = rc.recommend(detected(vram_total_gib=16.0, vram_used_gib=0.0))
-    assert rec["env"]["KV_POOL_TOKENS"] != "0"
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"  # auto, whatever the estimate
     assert rec["env"]["MAX_TOKENS"] != "0"
     assert any("GPU 可用 VRAM 不足" in w for w in rec["warnings"])
 
@@ -100,7 +114,8 @@ def test_unknown_gpu_ram_disk_fall_back_to_compose_defaults_without_crashing():
         notes=["GPU 未偵測"],
     )
     rec = rc.recommend(d)
-    assert rec["env"]["KV_POOL_TOKENS"] == "524288"
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"
+    assert rec["env"]["MAX_SEQS"] == "8"
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert rec["env"]["SPILL_RAM_GIB"] == "64"
     assert rec["env"]["SPILL_SSD_GIB"] == "100"
@@ -135,7 +150,7 @@ def test_write_keeps_unrelated_lines_and_comments_and_makes_bak(tmp_path):
     original = (
         "# my settings\n"
         "HOST=0.0.0.0\n"
-        "KV_POOL_TOKENS=0   # old\n"
+        "KV_POOL_TOKENS=524288   # old\n"
         "#MAX_TOKENS=1\n"
         "\n"
         "SPILL_RAM_GIB = 16\n"
@@ -155,7 +170,7 @@ def test_write_keeps_unrelated_lines_and_comments_and_makes_bak(tmp_path):
     assert "HOST=0.0.0.0" in lines
     assert "PORT=8080" in lines
     assert "#MAX_TOKENS=1" in lines
-    assert "KV_POOL_TOKENS=524288" in lines  # replaced; the old inline comment is dropped with the line
+    assert "KV_POOL_TOKENS=0" in lines  # replaced; the old inline comment is dropped with the line
     assert "SPILL_RAM_GIB=24" in lines
     assert "MAX_TOKENS=262144" in lines  # missing key appended
     assert "SPILL_SSD_MIN_FREE_GIB=10" not in text  # not a managed key
@@ -214,7 +229,7 @@ def test_main_runs_without_gpu_and_exits_zero(monkeypatch, capsys, tmp_path):
     assert rc.main(["--spill-dir", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert "== .env 區塊 ==" in out
-    assert "KV_POOL_TOKENS=524288" in out
+    assert "KV_POOL_TOKENS=0" in out
 
 
 def test_main_json_output_is_json_only(monkeypatch, capsys, tmp_path):
@@ -224,7 +239,7 @@ def test_main_json_output_is_json_only(monkeypatch, capsys, tmp_path):
     monkeypatch.delenv("SPILL_DIR", raising=False)
     assert rc.main(["--json", "--spill-dir", str(tmp_path)]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["recommendation"]["env"]["MAX_SEQS"] == "4"
+    assert data["recommendation"]["env"]["MAX_SEQS"] == "8"
 
 
 def test_video_max_tokens_follows_the_ram():
