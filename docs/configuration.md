@@ -27,7 +27,7 @@ What it takes for a setting to change depends on who reads it, and when:
 | At once | `ENGINE_IDLE_UNLOAD_S` | Stats page, `POST /admin/engine/idle` | The file |
 | At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS` | `POST /admin/concurrency` | The file |
 | At once | `target_seqs` | `POST /admin/concurrency` | Cannot be kept: there is no variable (`MAX_SEQS` is the upper limit that can) |
-| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
+| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB`, `IMAGE_TOKENS`, `VIDEO_MAX_TOKENS`, `VIDEO_MAX_FRAMES` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
 | When the server restarts | Everything else, such as `HOST`, `PORT`, `HF_HOME`, `ENGINE_AUTOSTART`, `MIN_KV_TOKENS`, `MAX_TOKENS_FIT`, `STATE_HOST_CACHE`, `PREFILL_CHUNK` | Not possible | The file |
 
 - Restarting the engine reloads the weights, fails the requests in flight and empties the prefix cache. Restarting the
@@ -176,6 +176,11 @@ a request:
 ```bash
 VIDEO_MAX_TOKENS=131072 VIDEO_MAX_FRAMES=2048 docker compose up -d serve
 ```
+
+The same three are start settings of the stats page (`image_tokens`, `video_max_tokens`, `video_max_frames`, under
+"Images and video") and rows of the tray's Settings window; empty means the defaults above. The defaults are in one
+place, `MEDIA_DEFAULTS` in `frontend/launch.py` (all empty, the upstream's), and the video settings are read by the
+server's own processor from the settings of the engine that is running, so a restart with changed values applies them.
 
 Or per request, within `IMAGE_TOKENS` and `VIDEO_MAX_FRAMES`:
 `"mm_processor_kwargs": {"fps": 2, "max_frames": 2048, "size": {"longest_edge": 268435456}}`
@@ -349,6 +354,9 @@ variables:
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
 | `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.5 GiB) or a number of GiB from 0 up to the device's memory |
+| `image_tokens` | `IMAGE_TOKENS` | `null` (16,384, or `video_max_tokens` when that is more) or 1 to 262,144: image and video tokens of one request. Pinned host memory, 10 KiB per token, allocated when the engine starts (it changes the plan's host memory) |
+| `video_max_tokens` | `VIDEO_MAX_TOKENS` | `null` (the checkpoint's 12,288) or 1 to 262,144: tokens of one video. The server's own bound: no pool changes. While a video is encoded its resized frames take 6 KiB of host memory per token |
+| `video_max_frames` | `VIDEO_MAX_FRAMES` | `null` (the checkpoint's 768) or 2 to 16,384: frames sampled from a video, and the most a request may ask for |
 | `spill_ram_gib` | `SPILL_RAM_GIB` | A number of GiB, 0 or more (64 by default; 0: no tiered cache) |
 | `spill_ram_retention_s` | `SPILL_RAM_RETENTION_S` | Seconds, 0 or more (3600) |
 | `spill_ssd_gib` | `SPILL_SSD_GIB` | GiB, 0 or more (100) |
@@ -506,6 +514,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
+| Images and videos | `IMAGE_TOKENS`, `VIDEO_MAX_TOKENS`, `VIDEO_MAX_FRAMES` (empty: the default) | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Tiered cache | `SPILL_RAM_GIB`, `SPILL_RAM_RETENTION_S`, `SPILL_SSD_GIB`, `SPILL_SSD_MIN_FREE_GIB`, `SPILL_SSD_MIN_TOKENS`, `SPILL_TTL_DAYS`, `VRAM_BACKUP_IDLE_S`, `SPILL_PINNED_GIB`, `SPILL_ASYNC_IO`, `SPILL_ASYNC_PROMOTE`, `SPILL_FAIR_AGENTS`, `SPILL_DIR` | Reloads the engine if it is loaded; otherwise the next load uses them |
 | Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_RESERVE_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |

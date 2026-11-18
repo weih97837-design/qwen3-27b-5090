@@ -429,15 +429,15 @@ def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
 
 
 def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
-    """IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when more; set, it stays."""
-    env = {}
+    """IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when more; set, it stays (image_tokens_env, which
+    Launch.config puts in the engine's environment: set_engine_env leaves the setting empty, so that a changed video
+    setting moves it too)."""
+    for video, image, want in ((None, None, 16384), (8192, None, 16384), (131072, None, 131072), (131072, 20000, 20000)):
+        assert launch.image_tokens_env({"image_tokens": image, "video_max_tokens": video}) == want
+    env = {"IMAGE_TOKENS": "", "VIDEO_MAX_TOKENS": "131072"}
     monkeypatch.setattr(os, "environ", env)  # (set_engine_env also sets the engine's defaults)
-    for video, image, want in ((None, None, "16384"), ("8192", "", "16384"), ("131072", "", "131072"),
-                               ("131072", "20000", "20000")):
-        env.clear()
-        env.update({k: v for k, v in (("VIDEO_MAX_TOKENS", video), ("IMAGE_TOKENS", image)) if v is not None})
-        launch.set_engine_env(tmp_path)
-        assert env["IMAGE_TOKENS"] == want
+    launch.set_engine_env(tmp_path)
+    assert env["IMAGE_TOKENS"] == "" and launch.env_settings()["image_tokens"] is None
     for bad in ("0", "-1", "1e5", "x"):
         env["VIDEO_MAX_FRAMES"] = bad
         with pytest.raises(ValueError):
