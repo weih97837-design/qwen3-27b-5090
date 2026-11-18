@@ -458,8 +458,8 @@ def test_the_log_record_has_the_media_in_its_meta():
 def test_the_log_table_has_a_media_column():
     html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
     assert 'el("th", { class: "r lo" }, "媒體")' in html and "fmtMedia(m.media)" in html
-    # the event rows span the table: 15 columns (Time, Result, Request, Endpoint, Agent, eight figures, Media, Last user message)
-    assert html.count('colspan: 15') == 2 and 'colspan: 10, class: "prev"' in html
+    # the event rows span the table: 16 columns (Time, Result, Request, Endpoint, Agent, Machine, eight figures, Media, Last user message)
+    assert html.count('colspan: 16') == 2 and 'colspan: 10, class: "prev"' in html
 
 
 # ------------------------------------------------------------ active (stepping now) flag
@@ -504,3 +504,13 @@ def test_slot_rows_pass_active_and_keep_lanes():
     rows2 = [("parked", 1, dict(row("b"), active=False)), ("running", None, dict(row("a", out=2, decode_wall=1.0), active=True))]
     out2 = stats.slot_rows(rows2, 4, last_lanes=memory)
     assert [(r["lane"], r["rid"], r["active"]) for r in out2 if r["rid"]] == [(1, "a", True), (2, "b", False)]
+
+
+def test_the_page_has_the_clients_panel_and_log_column():
+    html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
+    assert 'id="clients-sec"' in html and "<h2 style=\"margin:0\">機器</h2>" in html and "drawClients()" in html
+    for label in ("機器", "執行中", "等待中", "請求數", "輸入 token", "快取命中", "輸出 token", "平均排隊時間", "錯誤", "最後出現"):
+        assert f'"{label}"' in html
+    assert "台機器" in html and "目前沒有機器紀錄。" in html and "取消 " in html and "waiting_tokens" in html
+    # the Log has the Machine column (after Agent) and the record's client
+    assert 'el("th", { class: "lo" }, "機器")' in html and "r.client || m.client_name" in html

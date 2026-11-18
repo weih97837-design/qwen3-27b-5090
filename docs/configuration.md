@@ -463,6 +463,8 @@ labelled series `q27:client_requests_total{client="PC-A"}`, `q27:client_running`
 `q27:client_media_tokens_total`, `q27:client_errors_total`, `q27:client_cancelled_total`, `q27:client_queue_wait_seconds_total`
 and `q27:client_queue_wait_count` (the average wait is their ratio). Docker: `CLIENT_NAMES` in `compose.yaml`.
 
+The stats page (`/ui`) shows this as a **機器** (Machines) table right after the Agents table (running, waiting and the queued prompt tokens, requests, prompt and cached tokens with the hit ratio, output tokens, average queue wait, errors and cancelled, last seen; it is hidden when the server sends no `clients`), and the Log has a 機器 column with the record's `client`.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from

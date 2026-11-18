@@ -120,6 +120,7 @@ print(json.load(urllib.request.urlopen(req))["choices"][0]["message"]["content"]
 
 多台機器共用同一台伺服器時，伺服器會依來源機器計數（統計頁 JSON 的 `clients`、`/metrics` 的 `q27:client_*`），讓使用者看到誰在用。**只計數，不限制**：伺服器沒有 API key、沒有並行或速率上限、不會回 429，排隊順序也不變。
 
+- 統計頁（`/ui`）的「機器」表會列出每台機器的執行中／等待中請求、token、快取命中、平均排隊時間與最後出現時間，Log 表也有「機器」欄。
 - 每個請求都送 `X-Client-Id: <機器名稱>`（例如 `PC-A`；最長 64 字元，允許 `A-Za-z0-9._/-`）。沒送時伺服器改用來源 IP（或 `CLIENT_NAMES` 對照的名稱），但 IP 可能變動，建議一律送標頭。OpenAI SDK：`default_headers={"X-Client-Id": "PC-A", "X-Agent-Id": "reviewer/pr-1842"}`。
 - 限制是**用戶端自己的責任**（使用者決定在各機器的代理程式內限制並行）。建議每台機器的同時進行請求數不超過伺服器的並行槽數（統計頁的 slots；設定 `MAX_SEQS`），超過的請求在伺服器端只是排隊，不會被拒絕，但會讓延遲變長，也會擠到其他機器。
 - 伺服器的語意是「排隊、不拒絕」：不要因為等得久就逾時重送（重送會多佔一個排隊位置，也浪費 prefill）。請求逾時設定放寬（長提示詞 prefill 期間伺服器送 `: keep-alive`），並用串流。
