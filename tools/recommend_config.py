@@ -47,7 +47,7 @@ PARKING_AREA_GIB = 0.19  # one parking area (about 190 MiB); MAX_SEQS = n has n 
 PARKING_GIB = 7 * PARKING_AREA_GIB  # 7 parking areas for MAX_SEQS = 8: about 1.33 GiB
 KV_BYTES_PER_TOKEN = 18432  # 18 KiB, NVFP4 KV
 POOL_STEP_TOKENS = 1024  # estimates are rounded down to this many tokens
-# (no cap: KV_POOL_TOKENS=0 gives the pool the VRAM budget leaves, with the parking areas lent to it; about 620-630K tokens
+# (no cap: KV_POOL_TOKENS=0 gives the pool the VRAM budget leaves, with the parking areas lent to it; an estimated 600K+ tokens
 # on an RTX 5090 with MAX_SEQS 8 and DSpine)
 FULL_CONTEXT_TOKENS = 262144  # MAX_TOKENS when the pool holds it
 POOL_FLOOR_TOKENS = 1024  # never emit 0 for MAX_TOKENS (the pool estimate is floored to this; KV_POOL_TOKENS=0 is the deliberate "auto")
@@ -351,7 +351,7 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
         reasons["KV_POOL_TOKENS"] = (
             f"{detected.get('gpu_name') or 'GPU'}：預算 {budget:.2f} GiB"
             + f"（可用 VRAM 扣除保留 {VRAM_RESERVE_GIB} GiB），0 = 引擎取預算剩下的全部；扣除非 KV {NON_KV_GIB} 後"
-            + f"估計約 {pool:,} tokens（停放區借用其中的頁面）。"
+            + f"預估約 {pool:,} tokens（僅為估計，引擎實際的池可能大約多 2%；停放區借用其中的頁面）。"
         )
         reasons["MAX_SEQS"] = (
             f"{seqs} 個並行請求，{seqs - 1} 個停放區（每個約 {PARKING_AREA_GIB * 1024:.0f} MiB，未使用時借給 KV 快取）；"

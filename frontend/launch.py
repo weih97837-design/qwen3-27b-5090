@@ -32,7 +32,7 @@ GiB = 1 << 30
 # unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
 # cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): the largest KV pool the VRAM budget leaves
-# (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine about 620-630K tokens on an RTX 5090; the planner and the UI show the pool
+# (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine an estimated 600K+ tokens on an RTX 5090, not measured; the planner and the UI show the pool
 # the engine really got, from its cache_stats), and 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
 # Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.

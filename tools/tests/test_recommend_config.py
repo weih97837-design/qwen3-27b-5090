@@ -31,7 +31,7 @@ def detected(**overrides):
 def test_5090_wsl_vm_48_gib_recommends_auto_pool_and_wslconfig_hint():
     rec = rc.recommend(detected())
     assert rec["env"]["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves (about 608K by this estimate)
-    assert "約 608,256" in rec["reasons"]["KV_POOL_TOKENS"]
+    assert "預估約 608,256" in rec["reasons"]["KV_POOL_TOKENS"]
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert rec["env"]["SPILL_RAM_GIB"] == "24"  # (48 - 8 - 4) * 0.75 = 27 -> 24
     assert len(rec["hints"]) == 1
@@ -73,7 +73,7 @@ def test_spill_ram_is_clamped():
 def test_24_gib_gpu_lowers_pool_and_max_tokens_with_warning():
     rec = rc.recommend(detected(vram_total_gib=24.0, vram_used_gib=0.0))
     assert rec["env"]["KV_POOL_TOKENS"] == "0"
-    # 24 - 1.5 - 19.9 = 2.6 GiB of pool (the parking areas are pages of it): about 152K tokens
+    # 24 - 1.0 - 19.9 = 3.1 GiB of pool (the parking areas are pages of it): about 180K tokens
     assert rec["env"]["MAX_TOKENS"] == str(rc.kv_pool_tokens(24.0 - rc.VRAM_RESERVE_GIB - rc.NON_KV_GIB) // 1024 * 1024)
     assert int(rec["env"]["MAX_TOKENS"]) < 262144
     assert any("262,144" in w for w in rec["warnings"])

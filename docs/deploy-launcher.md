@@ -159,7 +159,7 @@ SPILL_RAM_RETENTION_S=3600
 SPILL_TTL_DAYS=7
 ```
 
-- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：KV 池取 VRAM 預算剩下的最大值（`KV_POOL_TOKENS=0`，RTX 5090 搭配 `MAX_SEQS=8`、DSpine 約 620–630K tokens；實際大小看統計頁，設定列顯示為 auto (max)）、同時最多 8 個請求（`MAX_SEQS=8`；7 個停放區各約 190 MiB，未使用時借給 KV 快取，`target_seqs` 預設等於它，要較少請在 /ui 設定）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`；`settings.ini` 或托盤明確設定的 `MAX_SEQS`、`KV_POOL_TOKENS` 會覆蓋這些預設值（上方範例的 `0` 與 `8` 即預設值，寫出來只是為了說明；要固定 512K 池請寫 `KV_POOL_TOKENS=524288`）。
+- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：KV 池取 VRAM 預算剩下的最大值（`KV_POOL_TOKENS=0`，預估約 60 萬 token 以上（實際大小以啟動 log 或監控頁為準），設定列顯示為 auto (max)）、同時最多 8 個請求（`MAX_SEQS=8`；7 個停放區各約 190 MiB，未使用時借給 KV 快取，`target_seqs` 預設等於它，要較少請在 /ui 設定）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`；`settings.ini` 或托盤明確設定的 `MAX_SEQS`、`KV_POOL_TOKENS` 會覆蓋這些預設值（上方範例的 `0` 與 `8` 即預設值，寫出來只是為了說明；要固定 512K 池請寫 `KV_POOL_TOKENS=524288`）。
 - **生效方式**：視窗沒有欄位的 `[env]` 變數，變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
