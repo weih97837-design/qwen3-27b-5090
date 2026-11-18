@@ -150,8 +150,8 @@
 
 ```ini
 [env]
-KV_POOL_TOKENS=524288
-MAX_SEQS=4
+KV_POOL_TOKENS=0
+MAX_SEQS=8
 SPILL_RAM_GIB=64
 SPILL_SSD_GIB=100
 SPILL_DIR=D:\kvcache
@@ -159,7 +159,7 @@ SPILL_RAM_RETENTION_S=3600
 SPILL_TTL_DAYS=7
 ```
 
-- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
+- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：KV 池取 VRAM 預算剩下的最大值（`KV_POOL_TOKENS=0`，RTX 5090 搭配 `MAX_SEQS=8`、DSpine 約 590–600K tokens；實際大小看統計頁，設定列顯示為 auto (max)）、同時最多 8 個請求（`MAX_SEQS=8`；7 個停放區各約 190 MiB，未使用時借給 KV 快取，`target_seqs` 預設等於它，要較少請在 /ui 設定）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`；`settings.ini` 或托盤明確設定的 `MAX_SEQS`、`KV_POOL_TOKENS` 會覆蓋這些預設值（上方範例的 `0` 與 `8` 即預設值，寫出來只是為了說明；要固定 512K 池請寫 `KV_POOL_TOKENS=524288`）。
 - **生效方式**：視窗沒有欄位的 `[env]` 變數，變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
@@ -236,7 +236,7 @@ SPILL_TTL_DAYS=7
 
 1. **確認伺服器就緒**：在 /ui 頁面看到引擎狀態為可用（托盤提示為 `Ready`，或 `Waiting: the first request loads the model`）。
 2. **用戶端設定**：Base URL 設為 `http://127.0.0.1:46320/v1`，API key 填任意值，模型名稱用 `http://127.0.0.1:46320/v1/models` 查到的名稱（預設 `qwen3.8-27b`）。
-3. **並行**：用戶端同時送出的請求數最多為 **Requests at once**（`MAX_SEQS`，預設 4）時可並行執行；超過的請求排隊等候。
+3. **並行**：用戶端同時送出的請求數最多為 **Requests at once**（`MAX_SEQS`，預設 8）時可並行執行；超過的請求排隊等候。
 4. **確認**：送出一則請求得到回應；在 /ui 頁面可以看到請求的進行。
 
 ---

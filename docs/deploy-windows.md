@@ -110,7 +110,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 
 | 名稱 | 預設 | 說明 |
 | --- | --- | --- |
-| `KV_POOL_TOKENS` | `524288` | GPU 上的 KV 池（token 數，512K） |
+| `KV_POOL_TOKENS` | `0` | GPU 上的 KV 池（token 數）。`0` = 最大：VRAM 預算剩下的全部（RTX 5090 約 590–600K）；明確設定的數字會覆蓋 |
 | `SPILL_RAM_GIB` | `64` | 被逐出的 checkpoint 放在主機 RAM 的上限（GiB）；`0` 關閉分層 |
 | `SPILL_DIR` | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` | SSD 層的資料夾 |
 | `SPILL_SSD_GIB` | `100` | SSD 層的上限（GiB），超過時刪除最舊的檔案 |

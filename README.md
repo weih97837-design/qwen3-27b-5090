@@ -269,7 +269,8 @@ to change it. The most useful ones:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TOKENS` | 262144 | Context limit of one request |
-| `MAX_SEQS` | 4 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
+| `MAX_SEQS` | 8 | Requests that can run at once (1–8, the engine's maximum); how many actually run is decided while running, from the free KV cache (`target_seqs` in /ui sets fewer). 7 parking areas of about 190 MiB, lent to the KV cache while unused |
+| `KV_POOL_TOKENS` | 0 | KV pool in tokens: 0 is the maximum, what the VRAM budget leaves (about 590–600K on an RTX 5090 with `MAX_SEQS=8`; the stats page shows the pool the engine got). A number fixes it (e.g. 524288) |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
 | `SPEC` | `dspine` | `dspine`, `dflash2` or `none` |

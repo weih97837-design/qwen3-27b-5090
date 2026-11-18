@@ -1,6 +1,6 @@
 # 分層 KV 快取（VRAM → RAM → SSD）
 
-長上下文的代理（agent）對話會佔用大量 KV 快取。GPU 上的 KV 池（`KV_POOL_TOKENS`，預設 512K tokens）裝不下所有對話時，
+長上下文的代理（agent）對話會佔用大量 KV 快取。GPU 上的 KV 池（`KV_POOL_TOKENS`，預設 `0` = VRAM 預算剩下的最大值，RTX 5090 約 590–600K tokens）裝不下所有對話時，
 引擎會把被逐出的 checkpoint 存到主機 RAM 和 SSD，而不是直接丟棄。之後同一段對話再來時，從較深的 checkpoint 還原，
 不必重算整段前綴。
 
@@ -61,8 +61,8 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 
 | 變數 | 預設 | 說明 |
 | --- | --- | --- |
-| `KV_POOL_TOKENS` | `524288`（512K） | GPU 上的 KV 池大小（tokens）。`0` 表示使用 VRAM 預算剩下的全部空間 |
-| `MAX_SEQS` | `4` | 同時執行的請求數上限 |
+| `KV_POOL_TOKENS` | `0`（最大） | GPU 上的 KV 池大小（tokens）。`0`（預設）表示使用 VRAM 預算剩下的全部空間（RTX 5090、`MAX_SEQS=8`、DSpine 約 590–600K；實際大小看統計頁）；填數字（例如 `524288` = 512K）則固定大小，並覆蓋預設 |
+| `MAX_SEQS` | `8` | 同時執行的請求數上限（引擎最大值）。7 個停放區各約 190 MiB，未使用時借給 KV 快取；`STATE_HOST_CACHE` 的 8 GiB 檢查點槽不變；`target_seqs` 預設等於它（每個請求變慢、總吞吐量上升，要較少請在 /ui 設定） |
 | `SPILL_RAM_GIB` | `64` | 主機 RAM 中保存被逐出 checkpoint 的容量（GiB）。`0` 表示關閉分層 |
 | `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache`。底下有 `entries/`（manifest）與 `chunks/`（共用的 chunk 檔） |
 | `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後才寫入 SSD |
@@ -85,7 +85,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 一個 256K tokens 的代理：KV 約 4.5 GiB + 狀態約 0.19 GiB，合計約 4.7 GiB。
 - 32 GiB RAM 約可保存 6 個代理。
 - 100 GiB SSD 約可保存 21 個代理。
-- 512K 的 KV 池約佔 9 GiB VRAM。
+- 約 590–600K 的 KV 池（預設）約佔 10 GiB VRAM（512K 約 9 GiB；每 1 GiB 約 58K tokens）。
 
 ## RAM 層去重（預設開啟，`SPILL_DEDUP=0` 關閉）
 
