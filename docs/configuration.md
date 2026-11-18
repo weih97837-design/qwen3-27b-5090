@@ -180,7 +180,7 @@ VIDEO_MAX_TOKENS=12288 VIDEO_MAX_FRAMES=768 docker compose up -d serve
 
 The defaults are in one place, `MEDIA_DEFAULTS` in `frontend/launch.py` (`compose.yaml`, `settings.example.ini` and
 these tables say the same; `frontend/tests/test_launch.py` compares them). The same three are start settings of the
-stats page (`image_tokens`, `video_max_tokens`, `video_max_frames`, under "Images and video") and rows of the tray's
+stats page (`image_tokens`, `video_max_tokens`, `video_max_frames`, under "影片與圖片") and rows of the tray's
 Settings window; empty means the defaults. The server's own processor reads `VIDEO_MAX_*` from the settings of the
 engine that is running, so a restart with changed values applies them.
 
@@ -321,9 +321,9 @@ a request and does not keep the engine loaded.
 - `ENGINE_AUTOSTART=0` starts the server in this unloaded state: no VRAM in use until the first request.
 - A stop from the stats page or `POST /admin/engine` stays until a start from there: requests get 503, as without this
   setting.
-- The stats page tells these states apart (`engine unloaded`: the first request loads it; `engine stopped`: requests get
+- The stats page tells these states apart ("引擎已卸載": the first request loads it; "引擎已停止": requests get
   503 until a start), shows the time left before an unload and why a load was refused, and changes the time under
-  **Unload when idle** in the start settings. From a script:
+  **閒置時卸載** in the start settings. From a script:
   `curl -s -X POST localhost:46320/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
   (0: off). It applies at once, the time running from then, and lasts until the service restarts.
 
@@ -356,7 +356,7 @@ work, unload the engine (the stats page, `POST /admin/engine`, or `ENGINE_IDLE_U
 ### Start settings
 
 The page's header shows the running engine's start settings (with the engine stopped, the next start's); clicking
-them opens "Start settings", which choose what the next start or restart of the engine uses, in place of these
+them opens "啟動設定" (Start settings), which choose what the next start or restart of the engine uses, in place of these
 variables:
 
 | Setting | Variable | Values |
@@ -386,7 +386,7 @@ variables:
 
 The tiered cache settings ("分層快取" in the page, and a group of the tray app's settings window) have no upper limit, since
 the machine decides what fits: the page only warns when the RAM tier is more than the machine's RAM. The engine process
-and `TierPolicy` read them when the engine loads, so they apply with a restart of the engine (the page's **Restart**,
+and `TierPolicy` read them when the engine loads, so they apply with a restart of the engine (the page's **重新啟動**,
 the tray's **Apply**); the other tier variables (`SPILL_TICK_S`, `SPILL_FLUSH_ON_STOP_S`, `SPILL_PINNED_SLAB_MIB`) stay
 variables. The environment (or `settings.ini` `[env]`) still gives the values the server starts with.
 
