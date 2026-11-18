@@ -154,9 +154,9 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .warnbox { border: 1px solid var(--warning); border-left-width: 4px; border-radius: 6px; padding: 6px 10px;
   color: var(--ink); background: var(--wash); font-size: 12px; overflow-wrap: anywhere; margin-top: 10px; }
 .warnbox b { font-weight: 600; }
-.slot.mini { padding: 6px 10px; gap: 0; }
-.slot.mini .head { justify-content: flex-start; gap: 6px 10px; flex-wrap: wrap; }
-.slot.mini .muted { font-size: 12px; }
+.slot { min-height: 232px; }
+.slot .speed { min-height: 30px; }
+.slot .speed small { margin-left: 0; display: block; font-size: 12px; font-weight: 400; min-height: 16px; }
 .opts > .k small { white-space: normal; }
 .kvt td.r { white-space: normal; overflow-wrap: anywhere; }
 .kvt td.mono { overflow-wrap: anywhere; }
@@ -164,8 +164,8 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .opts > * { min-width: 0; }
 @media (max-width: 700px) {
   .slots { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .slots > .slot:not(.mini), .slots > .empty { grid-column: 1 / -1; }
-  .slot.mini .lane { white-space: normal; }
+  .slots > .empty { grid-column: 1 / -1; }
+  .slot { min-height: 0; }
   .opts { grid-template-columns: minmax(0, 1fr); }
   .opts > .k { white-space: normal; }
   .opts [style*="font-size:11px"], .opts [style*="font-size: 11px"], .opts > .k small, .opt .n, .opt .muted, .log pre { font-size: 12px !important; }
@@ -817,8 +817,9 @@ const PHASE_ZH = { prefill: "預填", decode: "解碼" };
 function speedBlock(s) {
   const live = s.tok_s_now > 0;
   return el("div", { class: "speed num" }, live ? fmtRate(s.tok_s_now) : s.tok_s == null ? "–" : fmtRate(s.tok_s),
-    el("span", {}, live ? "tok/s 生成速度（即時）" : "tok/s 生成速度"),
-    live && s.tok_s != null ? el("small", {}, "平均 " + fmtRate(s.tok_s)) : null);
+    el("span", {}, "tok/s"),
+    // second line always present so the card keeps its height: label "tok/s 生成速度（即時）" with the average beside it
+    el("small", {}, live ? "tok/s 生成速度（即時）" + (s.tok_s != null ? " · " + "平均 " + fmtRate(s.tok_s) : "") : "生成速度"));
 }
 function slotTile(s, i) {
   const key = SLOT_STATE[s.state] ? s.state : "idle", [label, color] = SLOT_STATE[key];
@@ -827,14 +828,13 @@ function slotTile(s, i) {
   const working = key === "running" || ((key === "parked" || key === "admitted") && s.active === true);
   const [shownLabel, shownColor] = working ? SLOT_STATE.running : [label, color];
   const lane = `Slot ${s.lane ?? i + 1}`;
-  if (idle || closed) return el("div", { class: "card slot mini " + key, title: closed ? "超過目前的同時處理上限，未開放" : "" },
-    el("div", { class: "head" }, el("span", { class: "dot", style: `background:var(${color})` }), el("span", { class: "lane" }, lane), el("span", { class: "muted" }, label)));
+  const dim = idle || closed;  // same card layout in every state (no jumping sizes); idle / closed are dimmed with dashes
   const head = el("div", { class: "head" },
     el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${shownColor})` }), shownLabel),
     el("span", { class: "lane" }, lane));
   const prompt = s.prompt, cached = s.cached;
   const pct = prompt && cached != null ? fmtPct(Math.min(cached, prompt) / prompt) : "–";
-  return el("div", { class: "card slot" },
+  return el("div", { class: "card slot" + (dim ? " " + key : ""), title: closed ? "超過目前的同時處理上限，未開放" : "" },
     head,
     el("div", { class: "rid mono trunc", title: s.rid || "" }, s.rid || "–"),
     el("div", { class: "kv" },
