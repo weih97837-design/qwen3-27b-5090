@@ -908,7 +908,7 @@ function drawDeploy() {
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
       el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
-          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "auto (max)" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
+          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "自動（最大）" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
   }
   body.replaceChildren(...kids);
 }
@@ -1012,7 +1012,7 @@ const MEDIA_OPTS = [
     help: "單一影片最多取樣的影格數（未達上限前每秒取 2 張），也是請求的 num_frames 最多能要求的數量。留空：2,048（模型檢查點本身的預設是 768）。" },
 ];
 const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
-const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "開" : "關") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "預設" : v.toLocaleString()) : k === "spill_dir" ? (v || "（無）") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB（預設）" : `${v} GiB`) :
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "開" : "關") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "預設" : v.toLocaleString()) : k === "spill_dir" ? (v || "（無）") : k === "vram_reserve_gib" ? (v == null ? "1.0 GiB（預設）" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "放不下" : `${fmtTok(p.max_tokens)} · 池 ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -1198,7 +1198,7 @@ function drawLaunch() {
     stackBar(bar, leg, pools.map(([name, bytes, c]) => ({ name, bytes, c })), p.budget, (q) => q.c, "規劃");
     sum.append(bar, leg);
     sum.append(el("div", { class: "muted" }, `裝置池 ${fmtGiB(p.device)}，預算 ${fmtGiB(p.budget)}` +
-      "（預算 = 可用 VRAM 減去留給其他程式的預留量" + (L.form.vram_reserve_gib == null ? "，預設 1.5 GiB）" : "）") +
+      "（預算 = 可用 VRAM 減去留給其他程式的預留量" + (L.form.vram_reserve_gib == null ? "，預設 1.0 GiB）" : "）") +
       ` · 固定主機記憶體 ${fmtGiB(p.host)} · 可用裝置記憶體 ${fmtGiB(dev.free)} ` +
       (dev.source === "engine" ? "（執行中引擎配置各個池之前的值）" : "（目前值，扣除引擎的 CUDA context：估計值）")));
   }

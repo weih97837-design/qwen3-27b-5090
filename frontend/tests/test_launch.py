@@ -27,8 +27,8 @@ def settings():
 
 
 def test_auto_budget_is_the_engines():
-    # memory.cc budget_for: max(0, free - reserve), the reserve 1.5 GiB unless given.
-    assert abs(launch.auto_budget(*DEVICE) / GiB - 28.70) < 0.01
+    # memory.cc budget_for: max(0, free - reserve), the reserve 1.0 GiB unless given.
+    assert abs(launch.auto_budget(*DEVICE) / GiB - 29.20) < 0.01
     assert abs(launch.auto_budget(*DEVICE, reserve=0.5) / GiB - 29.70) < 0.01
     assert abs(launch.auto_budget(*DEVICE, reserve=0) / GiB - 30.20) < 0.01
     assert launch.auto_budget(int(1 * GiB), DEVICE[1]) == 0 and launch.auto_budget(int(2 * GiB), reserve=3) == 0

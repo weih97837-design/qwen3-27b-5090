@@ -22,17 +22,17 @@ from tokenizer import fingerprint
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
-DEFAULT_RESERVE_GIB = 1.5   # VRAM_RESERVE_GIB when unset (memory.cc budget_for)
+DEFAULT_RESERVE_GIB = 1.0   # VRAM_RESERVE_GIB when unset (memory.cc budget_for)
 # The values the page shows a plan for, besides the current one.
 VARIANTS = {"max_seqs": tuple(range(1, MAX_SEQS + 1)), "max_tokens": (32768, 65536, 131072, 196608, 262144),
-            "vram_reserve_gib": (None, 0.5, 1.0, 2.0, 3.0, 4.0)}  # (None: the default, 1.5)
+            "vram_reserve_gib": (None, 0.5, 1.0, 2.0, 3.0, 4.0)}  # (None: the default, 1.0)
 LM_HEAD_ENV = os.environ.get("Q27_LM_HEAD_CKPT", "")  # (engine_target("quasar") sets it in this process)
 GiB = 1 << 30
 # Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
 # unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
 # cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): the largest KV pool the VRAM budget leaves
-# (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine about 590-600K tokens on an RTX 5090; the planner and the UI show the pool
+# (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine about 620-630K tokens on an RTX 5090; the planner and the UI show the pool
 # the engine really got, from its cache_stats), and 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
 # Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
@@ -291,7 +291,7 @@ class Launch:
         b = s["vram_reserve_gib"]
         if b is not None:
             if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or b < 0:
-                raise ValueError("vram_reserve_gib: null (the default, 1.5) or a number of GiB, 0 or more")
+                raise ValueError("vram_reserve_gib: null (the default, 1.0) or a number of GiB, 0 or more")
             s["vram_reserve_gib"] = round(float(b), 2)
             if check_budget and device is not None and s["vram_reserve_gib"] * GiB > device[1]:
                 raise ValueError(f"vram_reserve_gib: at most the device's memory, {device[1] / GiB:.2f} GiB")
