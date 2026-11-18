@@ -67,6 +67,11 @@ checks the spill counters to show that the intended path was taken.
                       or encoded), the RAM entries are written to SPILL_DIR and B's follow-up is restored from the file. Every output
                       must equal the uncached reference (the reference decodes and encodes the video again each time). Runs with the
                       draft model like the others.
+                      Self-diagnosing (`ctl ...` lines): the reference runs A twice (determinism); a first tiered phase "ctl" runs A with
+                      no planned checkpoint and A, B with the full plan (info only); the checked run uses the plan without a chunk of
+                      <= 64 tokens (plan_final_chunk_ok: such a chunk takes the decode GEMMs, engine/src/model.cc kSkinnyMaxM, and its
+                      numerics differ from the uncut prefill's). If the reference itself is not deterministic, the outputs only have to
+                      agree on a prefix of 8 tokens (the first differing index is printed).
 
 Each scenario runs a few conversations (the golden prompts, prompt-len tokens each, different starts) and one
 follow-up turn per conversation that continues the generation with 300 new tokens. The driver sizes the conversations
@@ -149,7 +154,7 @@ SCENARIOS = {
     "i": ("RAM dedup with pinned segments + async I/O", ["full"]),
     "j": ("SSD dedup: shared chunk files, restart, drop, restore (sync + async)", ["write", "read"]),
     "k": ("retention: per-agent fairness, never-hit first, superseded", ["probe", "run"]),
-    "l": ("video input: prefix hit on the same video, RAM and SSD spill and restore", ["full"]),
+    "l": ("video input: prefix hit on the same video, RAM and SSD spill and restore", ["ctl", "full"]),
 }
 # Scenario l: the engine needs the vision tower and room for the video's embeddings (both modes, the reference too).
 SCEN_ENV_ALL = {"l": {"VISION": "host", "IMAGE_TOKENS": "16384"}}
@@ -310,12 +315,15 @@ class Run:
         self.ids, self.outs, self.fed = {}, {}, {}
         self.media = {}  # key -> (spans, sources, videos) of its prompt (scenario l)
         self.checks, self.stats = [], []
+        self.cached = {}   # key -> tokens the last turn1 resumed at
+        self.aux = {}      # name -> tokens (or numbers) of a control: reported by the driver, never compared as outputs
+        self.quiet = False  # the checks of a control run are not recorded (they are not what the scenario proves)
 
     def prompt(self, idx):
         return make_prompt(self.docs, self.L, idx)
 
     def check(self, name, ok, detail=""):
-        if self.cache:  # (the reference has nothing to prove)
+        if self.cache and not self.quiet:  # (the reference has nothing to prove)
             self.checks.append({"name": name, "ok": bool(ok), "detail": str(detail)})
             self.log(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f" ({detail})" if detail != "" else ""))
 
@@ -399,9 +407,10 @@ class Run:
         self.log(f"  media of {key}: {len(spans)} pairs, {encoded} encoded (the rest inside the {cached} cached tokens)")
         return encoded
 
-    def turn1(self, key, ids, at=(), media=None, expect_cached=0, at_least=False):
+    def turn1(self, key, ids, at=(), media=None, expect_cached=0, at_least=False, end_checkpoint=True):
         """A new conversation. at: positions the prefill saves checkpoints at (the cache run only). media: the prompt's
-        (spans, sources, videos). expect_cached: the prefix the cache must hold already (a hit on an earlier prompt; at_least: or more)."""
+        (spans, sources, videos). expect_cached: the prefix the cache must hold already (a hit on an earlier prompt; at_least: or more).
+        end_checkpoint=False: no checkpoint at the end of the generation (a control run that must leave nothing behind)."""
         if media:
             self.media[key] = media
         if self.cache:
@@ -415,8 +424,9 @@ class Run:
         if media:
             self.encode_media(key, cached)
         out = self._gen(ids[cached:])
-        if self.cache:
+        if self.cache and end_checkpoint:
             self.op("checkpoint", self.eng.checkpoint)  # the checkpoint at the end of the generation
+        self.cached[key] = cached
         self.ids[key], self.outs[key], self.fed[key] = ids, out, self.eng.pos
         self.log(f"  {key}: {len(out)} tokens, pos {self.eng.pos}")
         return out
@@ -946,18 +956,177 @@ def l_prompts(R):
     return ids_a, ids_b, (spans, srcs, videos_a), (spans_b, srcs_b, videos_b), at, resume
 
 
+PREFILL_CHUNK = 2048  # the Engine's prefill_chunk (q27lib default; the worker does not pass another)
+SKINNY_MAX_M = 64     # engine/src/model.h kSkinnyMaxM: a chunk of <= 64 tokens takes the decode-path (skinny) GEMMs
+L_PREFIX_OK = 8       # a reference that is not deterministic: outputs must agree on at least this many tokens
+
+
+def l_chunks(plan, n, cached=0, chunk=PREFILL_CHUNK):
+    """The prefill chunks of the engine for a prompt of n tokens resumed at `cached` with the planned checkpoints `plan`:
+    a copy of Model::prefill_cut / prompt_chunks (engine/src/model.cc): the plan is rounded down to multiples of 64 (prefix_begin),
+    a chunk ends at the next planned position that fits in it, else at a multiple of 64 (the last chunk of the prompt at its end)."""
+    pts = sorted({q // 64 * 64 for q in plan if cached < q // 64 * 64 < n})
+    pos, out = cached, []
+    while pos < n:
+        t = min(chunk, n - pos)
+        cut = next((q - pos for q in pts if q > pos), None)
+        if cut is None or cut > t:
+            cut = t if chunk >= n - pos else (pos + t) // 64 * 64 - pos
+        out.append(cut)
+        pos += cut
+    return out
+
+
+def plan_final_chunk_ok(plan, n, cached=0, chunk=PREFILL_CHUNK):
+    """True when no chunk of the prefill is <= 64 tokens (such a chunk takes the decode GEMMs: not bit-identical to an uncut prefill)."""
+    return min(l_chunks(plan, n, cached, chunk)) > SKINNY_MAX_M
+
+
+def l_plan_ok(plan, n):
+    """(plan without short chunks, dropped): drops the highest checkpoint until plan_final_chunk_ok (here the generation prompt's start)."""
+    plan, dropped = sorted(plan), []
+    while len(plan) > 0 and not plan_final_chunk_ok(plan, n):
+        dropped.append(plan.pop())
+    return plan, dropped
+
+
+def fmt_chunks(chunks):
+    out, i = [], 0
+    while i < len(chunks):
+        j = i
+        while j < len(chunks) and chunks[j] == chunks[i]:
+            j += 1
+        out.append(f"{chunks[i]}x{j - i}" if j - i > 1 else str(chunks[i]))
+        i = j
+    return " + ".join(out)
+
+
+def first_diff(a, b):
+    """The first index where the token lists differ (the length of the shorter one if it is a prefix of the other), None if equal."""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return None if len(a) == len(b) else min(len(a), len(b))
+
+
+def diff_text(got, ref):
+    i = first_diff(got, ref)
+    if i is None:
+        return f"equal ({len(ref)} tokens)"
+    g, r = (got[i] if i < len(got) else None), (ref[i] if i < len(ref) else None)
+    return f"different at token {i} (got {g}, ref {r}; got[{max(i - 2, 0)}:{i + 3}]={got[max(i - 2, 0):i + 3]} ref={ref[max(i - 2, 0):i + 3]})"
+
+
+def l_controls(ref, ctl, outs):
+    """Prints the `ctl` lines of scenario l and returns (relaxed, diagnosis). relaxed: the reference is not deterministic."""
+    refs = ref["outs"]
+    a, a2 = refs.get("A"), ref.get("aux", {}).get("A2")
+    relaxed = False
+    if a is None or a2 is None:
+        say("  ctl determinism: not run (the reference result has no second A)")
+    elif a == a2:
+        say(f"  ctl determinism: equal (the reference engine ran A twice: {len(a)} tokens)")
+    else:
+        relaxed = True
+        say(f"  ctl determinism: DIFFERENT ({diff_text(a2, a)}): the vision/video path is not deterministic; equality checks on the video "
+            f"outputs are relaxed to a common prefix of >= {L_PREFIX_OK} tokens")
+    aux = (ctl or {}).get("aux", {})
+    eq = {}
+    for label, key, name in (("no-plan", "nopl:A", "A"), ("full plan (d)", "full:A", "A"), ("full plan (d)", "full:B", "B")):
+        if key not in aux:
+            say(f"  ctl {label} vs ref ({name}): not run")
+            continue
+        eq[key] = aux[key] == refs.get(name)
+        c = aux.get("cached:" + key, [None])[0]
+        say(f"  ctl {label} vs ref ({name}, cached {c}): {diff_text(aux[key], refs.get(name, []))}")
+    if "A" in outs and "A" in refs:
+        eq["ok:A"] = outs["A"] == refs["A"]
+        say(f"  ctl plan without a chunk <= {SKINNY_MAX_M} (c) vs ref (A): {diff_text(outs['A'], refs['A'])}")
+    say("  ctl near-tie: not measured (the engine API has no cheap logprobs for a prefill's first tokens)")
+    d = ""
+    if eq.get("ok:A") is not None and eq.get("full:A") is not None:
+        if eq["ok:A"] and not eq["full:A"]:
+            d = "the full plan (d) differs and plan (c) equals the reference: the difference is the short final chunk (decode-path numerics)"
+        elif eq["ok:A"] and eq["full:A"]:
+            d = "plan (c) and the full plan (d) both equal the reference for A: the short final chunk did not change this output"
+        elif not eq["ok:A"] and eq.get("nopl:A"):
+            d = "no-plan equals the reference but plan (c) differs: the cuts at the checkpoints (not a short chunk) change the numerics"
+        elif not eq["ok:A"] and eq.get("nopl:A") is False:
+            d = "even the no-plan run differs: the cause is not the plan (the prefix-cache engine, the video path or the reference's own variation)"
+    if d:
+        say(f"  ctl diagnosis: {d}")
+    return relaxed, d
+
+
+def l_compare(ref, outs, relaxed):
+    """Scenario l's output comparison: (keys that differ, said). Exact; relaxed (non-deterministic reference): a common prefix >= 8."""
+    bad = []
+    for k, want in ref.items():
+        got = outs.get(k)
+        if got is None:
+            bad.append(k)
+            continue
+        if relaxed and k.endswith("+") and outs.get(k[:-1]) != ref.get(k[:-1]):
+            say(f"  ctl {k}: not comparable (its prompt holds {k[:-1]}'s generated tokens, which differ from the reference's)")
+            continue
+        i = first_diff(got, want)
+        if i is None:
+            continue
+        if relaxed and i >= L_PREFIX_OK:
+            say(f"  ctl {k}: differs at token {i} after a common prefix of {i} >= {L_PREFIX_OK} tokens: explained by the reference's non-determinism")
+            continue
+        bad.append(k)
+        say(f"  FAIL {k}: first differing token {i}: got {got[i] if i < len(got) else None}, ref {want[i] if i < len(want) else None}"
+            f" (got[{max(i - 2, 0)}:{i + 3}]={got[max(i - 2, 0):i + 3]} ref[{max(i - 2, 0)}:{i + 3}]={want[max(i - 2, 0):i + 3]})")
+    return bad
+
+
+def l_describe(R, label, plan, n, cached=0):
+    chunks = l_chunks(plan, n, cached)
+    R.log(f"  chunks of {label}: {fmt_chunks(chunks)} (shortest {min(chunks)}{'' if min(chunks) > SKINNY_MAX_M else f', <= {SKINNY_MAX_M}: decode GEMMs'})")
+
+
+def l_ctl_phase(R, ids_a, ids_b, media_a, media_b, at, resume):
+    """The tiered engine's controls (info only, nothing is checked): A with no planned checkpoint, then A and B with the full plan."""
+    R.quiet = True
+    l_describe(R, "A with no plan", [], len(ids_a))
+    R.aux["nopl:A"] = R.turn1("A", ids_a, at=(), media=media_a, end_checkpoint=False)
+    R.aux["cached:nopl:A"] = [R.cached["A"]]
+    l_describe(R, "A with the full plan (d)", at, len(ids_a))
+    R.aux["full:A"] = R.turn1("A", ids_a, at=at, media=media_a, end_checkpoint=False)
+    R.aux["cached:full:A"] = [R.cached["A"]]
+    R.aux["full:B"] = R.turn1("B", ids_b, at=at, media=media_b, end_checkpoint=False)
+    R.aux["cached:full:B"] = [R.cached["B"]]
+    R.outs.clear()  # (nothing here is compared as an output)
+
+
 def scen_l(R, spill_dir):
     if R.cache and not R.eng.has_vision:
         raise ScenarioSkip("the engine has no vision tower (VISION=host)")
     try:
-        ids_a, ids_b, media_a, media_b, at, resume = l_prompts(R)
+        ids_a, ids_b, media_a, media_b, at_full, resume = l_prompts(R)
     except ImportError as e:
         raise ScenarioSkip(f"the server's modules are not importable here ({e})")
+    n = len(ids_a)
+    at, dropped = l_plan_ok(at_full, n)  # the plan the checks run with: no chunk of <= 64 tokens (plan_final_chunk_ok)
+    assert resume in {q // 64 * 64 for q in at}, (resume, at)  # (B's hit: the video's end checkpoint is kept)
     spans = media_a[0]
-    R.log(f"  prompt {len(ids_a)} tokens: video of {len(spans)} pairs, {sum(gh * gw for _, gh, gw in spans)} tokens, "
-          f"from token {spans[0][0]}; checkpoints {at}, B resumes at {resume}")
+    R.log(f"  prompt {n} tokens: video of {len(spans)} pairs, {sum(gh * gw for _, gh, gw in spans)} tokens, "
+          f"from token {spans[0][0]}; checkpoints {at_full}, B resumes at {resume}")
+    if R.phase == "ctl":
+        return l_ctl_phase(R, ids_a, ids_b, media_a, media_b, at_full, resume)
+    R.log(f"  plan of the checks (c): {at}" + (f" (dropped {dropped}: a chunk <= {SKINNY_MAX_M} tokens would be left)" if dropped else " (the full plan has no short chunk)"))
+    l_describe(R, "A with the plan of the checks (c)", at, n)
+    if R.cache:
+        l_describe(R, "B resumed from A's checkpoint", at, n, resume // 64 * 64)
+    else:
+        R.log(f"  chunks of the reference: {fmt_chunks(l_chunks([], n))}")
     s0 = R.snap("start")
     R.turn1("A", ids_a, at=at, media=media_a)
+    if not R.cache:  # determinism control (a): the reference runs A a second time (the driver compares)
+        R.aux["A2"] = R.turn1("A2", ids_a, media=media_a)
+        for d in (R.outs, R.ids, R.fed, R.media):
+            d.pop("A2", None)
     # The same video, another question: the prefix cache hit is the video's end checkpoint (at or after it, never the interval one
     # inside the video): no pair is decoded, encoded or prefilled again but at most the last one that the rounding cut.
     R.turn1("B", ids_b, at=at, media=media_b, expect_cached=resume, at_least=True)
@@ -972,9 +1141,9 @@ def scen_l(R, spill_dir):
     R.turn2("A", make_prompt(R.docs, 1000, 9)[:FOLLOW])  # the whole video is inside the restored prefix
     s2 = R.snap("after A's follow-up")
     R.check("A's follow-up restored its checkpoint from RAM", delta(s1, s2, "restored") > 0, f"restored +{delta(s1, s2, 'restored')}")
-    n = export_ram(R.eng, spill_dir) if R.cache else 0
+    nfiles = export_ram(R.eng, spill_dir) if R.cache else 0
     s3 = R.snap("RAM entries written to SPILL_DIR")
-    R.check("RAM entries written to SPILL_DIR", n > 0 and s3["on_disk"] > 0, f"{n} files, on_disk {s3['on_disk']}")
+    R.check("RAM entries written to SPILL_DIR", nfiles > 0 and s3["on_disk"] > 0, f"{nfiles} files, on_disk {s3['on_disk']}")
     R.turn2("B", make_prompt(R.docs, 1000, 10)[:FOLLOW])
     s4 = R.snap("after B's follow-up (read from the file)")
     R.check("B's follow-up restored its checkpoint from the file", delta(s3, s4, "restored") > 0,
@@ -1026,14 +1195,14 @@ def worker(a):
     heads = {tuple(R.prompt(i)[:64]) for i in range(4)}
     if len(heads) != 4 and a.scenario not in ("h", "i", "j", "k", "l"):  # (h builds its own prompts, which share their first tokens)
         raise SystemExit("the prompts do not differ in their first 64 tokens")
-    if a.prior:
+    if a.prior and a.scenario != "l":  # (l's phases do not continue one another)
         R.load_prior(a.prior)
     try:
         SCEN_FN[a.scenario](R, a.spill_dir)
     except ScenarioSkip as e:
         eng.close()
         return write_json(a.out, {"skip": str(e)})
-    write_json(a.out, {"outs": R.outs, "fed": R.fed, "checks": R.checks, "stats": R.stats})
+    write_json(a.out, {"outs": R.outs, "fed": R.fed, "checks": R.checks, "stats": R.stats, "aux": R.aux})
     say("  > eng.close()")
     eng.close()
     say("  < eng.close()")
@@ -1207,15 +1376,21 @@ def main():
         if ref.get("skip"):
             say(f"SKIP {s}: {ref['skip']}", flush=True)
             continue
-        outs, checks, stats, prior, err, skip = {}, [], [], None, None, None
+        outs, checks, stats, prior, err, skip, ctl = {}, [], [], None, None, None, None
         for ph in phases:
             r = run_worker(sa, s, "tiered", ph, spill_dir, work / f"tiered_{s}_{ph}.json", prior)
+            if "error" in r and ph == "ctl":  # (info only: a crash of the controls does not fail the scenario)
+                say(f"  ctl: the control run exited {fmt_rc(r['error'])}; its lines are missing", flush=True)
+                continue
             if "error" in r:
                 err = f"the tiered run ({ph}) exited {fmt_rc(r['error'])}"
                 break
             if r.get("skip"):
                 skip = r["skip"]
                 break
+            if ph == "ctl":
+                ctl = r
+                continue
             outs.update(r["outs"])
             checks += r["checks"]
             stats += r["stats"]
@@ -1227,7 +1402,12 @@ def main():
             say(f"FAIL {s}: {err}", flush=True)
             fails += 1
             continue
-        mism = [k for k in ref["outs"] if outs.get(k) != ref["outs"][k]]
+        relaxed = False
+        if s == "l":
+            relaxed, diagnosis = l_controls(ref, ctl, outs)
+            mism = l_compare(ref["outs"], outs, relaxed)
+        else:
+            mism = [k for k in ref["outs"] if outs.get(k) != ref["outs"][k]]
         extra = [k for k in outs if k not in ref["outs"]]
         bad = [c for c in checks if not c["ok"]]
         if not checks:
@@ -1240,8 +1420,12 @@ def main():
             say(f"  FAIL outputs differ from the reference: {mism + extra}")
             for k in mism:
                 say(f"       {k} got {outs.get(k, [])[:12]}...\n       {k} ref {ref['outs'][k][:12]}...")
+            if s == "l":
+                say("  this difference is NOT explained by the controls: " + (
+                    f"the reference is not deterministic but the outputs agree on fewer than {L_PREFIX_OK} tokens" if relaxed else
+                    "the reference is deterministic (ctl determinism), so the check stays exact") + (f"; {diagnosis}" if diagnosis else ""))
         else:
-            say(f"  outputs identical to the reference: {len(ref['outs'])} sequences, "
+            say(f"  outputs {'agree with' if relaxed else 'identical to'} the reference: {len(ref['outs'])} sequences, "
                   f"{sum(len(v) for v in ref['outs'].values())} tokens")
         ok = not (mism or extra or bad)
         fails += not ok

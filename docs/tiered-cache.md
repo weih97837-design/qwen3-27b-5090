@@ -445,7 +445,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | i RAM 去重＋pinned＋async | 同 h，加 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`，全部經 `spill_match` / `spill_restore_*` 還原 | 同 h |
 | j SSD 去重 | 4 段共用前綴的對話全部 `spill_export` 到 `SPILL_DIR`（兩個行程）：第一個行程寫出，第二個行程（新的 Engine、同一個目錄）`spill_import`、`spill_sweep`，丟棄一筆後從檔案還原其他筆（兩筆走 `prefix_begin` 的同步 promote，一筆走 `spill_restore_begin`） | `spill_disk_usage` 實體 < 0.6 × 邏輯、`.kvc` 檔數少於 chunk 參照數；重啟後仍然成立；丟棄釋放的位元組恰為 `unique_disk_bytes` 且共用的 `.kvc` 仍在；還原的 token 與參考相同；最後一筆還原後沒有殘留檔案 |
 | k 保留策略 | 兩個 agent（`set_owner`）：一個有很多大的 entry（含被取代與從未重用者），一個只有幾個；RAM 層壓力（小的 `SPILL_RAM_GIB`）下 | 小 agent 的 entry 全數留在 RAM、大 agent 被逐出的是被取代／從未重用的；`spill_meta` 的 owner／hits／superseded 與 `spill_agents` 位元組一致；還原後 token 與參考相同 |
-| l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一，prefill 存下 `Scheduler.checkpoints` 規劃的影片結尾檢查點與問題前最後一個 4096 倍數處的檢查點；B 同一支影片、問題二，從影片結尾檢查點續起（`cached` 不小於影片結尾向下對齊 64 的位置，影片不再解碼與編碼，最多重算最後一對）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 不小於影片結尾（向下對齊 64）、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片） |
+| l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一，prefill 存下 `Scheduler.checkpoints` 規劃的影片結尾檢查點與問題前最後一個 4096 倍數處的檢查點；B 同一支影片、問題二，從影片結尾檢查點續起（`cached` 不小於影片結尾向下對齊 64 的位置，影片不再解碼與編碼，最多重算最後一對）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 不小於影片結尾（向下對齊 64）、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片）。檢查用的檢查點計畫不留下 ≤ 64 token 的 chunk（`plan_final_chunk_ok`：生成提示詞起點的檢查點在此會讓最後一個 chunk 剛好 64 token，故被略過）；另有只供參考的 `ctl` 對照（見下）。分三個行程階段：參考（A 跑兩次）、tiered `ctl`（無計畫的 A、完整計畫的 A 與 B）、tiered `full`（實際檢查） |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
 
@@ -460,6 +460,24 @@ NVFP4 為 57 頁、FP8 為 32 頁、BF16 為 16 頁；`Q27_KV_BLOCK` 可覆寫�
 
 **PASS 的意義**：該情境的每一段輸出 token（貪婪解碼，每回合 `--tokens` 個）與關閉快取的參考完全相同，而且所有檢查都通過，
 表示確實走了該情境的路徑。任何一個 FAIL 則 exit code 為 1。
+
+**情境 l 的 `ctl` 對照（自我診斷）**：影片輸入的輸出若與參考不同，原因可能是影片路徑不具決定性、檢查點計畫改變了數值，或引擎本身。
+所以 l 會印出下列幾行（只供參考，不算 FAIL），單獨重跑用 `test.cmd --scenarios l`：
+
+- `ctl determinism`：參考引擎把 A 跑兩次。`DIFFERENT` 表示視覺或影片路徑本身不具決定性；此時 l 的輸出檢查放寬為「相同前綴至少 8 個 token」，並印出第一個不同的 token 位置；A+、B+ 的提示詞含有 A、B 的輸出，無法比較時會註明。
+- `ctl no-plan vs ref`：開啟前綴快取、但 A 沒有任何計畫檢查點。
+- `ctl full plan (d) vs ref`：A 與 B 使用完整計畫（含生成提示詞起點的檢查點，最後一個 chunk 為 64 token）。
+- `ctl plan without a chunk <= 64 (c) vs ref`：實際檢查所用的計畫。
+- `ctl diagnosis`：由上列推得的原因；`first differing token` 同時列出雙方的 token id。near-tie（前兩名 logprob 差）目前不量測：引擎沒有便宜的 prefill 首 token logprob 介面。
+
+通過條件是 (c) 的 A、B、A+、B+ 與參考完全相同（每條快取路徑：前綴命中、RAM、檔案）；(b)、(d) 只報告。
+若 `ctl determinism` 為 `DIFFERENT`，則只要求相同前綴 ≥ 8 token，且仍會註明差異是否被對照解釋。
+
+**已知的數值註記（chunk ≤ 64 token）**：引擎對 ≤ 64 token 的 prefill chunk 使用 decode 路徑（skinny）的 GEMM（`engine/src/model.h`
+`kSkinnyMaxM = 64`，`model.cc` 的 `gemm_q`），其數值與多列 GEMM 不同（僅最後幾位）。`Scheduler.plan_checkpoints` 刻意保留
+生成提示詞起點（`starts[-1]`，向下對齊 64）的檢查點，因此一般提示詞的最後一個 chunk 常 ≤ 64 token。結果：快取過的請求，其 token
+在 greedy（temperature 0）下，可能與沒有計畫檢查點的未快取執行在近乎平手處（near-tie）出現不同的選擇；這是數值差異，不是快取還原錯誤。
+測試的參考引擎沒有計畫，所以情境 l 用不留 ≤ 64 token chunk 的計畫來要求逐 token 相同。
 
 `tiered_cache_bench.py` 的計時不含引擎建立與 checkpoint 的 prefill。「逐出並複製」的時間是 prefill 時間減去同一段
 prefill（沒有東西可逐出）的時間，是估計值。bench 的提示由 golden 文件重複拼接而成，只用於計時，不檢查輸出。
