@@ -32,7 +32,7 @@ faster than computing the prompt again (RESTORE_MARGIN); after RESTORE_TIMEOUT_S
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per id (logprob, [(id, logprob)])]), ("done", rid, finish, info),
 ("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
-("error", rid, message[, HTTP status: 400 for an image that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("error", rid, message[, HTTP status: 400 for an image or video that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
 ("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
 ("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
@@ -81,7 +81,10 @@ def step_ms(n):
 
 
 class ImageError(Exception):
-    """An image of the request cannot be decoded (the client's error: 400)."""
+    """An image or video of the request cannot be decoded (the client's error: 400)."""
+
+
+VOCAB = 248320  # rows of the engine's embedding table (kVocab)
 
 
 def log(msg):
@@ -119,8 +122,10 @@ class Seq:
         self.bias = {int(k): float(v) for k, v in (req.get("logit_bias") or {}).items()}
         self.min_tokens, self.ignore_eos = req.get("min_tokens", 0), bool(req.get("ignore_eos"))
         self.rng = random.Random(req.get("seed"))
-        self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
-        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
+        # (spans [(start, gh, gw)], [source per span], [(encoded video, plan)]) or None: server.py Images.prepare
+        self.images = req.get("images")
+        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), ("video", k) -> of the
+        #                          video's frames (videoproc.frames), started on arrival
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
@@ -186,6 +191,9 @@ class Scheduler:
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
     dec_tok = None  # the plain tokenizer of the divergence log (made with the first divergence)
+    returns = ()  # (video loans to give back; __init__ makes the deque)
+    user = None  # the id of "user" and the ids of blank-line tokens (checkpoints: after the last blank line of a final user message)
+    breaks = frozenset()
     last_active = 0.0
     backup_done = False
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
@@ -238,6 +246,8 @@ class Scheduler:
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
         self.im_start = cfg["im_start"]
+        self.user = cfg.get("user")
+        self.breaks = frozenset(cfg.get("breaks", ()))
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
         self.slot_lanes = {}     # rid -> UI lane (1-based) in the last stats snapshot (slot_rows keeps lanes still)
@@ -246,6 +256,10 @@ class Scheduler:
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
         self.decoder = None      # threads that decode images (prefetch)
+        # Loans of KV pool memory for decoding videos on NVDEC (Engine.kv_lend: the driver allocates the decoder's
+        # surfaces outside the engine's pools), made and returned on this thread; a decoder thread queues its loan
+        # here when it is done.
+        self.returns = collections.deque()
         self.m = collections.Counter()
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
@@ -258,6 +272,7 @@ class Scheduler:
         self.conn.send(msg)
 
     def poll(self, block, wait=STATS_IDLE):
+        self.unlend()
         # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
         # then wake up now and then for a stats snapshot (wait seconds at most: less when a backup is due).
         if block and not self.cache_full:
@@ -347,7 +362,16 @@ class Scheduler:
 
     def submit(self, rid, req):
         self.touch()
-        s = Seq(rid, req, time.time())
+        # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
+        try:
+            s = Seq(rid, req, time.time())
+            array.array("i", s.prompt)  # (integers that fit int32)
+            # (an image's positions hold ids above the vocabulary: image_tokens.image_token_ids)
+            if s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
+                raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
+        except (TypeError, ValueError, KeyError, OverflowError) as e:
+            self.send("error", rid, f"bad request: {e}", 400)
+            return
         if s.grammar is not None:
             try:
                 s.matcher = self.matcher(s.grammar)
@@ -465,17 +489,66 @@ class Scheduler:
         return m
 
     def prefetch(self, s):
-        """Starts decoding the images that lie past the reusable prefix, which begin() will likely encode, on
-        threads while the request waits (images inside the prefix are decoded only if the cache misses them)."""
-        import imageproc
-
+        """Starts decoding the images and videos that lie past the reusable prefix, which begin() will likely
+        encode, on threads while the request waits (those inside the prefix are decoded only if the cache misses
+        them)."""
         if self.decoder is None:
             from concurrent.futures import ThreadPoolExecutor
 
             self.decoder = ThreadPoolExecutor(2, thread_name_prefix="image")
-        for i, ((start, gh, gw), (raw, size, _)) in enumerate(zip(*s.images)):
+        spans, srcs, _ = s.images
+        for i, ((start, gh, gw), src) in enumerate(zip(spans, srcs)):
             if start + gh * gw > s.reusable:
-                s.decoding[i] = self.decoder.submit(imageproc.rgb, raw, size)
+                key = i if src[0] == "image" else ("video", src[1])
+                if key not in s.decoding:  # (a video: from its first pair past the prefix on)
+                    g = src[2] if src[0] == "video" else 0
+                    sessions, loan = self.lend(s, key, g)
+                    f = self.decoder.submit(self.decode, s, key, sessions, g)
+                    if loan >= 0:
+                        f.add_done_callback(lambda _, loan=loan: self.returns.append(loan))  # (cancelled too)
+                    f.first_pair = g
+                    s.decoding[key] = f
+
+    def lend(self, s, key, g=0):
+        """(sessions, loan): the parallel decoders for video `key` from its pair g on and a loan of KV pool memory
+        covering what they take (-1: none; an image, or a pool that cannot spare it: then one decoder, the memory
+        taken beyond the budget)."""
+        if not isinstance(key, tuple):
+            return 0, -1
+        import videoproc
+
+        raw, plan = s.images[2][key[1]]
+        plan = videoproc.tail(plan, g)
+        try:
+            need, sessions = videoproc.memory(raw, plan)
+        except ValueError:  # (the decode reports it)
+            return 0, -1
+        loan = self.engine.kv_lend(need)
+        if loan < 0 and sessions > 1:
+            need, sessions = videoproc.memory(raw, plan, 1)
+            loan = self.engine.kv_lend(need)
+        if loan < 0:
+            log(f"{s.rid}: decoding a video with {need / 2**20:.0f} MiB of device memory not lent by the KV pool")
+        return sessions, loan
+
+    def unlend(self):
+        while self.returns:
+            self.engine.kv_unlend(self.returns.popleft())
+
+    @staticmethod
+    def decode(s, key, sessions=0, g=0):
+        """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) from its pair g on
+        (videoproc.frames; only the samples from the closed key frame before them are decoded)."""
+        spans, srcs, videos = s.images
+        if isinstance(key, tuple):
+            import videoproc
+
+            raw, plan = videos[key[1]]
+            return videoproc.frames(raw, videoproc.tail(plan, g), sessions=sessions)
+        import imageproc
+
+        _, raw, size, _ = srcs[key]
+        return imageproc.rgb(raw, size)
 
     def drop_decoding(self, s):
         for f in s.decoding.values():
@@ -837,9 +910,23 @@ class Scheduler:
         """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
         and tools), the starts of the last message and of the generation prompt (a retried request, or a
         client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
-        prefix shared inside a message). The end of the generation is saved after it."""
+        prefix shared inside a message), and after the last blank line of a final user message (a document followed
+        by a question: the next question about it shares the document). The end of the generation is saved
+        after it."""
         starts = [i for i, t in enumerate(prompt) if t == self.im_start]
         at = set(starts[1:2] + starts[-2:])
+        if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
+            # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
+            # the document and miss a follow-up question that differs only after it)
+            b = next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in self.breaks), 0)
+            g = starts[-1] // 64 * 64
+            # (b must also keep more than 64 tokens from the other planned positions, our sibling share's `reusable`
+            # included: a chunk of <= 64 tokens between two checkpoints takes the decode GEMMs)
+            others = [q // 64 * 64 for q in at | ({reusable} if reusable > 0 else set()) if q != starts[-1]]
+            if b and b // 64 * 64 < g and all(abs(b // 64 * 64 - q) > 64 for q in others):
+                if g - b // 64 * 64 <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
+                    at.discard(starts[-1])
+                at.add(b)
         if reusable > 0:
             at.add(reusable)
         return sorted(at)
@@ -1047,22 +1134,51 @@ class Scheduler:
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
-            import imageproc
-
-            spans, srcs = s.images
+            spans, srcs, _ = s.images
             self.engine.mm_set(spans)
             t0, encoded, waited = time.time(), 0, 0.0
-            for i, (start, gh, gw) in enumerate(spans):
-                if start + gh * gw > cached:  # (images inside the restored prefix need no embeddings)
-                    raw, size, norm = srcs[i]
-                    t1, f = time.time(), s.decoding.pop(i, None)
-                    try:
-                        rgb = f.result() if f is not None else imageproc.rgb(raw, size)
-                    except Exception as e:  # noqa: BLE001 - any decoder error is the client's
-                        raise ImageError(f"cannot decode image: {e}") from e
+
+            def pixels(key, g=0):
+                """The image's pixels, or the video's frames from its pair g on."""
+                nonlocal waited
+                t1, f = time.time(), s.decoding.pop(key, None)
+                loan = -1
+                try:
+                    if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
+                        out = f.result()
+                        return out[2 * (g - f.first_pair):] if isinstance(key, tuple) else out
+                    if f is not None:  # (the cache restored less than the prefetch expected: earlier pairs too)
+                        f.cancel()
+                    sessions, loan = self.lend(s, key, g)
+                    return self.decode(s, key, sessions, g)
+                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                    raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
+                finally:
+                    if loan >= 0:
+                        self.engine.kv_unlend(loan)
+                    self.unlend()
                     waited += time.time() - t1
-                    self.engine.mm_encode_rgb(i, rgb, norm)
-                    encoded += 1
+
+            i, frames = 0, {}
+            while i < len(spans):
+                start, gh, gw = spans[i]
+                src = srcs[i]
+                if start + gh * gw <= cached:  # (images inside the restored prefix need no embeddings)
+                    i += 1
+                    continue
+                if src[0] == "image":
+                    self.engine.mm_encode_rgb(i, pixels(i), src[3])
+                    i, encoded = i + 1, encoded + 1
+                    continue
+                k = src[1]  # (a video: its pairs from here to its end, encoded together)
+                j = i
+                while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
+                    j += 1
+                # (the pairs from the first one past the restored prefix to the video's end: decoded from there)
+                frames[k] = pixels(("video", k), src[2])
+                self.engine.mm_encode_frames(i, frames[k][:2 * (j - i)], src[3])
+                i, encoded = j, encoded + j - i
+            frames.clear()
             self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
                 f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
@@ -1125,7 +1241,7 @@ class Scheduler:
         step, n0 = 0.0, len(s.out)
         while not s.dead and s.phase == DECODE:  # (a forced output makes it a prefill again)
             now = time.time()
-            last = (others and now + step >= t0 + turn) or self.conn.poll(0) or self.restore_due()
+            last = (others and now + step >= t0 + turn) or self.conn.poll(0) or self.restore_due() or bool(self.returns)
             ts = time.time()
             if self.spec:
                 if s.gm is not None:
@@ -1166,16 +1282,16 @@ class Scheduler:
             if any(s.gm is not None for s in seqs):  # (structured output: drafted, masked by the grammars, verified)
                 for z, (s, chain) in enumerate(zip(seqs, self.engine.spec_draft_lanes(lanes))):
                     if s.gm is not None:
-                        write_masks(self.engine, s.gm, chain, 8 * z, self.eos)
+                        write_masks(self.engine, s.gm, chain, 16 * z, self.eos)
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
             for z, (s, toks) in enumerate(zip(seqs, new)):
                 s.steps += 1
-                self.count_draft(s, toks)
+                self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
                 self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
             if (any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0)
-                    or self.restore_due()):
+                    or self.restore_due() or self.returns):
                 break
         dt = time.time() - t0
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)

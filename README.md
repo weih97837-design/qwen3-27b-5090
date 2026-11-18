@@ -34,8 +34,9 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 - **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
   16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
   `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
-  DSpine is faster for one request (JSON 1.36x, code 1.07x); with four or eight requests at once DFlash2 is 4–7%
-  faster, so a server that mostly runs many requests at once may prefer `SPEC=dflash2`.
+  DSpine is faster for one request (JSON 1.37x, code 1.08x). In a batch each DSpine request verifies 4 to 16 rows of
+  its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6% faster with four or eight
+  requests at once, so a server that mostly runs many such requests may prefer `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -76,7 +77,7 @@ Long prompts stay fast and accurate:
 | 73K tokens | 8,773 tok/s (8.3 s) | 87 tok/s |
 | 194K tokens | 5,875 tok/s (33 s) | 77 tok/s |
 
-Between 73K and 152K tokens of a prompt this engine prefills 5,359 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
+Between 73K and 152K tokens of a prompt this engine prefills 5,652 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
 and 1,953 (vLLM). Needle retrieval finds 16 of 16 facts at 190K tokens and 56 of 64 at 256K.
 
 The full measurements, each engine's settings and the caveats (NInfer's memory sizing under WSL2, for one) are in
@@ -216,7 +217,16 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`.
 - **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:46320/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
-- Images as data URLs or http(s) URLs. No video.
+- Images and videos as data URLs or http(s) URLs: `image_url` parts, and `video_url` parts as vLLM takes them
+  (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`; up to 256 MB): MP4 / MOV or Matroska / WebM
+  with H.264, HEVC, AV1 or VP9 (4:2:0; H.264 and HEVC also 4:2:2, HEVC 4:4:4; 8 or 10 bits), decoded on the GPU's
+  video decoder (NVDEC); a phone video's rotation is applied. A video is sampled
+  at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
+  with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
+  ([Images and videos](docs/architecture.md#11-vision-tower)). A request can sample otherwise with vLLM's
+  `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`, and `"size": {"longest_edge": N}`,
+  the pixels of all frames together: 2,048 per token). For long videos the server can take more:
+  `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` ([Long videos](docs/configuration.md#long-videos)).
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
   turn markers. `/v1/completions` takes them as tokens.
 
@@ -327,6 +337,7 @@ dependency beyond the CUDA toolkit. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
+docker compose --profile dev run --rm dev-cpu python -m pytest -q engine/tests_cpu              # malformed checkpoint readers, no GPU
 docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q'               # reference model on the CPU (seconds; -m slow: every layer, about 11 min and 10 GB of RAM)
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```
@@ -336,7 +347,7 @@ End-to-end checks against a running server (`docker compose up -d serve`; `--bui
 ```bash
 python3 scripts/smoke_test.py                # a few requests
 python3 scripts/api_test.py                  # OpenAI / Anthropic APIs: streaming, tool calls, reasoning
-python3 scripts/vision_api_test.py           # images
+python3 scripts/vision_api_test.py           # images and videos
 ```
 
 The integration tests under `scripts/` (`decode_consistency.py`, `multiseq_test.py`, `prefix_cache_test.py`,

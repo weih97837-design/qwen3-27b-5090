@@ -10,6 +10,7 @@
 #include "kernels.h"
 #include "draft.h"
 #include "model.h"
+#include "video.h"
 
 using namespace q27;
 
@@ -25,6 +26,9 @@ int guard(F&& f) {
   } catch (const KvFull& e) {  // (recoverable: the caller frees pages and retries)
     g_error = e.what();
     return -2;
+  } catch (const VideoError& e) {  // (the client's video cannot be used: HTTP 400)
+    g_error = e.what();
+    return -3;
   } catch (const std::exception& e) {
     g_error = e.what();
     return -1;
@@ -295,6 +299,9 @@ int q27_spec_draft(void* m, int32_t* chain) {
 }
 
 // Masks of a decoding sequence from its next step on (Model::spec_set_masked; area -1: the running one).
+int q27_spec_set_block(void* m, int area, int block) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_block(area, block); });
+}
 int q27_spec_set_masked(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->spec_set_masked(area); });
 }
@@ -326,17 +333,25 @@ int q27_share_mark(void* m, int pos) {
 int q27_seq_drop(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_drop(area); });
 }
+// Device memory lent for video decoding (Model::kv_lend): *id is the loan, or -1 when the pool cannot spare it.
+int q27_kv_lend(void* m, int64_t bytes, int* id) {
+  return guard([&] { *id = static_cast<Model*>(m)->kv_lend(size_t(std::max<int64_t>(0, bytes))); });
+}
+int q27_kv_unlend(void* m, int id) {
+  return guard([&] { static_cast<Model*>(m)->kv_unlend(id); });
+}
+int64_t q27_kv_lent(void* m) { return int64_t(static_cast<Model*>(m)->kv_lent()); }
 int q27_seq_suspend(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_suspend(area); });
 }
 
 // Batched speculative steps (P6-10, Model::spec_step_lanes): lanes[n] (-1: the running sequence, else a
-// parking area); out [n][8] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
+// parking area); out [n][16] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
 int q27_max_lanes(void* m) { return static_cast<Model*>(m)->max_lanes(); }
 int q27_spec_step_lanes(void* m, const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
   return guard([&] { static_cast<Model*>(m)->spec_step_lanes(lanes, n, out, counts); });
 }
-// Lanes with masks (Model::spec_draft_lanes): chain [n][8].
+// Lanes with masks (Model::spec_draft_lanes): chain [n][16] (lane z's block rows, then -1).
 int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
   return guard([&] { static_cast<Model*>(m)->spec_draft_lanes(lanes, n, chain); });
 }
@@ -346,6 +361,8 @@ int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0;
 int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
 // Rows of the block of the step the last q27_spec_step returned (Q27_SPEC_ADAPT: 8 or the draft's block).
 int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
+// Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).
+int q27_last_lane_block(void* m, int z) { return static_cast<Model*>(m)->last_lane_block(z); }
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {
@@ -528,11 +545,26 @@ int q27_mm_encode(void* m, int i, const float* pixels) {
   return guard([&] {
     VisionPixels px;
     px.patches = pixels;
-    static_cast<Model*>(m)->mm_encode(i, px);
+    static_cast<Model*>(m)->mm_encode(i, &px);
   });
 }
 int q27_mm_encode_rgb(void* m, int i, const uint8_t* rgb, const float* norm) {
-  return guard([&] { static_cast<Model*>(m)->mm_encode(i, rgb_pixels(rgb, norm)); });
+  return guard([&] {
+    const VisionPixels px = rgb_pixels(rgb, norm);
+    static_cast<Model*>(m)->mm_encode(i, &px);
+  });
+}
+// A video's frame pairs i .. i + n - 1 (spans of one grid): frames [2n] resized frames as in q27_mm_encode_rgb,
+// the pair of span i + k being frames[2k], frames[2k + 1].
+int q27_mm_encode_frames(void* m, int i, int n, const uint8_t* const* frames, const float* norm) {
+  return guard([&] {
+    std::vector<VisionPixels> px(std::max(n, 0));
+    for (int k = 0; k < n; k++) {
+      px[k] = rgb_pixels(frames[2 * k], norm);
+      px[k].rgb2 = frames[2 * k + 1];
+    }
+    static_cast<Model*>(m)->mm_encode(i, px.data(), n);
+  });
 }
 int q27_mm_embeds(void* m, int i, bf16* out) {
   return guard([&] { static_cast<Model*>(m)->mm_embeds(i, out); });
@@ -540,6 +572,41 @@ int q27_mm_embeds(void* m, int i, bf16* out) {
 
 int q27_mm_put(void* m, int i, const bf16* in) {
   return guard([&] { static_cast<Model*>(m)->mm_put(i, in); });
+}
+
+// Videos: the container's video track (no CUDA): out [6] = codec (VideoCodec), width, height (upright: a rotated
+// video's turned), frames, frames
+// per second, frames an edit list leaves out at the start. -3: the file cannot be used (q27_last_error).
+int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
+  return guard([&] {
+    const VideoTrack t = video_demux(data, size_t(n));
+    const double v[6] = {double(t.codec), double(t.display_width()), double(t.display_height()), double(t.frames()),
+                         t.fps, double(t.skip_front)};
+    std::memcpy(out, v, sizeof v);
+  });
+}
+
+// Device memory decoding a video's frames from `first` on to out_w x out_h takes (video_memory; the parser on the
+// CPU, no decoder): out [4] = bytes, sessions, bytes per session, decode surfaces. -3: the file cannot be used.
+int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int sessions, int first, double* out) {
+  return guard([&] {
+    const VideoMemory v = video_memory(data, size_t(n), out_w, out_h, sessions, first);
+    const double r[4] = {double(v.bytes), double(v.sessions), double(v.per_session), double(v.surfaces)};
+    std::memcpy(out, r, sizeof r);
+  });
+}
+
+// Frames want[n_want] (ascending) of a video, decoded on NVDEC and resized on the GPU to out_w x out_h (0: their
+// size; PIL's bicubic), as RGB [h][w][3] uint8 into out (host), one after another. sessions: parallel decoders
+// (0: one per NVDEC engine). stats [5] = frames presented, pictures decoded, sessions, setup ms, total ms.
+int q27_video_frames(const uint8_t* data, int64_t n, const int32_t* want, int n_want, int out_w, int out_h, int sessions,
+                     uint8_t* out, double* stats) {
+  return guard([&] {
+    const VideoDecodeStats st = video_frames(data, size_t(n), std::vector<int>(want, want + n_want), out_w, out_h, out,
+                                             sessions);
+    const double v[5] = {double(st.presented), double(st.decoded), double(st.sessions), st.setup_ms, st.total_ms};
+    std::memcpy(stats, v, sizeof v);
+  });
 }
 
 int q27_debug_kv(void* m, int layer, int pos, int n, void* out) {
@@ -626,6 +693,19 @@ int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 }
 int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* oa, float* ob) {
   return kernel([&] { linear_bf16_pair(x, wa, wb, T, N, K, oa, ob, ts()); });
+}
+// RMSNorm (FP8 activations into q) then in_proj_a / b as the GDN prefill runs them; h: [T][5120] scratch.
+int q27t_norm_linear_bf16_pair(const float* x, const bf16* norm_w, float eps, const bf16* wa, const bf16* wb, int T,
+                               float* h, uint8_t* q, float* oa, float* ob) {
+  return kernel([&] {
+    const bool fused = linear_bf16_pair_norm_ok(T);
+    rmsnorm_quant(x, norm_w, T, eps, fused ? nullptr : h, {QuantOut::kFp8, 1.f, q, nullptr}, ts(), nullptr, 0,
+                  fused ? h : nullptr);
+    if (fused)
+      linear_bf16_pair(x, wa, wb, T, 48, dims::kHidden, oa, ob, ts(), h, norm_w);
+    else
+      linear_bf16_pair(h, wa, wb, T, 48, dims::kHidden, oa, ob, ts());
+  });
 }
 int q27t_swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst) {
   return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts()); });
