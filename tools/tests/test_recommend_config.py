@@ -30,8 +30,8 @@ def detected(**overrides):
 
 def test_5090_wsl_vm_48_gib_recommends_auto_pool_and_wslconfig_hint():
     rec = rc.recommend(detected())
-    assert rec["env"]["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves (about 580K by this estimate)
-    assert "約 5" in rec["reasons"]["KV_POOL_TOKENS"]
+    assert rec["env"]["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves (about 608K by this estimate)
+    assert "約 608,256" in rec["reasons"]["KV_POOL_TOKENS"]
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert rec["env"]["SPILL_RAM_GIB"] == "24"  # (48 - 8 - 4) * 0.75 = 27 -> 24
     assert len(rec["hints"]) == 1
@@ -49,7 +49,7 @@ def test_96_gib_gpu_pool_is_auto_and_budget_is_real():
     assert rec["env"]["KV_POOL_TOKENS"] == "0"  # no cap: the engine takes what the budget leaves
     assert rec["env"]["MAX_SEQS"] == "8"
     assert rec["env"]["MAX_TOKENS"] == "262144"
-    assert "預算 94.00 GiB" in rec["reasons"]["KV_POOL_TOKENS"]  # 96 - 0.5 - 1.5 reserve
+    assert "預算 94.50 GiB" in rec["reasons"]["KV_POOL_TOKENS"]  # 96 - 0.5 - 1.0 reserve
 
 
 def test_wsl_hint_rounds_host_ram_before_reserve():
@@ -92,7 +92,7 @@ def test_max_seqs_drops_when_the_parking_areas_do_not_fit():
 def test_budget_is_total_minus_used_minus_the_reserve():
     rec = rc.recommend(detected(vram_total_gib=32.0, vram_used_gib=0.5))
     assert f"預算 {32.0 - 0.5 - rc.VRAM_RESERVE_GIB:.2f} GiB" in rec["reasons"]["KV_POOL_TOKENS"]
-    assert rc.VRAM_RESERVE_GIB == 1.5
+    assert rc.VRAM_RESERVE_GIB == 1.0
 
 
 def test_gpu_too_small_warns_and_never_emits_a_zero_context():

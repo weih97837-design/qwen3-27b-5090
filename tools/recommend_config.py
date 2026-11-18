@@ -39,7 +39,7 @@ GiB = 2**30
 MiB = 2**20
 
 # VRAM (section 5: the engine budget is the free VRAM minus VRAM_RESERVE_GIB, the default of memory.cc).
-VRAM_RESERVE_GIB = 1.5
+VRAM_RESERVE_GIB = 1.0  # the display runs on the iGPU; 1.5-2 when the dGPU drives a display
 # Weights + draft + state + activations, derived from the documented 605,504-token pool at the 30.3 GiB budget of a 5090 with
 # 18 KiB/token NVFP4 KV.
 NON_KV_GIB = 19.9
@@ -47,7 +47,7 @@ PARKING_AREA_GIB = 0.19  # one parking area (about 190 MiB); MAX_SEQS = n has n 
 PARKING_GIB = 7 * PARKING_AREA_GIB  # 7 parking areas for MAX_SEQS = 8: about 1.33 GiB
 KV_BYTES_PER_TOKEN = 18432  # 18 KiB, NVFP4 KV
 POOL_STEP_TOKENS = 1024  # estimates are rounded down to this many tokens
-# (no cap: KV_POOL_TOKENS=0 gives the pool the VRAM budget leaves, with the parking areas lent to it; about 590-600K tokens
+# (no cap: KV_POOL_TOKENS=0 gives the pool the VRAM budget leaves, with the parking areas lent to it; about 620-630K tokens
 # on an RTX 5090 with MAX_SEQS 8 and DSpine)
 FULL_CONTEXT_TOKENS = 262144  # MAX_TOKENS when the pool holds it
 POOL_FLOOR_TOKENS = 1024  # never emit 0 for MAX_TOKENS (the pool estimate is floored to this; KV_POOL_TOKENS=0 is the deliberate "auto")

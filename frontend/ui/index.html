@@ -999,7 +999,7 @@ const MEDIA_OPTS = [
     help: "Frames sampled from a video at most (2 per second until then), and the most a request's num_frames may ask for. Empty: 2,048 (the checkpoint's own is 768)." },
 ];
 const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
-const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB (default)" : `${v} GiB`) :
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "on" : "off") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "default" : v.toLocaleString()) : k === "spill_dir" ? (v || "(none)") : k === "vram_reserve_gib" ? (v == null ? "1.0 GiB (default)" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -1185,7 +1185,7 @@ function drawLaunch() {
     stackBar(bar, leg, pools.map(([name, bytes, c]) => ({ name, bytes, c })), p.budget, (q) => q.c, "planned");
     sum.append(bar, leg);
     sum.append(el("div", { class: "muted" }, `Device pools ${fmtGiB(p.device)} of a ${fmtGiB(p.budget)} budget` +
-      " (VRAM left free for other programs; budget = free VRAM minus the reserve" + (L.form.vram_reserve_gib == null ? ", 1.5 GiB by default)" : ")") +
+      " (VRAM left free for other programs; budget = free VRAM minus the reserve" + (L.form.vram_reserve_gib == null ? ", 1.0 GiB by default)" : ")") +
       ` · pinned host memory ${fmtGiB(p.host)} · free device memory ${fmtGiB(dev.free)} ` +
       (dev.source === "engine" ? "(the running engine's, before its pools)" : "(now, less an engine's CUDA context: estimated)")));
   }

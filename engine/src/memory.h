@@ -67,7 +67,7 @@ struct Budget {
   size_t asked = 0;           // legacy VRAM_BUDGET_GIB, if it was above the budget (and so not used)
 };
 
-// max(0, free - VRAM_RESERVE_GIB (default 1.5)), or the legacy VRAM_BUDGET_GIB if that is lower.
+// max(0, free - VRAM_RESERVE_GIB (default 1.0)), or the legacy VRAM_BUDGET_GIB if that is lower.
 Budget make_budget();
 // The same for a device with `free` of `total` bytes free (after the CUDA context), without CUDA (Options::plan_only).
 Budget budget_for(size_t free, size_t total);
