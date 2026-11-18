@@ -619,7 +619,8 @@ class Scheduler:
                 reason = "kv"
             elif self.min_tps > 0 and self.predicted_rate(len(self.alive) + 1) < self.min_tps:
                 reason = "speed"
-        s.held_reason = reason if reason else s.held_reason
+        if reason:
+            s.held_reason = reason
         if reason and not s.held:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
@@ -1523,7 +1524,7 @@ class Scheduler:
                          "decode_wall": (now - s.first_token) if s.first_token else 0.0,
                          "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
-                         "wait": s.held_reason if s.held and s in self.waiting else None,
+                         "wait": getattr(s, "held_reason", None) if s.held and s in self.waiting else None,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id})
             if s.restoring is not None:
