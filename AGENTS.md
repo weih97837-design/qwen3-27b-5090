@@ -20,3 +20,5 @@ Guidance for AI agents working in this repository. / 給在此 repo 工作的 AI
   工具測試：`python -m pytest tools/tests -q`。
 - Do not stop or change a running engine (`docker compose down`, `POST /admin/engine`) without the user's request: it frees VRAM and fails in-flight requests.
   未經使用者要求，不要停止或變更正在執行的引擎（`docker compose down`、`POST /admin/engine`）：會釋放 VRAM 並使進行中的請求失敗。
+- Writing an agent client for this server (agent id, byte-stable prefixes, video input): `docs/agent-client-guide.md`.
+  寫呼叫本伺服器的代理程式（代理識別、位元組穩定的前綴、影片輸入）：`docs/agent-client-guide.md`。
