@@ -580,7 +580,8 @@ function drawSessions() {
       ["age", fmtS(s.age)],
       ["cache hit", s.prompt ? fmtPct(Math.min(s.cached, s.prompt) / s.prompt) : "–"],
       ["max new", fmtTok(s.max_new)],
-      ...(s.images ? [["image tokens", fmtTok(s.images)]] : []),
+      ...(s.media ? [["media", fmtMedia(s.media)]] : s.images ? [["image tokens", fmtTok(s.images)]] : []),
+      ...(s.wait ? [["waits for", s.wait === "kv" ? "KV room" : s.wait === "speed" ? "speed limit" : s.wait]] : []),
       ...(s.preempted ? [["preempted", s.preempted + "×"]] : []),
     ];
     return el("div", { class: "seq" },
@@ -599,6 +600,11 @@ function drawSessions() {
 
 // ---------------------------------------------------------------- log
 const LEVEL = { info: "--good", warn: "--warning", error: "--critical" };
+// Images, videos and their tokens of a request (stats.media_of): "2 img · 1 vid · 12.3K tok", "" without any.
+function fmtMedia(m) {
+  if (!m || !(m.images || m.videos)) return "";
+  return [m.images ? `${m.images} img` : null, m.videos ? `${m.videos} vid` : null, `${fmtTok(m.tokens)} tok`].filter(Boolean).join(" · ");
+}
 function logRow(e) {
   const r = e.rec, m = e.meta || r?.meta || {};
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
@@ -613,8 +619,9 @@ function logRow(e) {
     el("td", { class: "r" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
     el("td", { class: "r" }, r.accept ? r.accept.toFixed(2) : "–"),
     el("td", { class: "r" }, fmtS(r.total)),
+    el("td", { class: "r", title: "images and videos of the request, and their tokens" }, fmtMedia(m.media)),
     el("td", { class: "prev" }, m.preview || ""),
-  ] : [el("td", { colspan: 9, class: "prev", style: "max-width:none" }, e.text)];
+  ] : [el("td", { colspan: 10, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
     el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
   tr.title = "click for details";
@@ -623,7 +630,7 @@ function logRow(e) {
   if (state.open.has(e.n)) {
     tr.className += " sel";
     const detail = { ...e }; delete detail.n;
-    out.push(el("tr", { class: "sel" }, el("td", { colspan: 14 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
+    out.push(el("tr", { class: "sel" }, el("td", { colspan: 15 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
   }
   return out;
 }
@@ -633,8 +640,8 @@ function drawLog() {
   const tb = $("log"); tb.replaceChildren();
   tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"), el("th", {}, "Agent"),
     el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r" }, "TTFT"),
-    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", {}, "Last user message")));
-  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 14, class: "empty" }, "Nothing yet.")));
+    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", { class: "r" }, "Media"), el("th", {}, "Last user message")));
+  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 15, class: "empty" }, "Nothing yet.")));
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
   const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);

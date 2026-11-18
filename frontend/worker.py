@@ -1504,7 +1504,7 @@ class Scheduler:
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
-        from stats import agents_block, slot_rows, tiers_block  # (the frontend dir is on sys.path)
+        from stats import agents_block, media_of, slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
         if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
             self.slot_lanes = {}
@@ -1526,6 +1526,7 @@ class Scheduler:
                          "preempted": s.preempted, "held": s.held and s in self.waiting,
                          "wait": getattr(s, "held_reason", None) if s.held and s in self.waiting else None,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
+                         "media": media_of(s.images),
                          "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id})
             if s.restoring is not None:
                 rec = s.restoring

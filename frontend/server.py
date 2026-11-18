@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT / "reference"))
 import structured  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
-from stats import HUB, request_meta  # noqa: E402
+from stats import HUB, media_of, request_meta  # noqa: E402
 from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
                   openai_call, parse_output, parse_tool_calls, responses_messages, responses_template_kwargs,
@@ -596,6 +596,9 @@ class Generation:
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
         # skip_special_tokens does)
         self.hide = set(getattr(server.engine, "cfg", {}).get("eos", ())) if sampling.get("ignore_eos") else set()
+        meta = getattr(HUB.local, "meta", None)
+        if meta is not None and images:  # (the log's media column: how many images and videos, and their tokens)
+            meta["media"] = media_of(images)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock, MARKS if marked else None)
         self.text, self.sent = "", 0
