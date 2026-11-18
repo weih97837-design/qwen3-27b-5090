@@ -961,11 +961,21 @@ SKINNY_MAX_M = 64     # engine/src/model.h kSkinnyMaxM: a chunk of <= 64 tokens 
 L_PREFIX_OK = 8       # a reference that is not deterministic: outputs must agree on at least this many tokens
 
 
-def l_chunks(plan, n, cached=0, chunk=PREFILL_CHUNK):
+def l_chunks(plan, n, cached=0, chunk=PREFILL_CHUNK, iv=0):
     """The prefill chunks of the engine for a prompt of n tokens resumed at `cached` with the planned checkpoints `plan`:
     a copy of Model::prefill_cut / prompt_chunks (engine/src/model.cc): the plan is rounded down to multiples of 64 (prefix_begin),
-    a chunk ends at the next planned position that fits in it, else at a multiple of 64 (the last chunk of the prompt at its end)."""
+    a chunk ends at the next planned position that fits in it, else at a multiple of 64 (the last chunk of the prompt at its end).
+    iv: the engine's CHECKPOINT_INTERVAL (0: none), whose last 4 multiples more than 64 tokens from the plan and both ends are
+    checkpoints too (prefix_begin; the driver sets it above 2 * max_tokens, so normally none)."""
     pts = sorted({q // 64 * 64 for q in plan if cached < q // 64 * 64 < n})
+    if iv > 0:
+        fixed = pts + [cached, n]
+        p, k = (n - 1) // iv * iv, 0
+        while p > cached and k < 4:
+            if all(abs(q - p) > SKINNY_MAX_M for q in fixed):
+                pts.append(p)
+            p, k = p - iv, k + 1
+        pts.sort()
     pos, out = cached, []
     while pos < n:
         t = min(chunk, n - pos)
@@ -977,15 +987,21 @@ def l_chunks(plan, n, cached=0, chunk=PREFILL_CHUNK):
     return out
 
 
-def plan_final_chunk_ok(plan, n, cached=0, chunk=PREFILL_CHUNK):
-    """True when no chunk of the prefill is <= 64 tokens (such a chunk takes the decode GEMMs: not bit-identical to an uncut prefill)."""
-    return min(l_chunks(plan, n, cached, chunk)) > SKINNY_MAX_M
+def plan_final_chunk_ok(plan, n, cached=0, chunk=PREFILL_CHUNK, iv=0, resume=None):
+    """True when no chunk of the prefill is <= 64 tokens (such a chunk takes the decode GEMMs: not bit-identical to an uncut prefill).
+    resume: also for the prefill of a prompt resumed there (B at the video's end), rounded down to 64."""
+    if min(l_chunks(plan, n, cached, chunk, iv)) <= SKINNY_MAX_M:
+        return False
+    return resume is None or min(l_chunks(plan, n, resume // 64 * 64, chunk, iv)) > SKINNY_MAX_M
 
 
-def l_plan_ok(plan, n):
-    """(plan without short chunks, dropped): drops the highest checkpoint until plan_final_chunk_ok (here the generation prompt's start)."""
+def l_plan_ok(plan, n, resume=None, iv=0):
+    """(plan without short chunks, dropped): drops the highest checkpoint until plan_final_chunk_ok (here the generation prompt's start),
+    but never the one at `resume` or a lower one (B's hit); the result may still not be ok then (the caller says so)."""
     plan, dropped = sorted(plan), []
-    while len(plan) > 0 and not plan_final_chunk_ok(plan, n):
+    while plan and not plan_final_chunk_ok(plan, n, 0, PREFILL_CHUNK, iv, resume):
+        if resume is not None and plan[-1] // 64 * 64 <= resume // 64 * 64:
+            break
         dropped.append(plan.pop())
     return plan, dropped
 
@@ -1081,8 +1097,13 @@ def l_compare(ref, outs, relaxed):
     return bad
 
 
+def L_IV(R):
+    """The CHECKPOINT_INTERVAL of this worker (the driver sets it in worker_invocation)."""
+    return int(os.environ.get("CHECKPOINT_INTERVAL", "0") or 0)
+
+
 def l_describe(R, label, plan, n, cached=0):
-    chunks = l_chunks(plan, n, cached)
+    chunks = l_chunks(plan, n, cached, iv=L_IV(R))
     R.log(f"  chunks of {label}: {fmt_chunks(chunks)} (shortest {min(chunks)}{'' if min(chunks) > SKINNY_MAX_M else f', <= {SKINNY_MAX_M}: decode GEMMs'})")
 
 
@@ -1108,19 +1129,27 @@ def scen_l(R, spill_dir):
     except ImportError as e:
         raise ScenarioSkip(f"the server's modules are not importable here ({e})")
     n = len(ids_a)
-    at, dropped = l_plan_ok(at_full, n)  # the plan the checks run with: no chunk of <= 64 tokens (plan_final_chunk_ok)
-    assert resume in {q // 64 * 64 for q in at}, (resume, at)  # (B's hit: the video's end checkpoint is kept)
+    iv = L_IV(R)
+    at, dropped = l_plan_ok(at_full, n, resume, iv)  # the plan the checks run with: no chunk of <= 64 tokens (A from 0, B from resume)
+    plan_err = None
+    if resume not in {q // 64 * 64 for q in at}:
+        plan_err = f"the video's end checkpoint {resume} is not in the plan {at} (planned {at_full})"
+    elif not plan_final_chunk_ok(at, n, 0, PREFILL_CHUNK, iv, resume):
+        plan_err = (f"no plan keeps B's hit at {resume} without a chunk of <= {SKINNY_MAX_M} tokens (plan {at}: A {fmt_chunks(l_chunks(at, n, iv=iv))}, "
+                    f"B {fmt_chunks(l_chunks(at, n, resume // 64 * 64, iv=iv))}); use another --prompt-len")
     spans = media_a[0]
     R.log(f"  prompt {n} tokens: video of {len(spans)} pairs, {sum(gh * gw for _, gh, gw in spans)} tokens, "
           f"from token {spans[0][0]}; checkpoints {at_full}, B resumes at {resume}")
     if R.phase == "ctl":
         return l_ctl_phase(R, ids_a, ids_b, media_a, media_b, at_full, resume)
+    if plan_err and R.cache:  # (the reference and the ctl phase have printed their lines by now; the checks cannot run)
+        raise ScenarioSkip(plan_err)
     R.log(f"  plan of the checks (c): {at}" + (f" (dropped {dropped}: a chunk <= {SKINNY_MAX_M} tokens would be left)" if dropped else " (the full plan has no short chunk)"))
     l_describe(R, "A with the plan of the checks (c)", at, n)
     if R.cache:
         l_describe(R, "B resumed from A's checkpoint", at, n, resume // 64 * 64)
     else:
-        R.log(f"  chunks of the reference: {fmt_chunks(l_chunks([], n))}")
+        R.log(f"  chunks of the reference: {fmt_chunks(l_chunks([], n, iv=iv))}")
     s0 = R.snap("start")
     R.turn1("A", ids_a, at=at, media=media_a)
     if not R.cache:  # determinism control (a): the reference runs A a second time (the driver compares)
@@ -1381,6 +1410,8 @@ def main():
             r = run_worker(sa, s, "tiered", ph, spill_dir, work / f"tiered_{s}_{ph}.json", prior)
             if "error" in r and ph == "ctl":  # (info only: a crash of the controls does not fail the scenario)
                 say(f"  ctl: the control run exited {fmt_rc(r['error'])}; its lines are missing", flush=True)
+                shutil.rmtree(spill_dir, ignore_errors=True)
+                spill_dir.mkdir(parents=True)
                 continue
             if "error" in r:
                 err = f"the tiered run ({ph}) exited {fmt_rc(r['error'])}"
@@ -1390,6 +1421,8 @@ def main():
                 break
             if ph == "ctl":
                 ctl = r
+                shutil.rmtree(spill_dir, ignore_errors=True)  # (the controls leave nothing the checked run may see)
+                spill_dir.mkdir(parents=True)
                 continue
             outs.update(r["outs"])
             checks += r["checks"]
