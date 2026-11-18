@@ -1,5 +1,11 @@
 # Qwen3.8-27B on one RTX 5090
 
+繁體中文簡介請見 [README.zh-TW.md](README.zh-TW.md)
+
+- 在一張 RTX 5090 上執行 Qwen3.8-27B 的推論伺服器，提供 OpenAI / Anthropic 相容 API，支援圖片與影片輸入。
+- 本 repo 是 [mkyt/qwen3-27b-5090](https://github.com/mkyt/qwen3-27b-5090) 的 fork（MIT 授權），加上分層快取（VRAM → RAM → SSD）、多機器計數、繁體中文監控頁與 Windows 原生程式包。
+- Windows 快速開始：到 [Releases](https://github.com/weih97837-design/qwen3-27b-5090/releases/latest) 下載 zip、核對 SHA-256、解壓縮後執行 `start.cmd`。
+
 A single-purpose inference engine for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on one NVIDIA RTX 5090
 (32 GB, SM120), written from scratch in C++ / CUDA with a small Python server in front. It serves OpenAI- and
 Anthropic-compatible APIs with images, so coding agents such as Claude Code and Codex can use it as their backend.
