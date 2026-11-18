@@ -102,10 +102,11 @@ class Images:
 
     MAX_BYTES = {"image": 32 << 20, "video": 256 << 20}
 
-    def __init__(self, path, max_pixels, max_tokens=16384):
+    def __init__(self, path, max_pixels, max_tokens=16384, env=None):
         from imageproc import ImageProcessor
 
         self.path = path
+        self.env = env  # (VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES: videoproc.VideoProcessor; None: os.environ)
         self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
         self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
@@ -116,7 +117,7 @@ class Images:
         if self._video is None:
             from videoproc import VideoProcessor
 
-            self._video = VideoProcessor(self.path)
+            self._video = VideoProcessor(self.path, self.env)
         return self._video
 
     @staticmethod
@@ -746,6 +747,7 @@ class Server:
         self.tok_lock = threading.Lock()
         self.images_lock = threading.Lock()
         self._images = None
+        self._images_key = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
         self.pads = tuple(tok.token_id(t) for t in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
@@ -766,10 +768,14 @@ class Server:
         cfg = self.engine.cfg
         if cfg["env"]["VISION"] == "off":
             return None
+        env = {k: cfg["env"].get(k) or None for k in ("IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")}
         with self.images_lock:
-            if self._images is None:
+            # (rebuilt when an engine start changed these settings: the engine's IMAGE_TOKENS rows and the server's
+            # video bounds must be the same ones)
+            if self._images is None or self._images_key != (cfg["model"], tuple(env.items())):
                 self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)),
-                                      int(os.environ.get("IMAGE_TOKENS", 16384)))
+                                      int(env["IMAGE_TOKENS"] or os.environ.get("IMAGE_TOKENS") or 16384), env)
+                self._images_key = (cfg["model"], tuple(env.items()))
             return self._images
 
     def encode(self, text):

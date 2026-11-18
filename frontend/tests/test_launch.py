@@ -17,7 +17,7 @@ from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
 DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dspine", "vision": "host", "max_seqs": 8,
-            "max_tokens": 262144, "vram_reserve_gib": None,
+            "max_tokens": 262144, "vram_reserve_gib": None, **launch.MEDIA_DEFAULTS,
             **{k: (launch.spill_dir_default() if v[2] == "path" else v[1]) for k, v in launch.TIER_SETTINGS.items()}}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
 
@@ -442,3 +442,84 @@ def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
         env["VIDEO_MAX_FRAMES"] = bad
         with pytest.raises(ValueError):
             launch.set_engine_env(tmp_path)
+
+
+# ---------------------------------------------------------------- the image / video settings
+
+def test_media_defaults_are_the_upstream_ones():
+    """The defaults live in launch.MEDIA_DEFAULTS (None: the checkpoint's 12,288 tokens and 768 frames, and
+    IMAGE_TOKENS 16,384 or VIDEO_MAX_TOKENS when more); compose.yaml and the documentation say the same."""
+    import re
+    assert launch.MEDIA_DEFAULTS == {"image_tokens": None, "video_max_tokens": None, "video_max_frames": None}
+    assert launch.IMAGE_TOKENS == 16384
+    compose = (ROOT / "compose.yaml").read_text()
+    for key, (var, lo, hi) in launch.MEDIA_SETTINGS.items():
+        m = re.search(rf"^\s+{var}: \$\{{{var}:-([^}}]*)\}}", compose, re.M)
+        assert m, var
+        want = launch.MEDIA_DEFAULTS[key]
+        assert m.group(1) == ("" if want is None else str(want)), var
+        assert launch.ENV_NAMES[key] == var and key in launch.Launch.KEYS
+    assert launch.image_tokens_env(DEFAULTS) == 16384
+
+
+def test_media_validate():
+    lc = settings()
+    s = lc.validate({"image_tokens": 32768, "video_max_tokens": 131072, "video_max_frames": 2048})
+    assert (s["image_tokens"], s["video_max_tokens"], s["video_max_frames"]) == (32768, 131072, 2048)
+    assert lc.validate({"video_max_tokens": None})["video_max_tokens"] is None
+    for bad in ({"image_tokens": 0}, {"image_tokens": -1}, {"image_tokens": 262145}, {"video_max_tokens": 1.5},
+                {"video_max_tokens": "131072"}, {"video_max_tokens": True}, {"video_max_frames": 1},
+                {"video_max_frames": 16385}, {"video_max_frames": float("nan")}):
+        with pytest.raises(ValueError):
+            lc.validate(bad)
+
+
+def test_image_tokens_follow_the_video_setting_in_the_engine_env(monkeypatch, tmp_path):
+    lc = settings()
+    monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
+    for changes, want in (({}, ("16384", None, None)), ({"video_max_tokens": 8192}, ("16384", "8192", None)),
+                          ({"video_max_tokens": 131072, "video_max_frames": 2048}, ("131072", "131072", "2048")),
+                          ({"video_max_tokens": 131072, "image_tokens": 40000}, ("40000", "131072", None)),
+                          ({"image_tokens": 4096}, ("4096", None, None))):
+        env = lc.config(lc.validate(dict(changes, spec="none")))["env"]
+        assert (env["IMAGE_TOKENS"], env["VIDEO_MAX_TOKENS"], env["VIDEO_MAX_FRAMES"]) == want, changes
+
+
+def test_media_env_settings_are_read_from_the_variables(monkeypatch):
+    for var in launch.MEDIA_ENV:
+        monkeypatch.delenv(var, raising=False)
+    s = launch.env_settings()
+    assert {k: s[k] for k in launch.MEDIA_SETTINGS} == launch.MEDIA_DEFAULTS
+    monkeypatch.setenv("VIDEO_MAX_TOKENS", "131072")
+    monkeypatch.setenv("VIDEO_MAX_FRAMES", "2048")
+    monkeypatch.setenv("IMAGE_TOKENS", "")  # (empty: follows VIDEO_MAX_TOKENS)
+    s = launch.env_settings()
+    assert (s["image_tokens"], s["video_max_tokens"], s["video_max_frames"]) == (None, 131072, 2048)
+    monkeypatch.setenv("IMAGE_TOKENS", "-5")
+    warned = []
+    assert launch.parse_media("image_tokens", "-5", warn=warned.append) is None and warned
+
+
+def test_video_env_is_not_part_of_a_plan_job_but_image_tokens_are(monkeypatch, tmp_path):
+    """Only the engine's IMAGE_TOKENS (a pinned host pool) changes a plan; VIDEO_MAX_* is the server's."""
+    lc = settings()
+    monkeypatch.setattr(launch, "model_dir", lambda w: tmp_path)
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": 1}')
+    jobs = []
+    monkeypatch.setattr(lc, "_run", lambda j: jobs.append(j) or [{"fits": True}] * len(j))
+    base = lc.validate({"spec": "none"})
+    lc.plan_many([base, dict(base, video_max_tokens=8192, video_max_frames=100)], DEVICE)
+    assert len(jobs) == 1 and len(jobs[0]) == 1
+    assert not set(jobs[0][0]["env"]) & launch.VIDEO_ENV and jobs[0][0]["env"]["IMAGE_TOKENS"] == "16384"
+    lc.plan_many([dict(base, image_tokens=65536)], DEVICE)
+    assert len(jobs) == 2 and jobs[1][0]["env"]["IMAGE_TOKENS"] == "65536"
+
+
+def test_media_env_changes():
+    lc = object.__new__(launch.Launch)
+    lc.settings = lc.at_start = dict(DEFAULTS)
+    lc.settings = dict(lc.at_start, video_max_tokens=131072, video_max_frames=2048)
+    assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "131072", "VIDEO_MAX_FRAMES": "2048"}
+    lc.at_start, lc.settings = lc.settings, dict(lc.settings, video_max_tokens=None, image_tokens=50000)
+    assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "", "IMAGE_TOKENS": "50000"}
