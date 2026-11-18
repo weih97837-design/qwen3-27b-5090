@@ -105,7 +105,7 @@ everywhere above.
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
-| `MAX_SEQS` | 4 | Requests the engine can run at once (1–8); more wait in a queue. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs about 0.25 GiB of fixed per-request buffers. KV pool with gdnfp4, NVFP4 KV and DFlash2: 620,096 tokens with 4, 605,504 with 8 (DSpine's tables take about 3,600 tokens of it: 601,856 with 8) |
+| `MAX_SEQS` | 8 | Requests the engine can run at once (1–8; 8 is the engine's maximum and this fork's default since the pool is uncapped); more wait in a queue. The admission target `target_seqs` starts at `MAX_SEQS`, so up to 8 requests decode together: total throughput rises, each request's own speed drops; set `target_seqs` in /ui to run fewer. How many actually run is decided while running (`ADMIT_KV`, `MIN_SEQ_TPS`, `target_seqs` of the admin API). Each request beyond the first has a 189.6 MiB parking area at the top of the KV pool, lent to the KV cache while unused (P7-13), so `MAX_SEQS=8` costs 7 parking areas (1.3 GiB, but lent to the KV cache while unused) and about 0.25 GiB of fixed per-request buffers; `STATE_HOST_CACHE` (8 GiB of pinned checkpoint slots) is unchanged. An explicit `MAX_SEQS` in the environment, `.env`, `settings.ini` or the tray overrides the default. KV pool with gdnfp4, NVFP4 KV and DFlash2: 620,096 tokens with 4, 605,504 with 8 (DSpine's tables take about 3,600 tokens of it: 601,856 with 8) |
 | `ADMIT_KV` | 1 | 1: a waiting request starts only when the KV pool can take it: free pages plus pages held only by prefix-cache checkpoints must cover the remaining prompts of the running requests, `KV_RESERVE_TOKENS` of output per request, and one more parking area. With nothing running a request always starts. 0: start by count only (a request that later runs out of KV is suspended) |
 | `KV_RESERVE_TOKENS` | 4096 | Output tokens per request that `ADMIT_KV` keeps room for (or the request's remaining `max_tokens`, if smaller) |
 | `MIN_SEQ_TPS` | 0 | Lower bound of tokens per second per request; 0 disables it. Another request does not start if it would push each below this. The prediction uses the measured speed at each number of running requests (decode turns, about the last 10 s); unmeasured counts are scaled from smaller ones by the step time |
@@ -126,7 +126,7 @@ everywhere above.
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
 | `STATE_HOST_CACHE` | 8 | GiB of pinned host memory for prefix-cache checkpoints (8 = about 42 checkpoints, twice the 21 of 4; 0 disables the cache; the server sets 8 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning takes about 0.45 s per GiB on WSL2): one by one while the server is idle, or when a checkpoint needs one |
-| `KV_POOL_TOKENS` | 524288 | KV pool size in tokens: the default is 512K (about 9 GiB of VRAM with NVFP4 KV). 0 = all the VRAM budget leaves. When set, it is the KV cache with every parking area in use; the pool is that plus the parking areas (P7-13). Checkpoints evicted from the pool go to the spill tiers ([tiered-cache.md](tiered-cache.md)). With MAX_TOKENS_FIT=1 (the default) a pool the VRAM budget cannot hold is lowered to what fits (logged), and MAX_TOKENS with it if needed. |
+| `KV_POOL_TOKENS` | 0 | KV pool size in tokens. The default 0 is the maximum: all the VRAM budget leaves (free VRAM minus `VRAM_RESERVE_GIB`, less weights, state and activations), an estimated 600K+ tokens on an RTX 5090 with `MAX_SEQS=8` and DSpine (not measured; the startup log and the stats page show the real size); the parking areas are pages of that pool. The pool therefore depends on the free VRAM at each start: read the real size from the stats page (`pool_pages` of the engine's cache stats), not from the setting, which shows as "auto (max)". With `STATE_HOST_CACHE=0` (no prefix cache) 0 means a pool of `MAX_TOKENS` only. A number (e.g. 524288 = 512K, about 9 GiB of VRAM with NVFP4 KV) fixes it: it is the KV cache with every parking area in use, and the pool is that plus the parking areas (P7-13). An explicit value in the environment, `.env`, `settings.ini` or the tray overrides the default. Checkpoints evicted from the pool go to the spill tiers ([tiered-cache.md](tiered-cache.md)). With MAX_TOKENS_FIT=1 (the default) a pool the VRAM budget cannot hold is lowered to what fits (logged), and MAX_TOKENS with it if needed. |
 | `SPILL_RAM_GIB` | 64 | Host RAM for KV checkpoints evicted from the GPU pool, in GiB. 0: off (the evicted checkpoints are dropped). Counts against the WSL2 VM's memory ([tiered-cache.md](tiered-cache.md#wsl2-注意事項)) |
 | `SPILL_PINNED_GIB` | 8 | Pinned host memory (GiB) for spill entries, pinned in 1 GiB slabs while the server is idle (`SPILL_PINNED_SLAB_MIB`). Faster copies. An entry is stored in segments (each inside one slab), so entries larger than a slab are pinned too; an entry the pool cannot hold completely uses normal memory. Part of the `SPILL_RAM_GIB` budget: the whole pinned pool counts toward it (reserved host memory, even when unused), and the value is clamped at startup to below it, leaving room for one checkpoint (at least 0.25 GiB). 8 by default since v0.3.2 (verified on an RTX 5090); 0: off. Counts against Windows shared GPU memory ([tiered-cache.md](tiered-cache.md)) |
 | `SPILL_ASYNC_IO` | 1 | 1: checkpoint pages are copied on a separate CUDA stream, so a spill or restore no longer stalls the GPU and the engine thread. The CPU is only freed for entries in pinned memory (copies to/from pageable memory block the CPU), so use it together with `SPILL_PINNED_GIB`. On by default since v0.3.2; 0: off |
@@ -148,7 +148,7 @@ everywhere above.
 | `IMAGE_TOKENS` | 131,072 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 1.25 GiB at 131,072; 160 MiB at 16,384). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more, so 131,072 by default. The engine library's own default (`q27lib.Engine`) is 16,384. See [Host memory](#host-memory-of-images-and-videos) |
 | `VIDEO_MAX_TOKENS` | 131,072 (the checkpoint's own: 12,288) | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 170 s at 2 frames per second (341 frames) keeps its size and longer ones get smaller frames; with the checkpoint's 12,288 that is 32 s. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
 | `VIDEO_MAX_FRAMES` | 2,048 (the checkpoint's own: 768) | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
-| `VRAM_RESERVE_GIB` | 1.5 | The minimum VRAM to keep unused, in GiB: the budget of the engine is the free VRAM minus this. It is for the desktop and other programs, and to stay below the point where Windows (WDDM) starts to page GPU memory to system RAM without an error, which slows inference about 7 times. 1.5 GiB is what the automatic budget was on an RTX 5090. Lowering it gives the KV pool more room (each 1 GiB is about 58K tokens of NVFP4 KV at 18 KiB per token) at the risk of that paging; a negative or unreadable value counts as 0. The log shows `reserve R GiB, budget B GiB`. The old `VRAM_BUDGET_GIB` (legacy, prefer `VRAM_RESERVE_GIB`) still works as an upper bound that can only lower the budget |
+| `VRAM_RESERVE_GIB` | 1.0 | The minimum VRAM to keep unused, in GiB: the budget of the engine is the free VRAM minus this. It is for the desktop and other programs, and to stay below the point where Windows (WDDM) starts to page GPU memory to system RAM without an error, which slows inference about 7 times. The default is 1.0 GiB because the display is expected on the iGPU, so the dGPU needs little for the desktop (it was 1.5 GiB, the old automatic budget on an RTX 5090; each 0.5 GiB less is about 29K more tokens of KV pool in auto mode). If the dGPU also drives a display or other GPU programs run on it, raise it to 1.5–2 to stay clear of WDDM paging. Lowering it gives the KV pool more room (each 1 GiB is about 58K tokens of NVFP4 KV at 18 KiB per token) at the risk of that paging; a negative or unreadable value counts as 0. The log shows `reserve R GiB, budget B GiB`. The old `VRAM_BUDGET_GIB` (legacy, prefer `VRAM_RESERVE_GIB`) still works as an upper bound that can only lower the budget |
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
@@ -337,11 +337,11 @@ happens depends on the settings:
 | Setting | Effect |
 | --- | --- |
 | Default | The KV pool takes what is left. If it cannot hold `MAX_TOKENS`, `MAX_TOKENS` is lowered as well (`MAX_TOKENS_FIT=1`) |
-| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4, `KV_POOL_TOKENS=0`) |
+| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 600K with nothing else on the GPU, nvfp4, the default `KV_POOL_TOKENS=0`) |
 | `MAX_TOKENS_FIT=0` | The engine does not start if the KV pool cannot hold `MAX_TOKENS` |
 
-For scale, uncapped (`KV_POOL_TOKENS=0`) with gdnfp4, nvfp4, `MAX_SEQS=8`, by the memory other programs use: nothing, a KV pool of about 610K
-tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower. This fork's defaults cap the pool at 524,288 tokens (`KV_POOL_TOKENS=524288`) with `MAX_SEQS=4`.
+For scale, with the defaults (`KV_POOL_TOKENS=0`, gdnfp4, nvfp4, `MAX_SEQS=8`), by the memory other programs use: nothing, a KV pool of about 600K
+tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower. These are this fork's defaults (`KV_POOL_TOKENS=0`, `MAX_SEQS=8`); a fixed `KV_POOL_TOKENS` is lowered to what fits with `MAX_TOKENS_FIT=1`, while 0 always takes what is left.
 
 An engine that does not start allocates no pools. With `ENGINE_IDLE_UNLOAD_S` set, the requests waiting for it get 503 with the
 reason (also `refused` in `GET /admin/engine`), and the next request tries again; there are no retries in between. Without it,
@@ -367,7 +367,7 @@ variables:
 | `vision` | `VISION` | `host`, `fp8`, `bf16`, `off` |
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
-| `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.5 GiB) or a number of GiB from 0 up to the device's memory |
+| `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.0 GiB) or a number of GiB from 0 up to the device's memory |
 | `image_tokens` | `IMAGE_TOKENS` | `null` (16,384, or `video_max_tokens` when that is more: 131,072 by default) or 1 to 262,144: image and video tokens of one request. Pinned host memory, 10 KiB per token, allocated when the engine starts (it changes the plan's host memory) |
 | `video_max_tokens` | `VIDEO_MAX_TOKENS` | `null` (131,072; the checkpoint's own: 12,288) or 1 to 262,144: tokens of one video. The server's own bound: no pool changes. While a video is encoded its resized frames take 6 KiB of host memory per token |
 | `video_max_frames` | `VIDEO_MAX_FRAMES` | `null` (2,048; the checkpoint's own: 768) or 2 to 16,384: frames sampled from a video, and the most a request may ask for |
@@ -431,6 +431,42 @@ later change can evict the tiered cache fairly between agents. Nothing changes f
 The stats page shows an **Agents** table (requests running and waiting, requests, prompt and cached tokens; RAM and SSD
 bytes are placeholders) and an Agent column in the Log. In `/ui/state` each request row has `agent` and `agent_id`, and the
 `agents` block lists the aggregates.
+
+## Client counting
+
+The server counts the requests of each client machine, so you can see who uses it. It is counting only: admission and
+ordering stay as they are (one queue), and nothing is limited, capped or rejected here, and there are no API keys. Limits
+are the job of the client machines' own agent programs (see `docs/agent-client-guide.md`).
+
+Who a request comes from, in this order:
+
+1. The header `X-Client-Id: <name>` (at most 64 characters: letters of any script, so a Chinese name works, digits and `. _ - /`; other characters become `_`; empty counts as none. HTTP headers carry bytes: send a non-ASCII name UTF-8 encoded; a client library that only accepts latin-1 header values should use an ASCII name).
+2. The setting `CLIENT_NAMES` (environment, empty by default): a comma-separated list of `address=name` or `network/prefix=name`,
+   e.g. `192.168.1.11=PC-A,192.168.1.12=PC-B,192.168.2.0/24=Lab`. An exact address is a `/32` (or `/128`); the longest matching
+   prefix wins. Entries that do not parse are ignored.
+3. The peer's IP address itself.
+
+A loopback peer (127.0.0.0/8, `::1`: the stats page, the tray app, tests on the server's own machine) is `local`.
+Behind a reverse proxy: the first entry of `X-Forwarded-For` replaces the peer address, but only when the immediate peer is a
+loopback or private address and the header is present. A public peer cannot choose its address that way. The header
+`X-Client-Id` is trusted as sent (there is no authentication): it is a label, not an identity check.
+Any client on a private network can also choose its address through `X-Forwarded-For`: the counts are for looking, not for
+security. With Docker, source addresses are kept when the port is published normally; a userland proxy or a rootless setup
+makes every machine appear as the bridge gateway (a 172.x address): then give each machine an `X-Client-Id`.
+
+Counted per client since the server's engine started (the table keeps at most 256 clients; the least recently seen go first):
+requests, requests running and waiting (queued or restoring), prompt tokens, cached tokens (and the hit ratio), output tokens,
+media tokens, errors, cancelled requests, the average queue wait (arrival until the prefill begins) and when the client was last seen.
+
+Where to read it: `/ui/state` has a `clients` list (`client`, `running`, `waiting`, `waiting_tokens`, `requests`,
+`prompt_tokens`, `cached_tokens`, `hit`, `output_tokens`, `media_tokens`, `avg_wait_s`, `errors`, `cancelled`, `first_seen_s`,
+`last_seen` in seconds ago); each request row has `client`, and so does the finished-request record in the Log. `/metrics` has
+labelled series `q27:client_requests_total{client="PC-A"}`, `q27:client_running`, `q27:client_waiting`,
+`q27:client_prompt_tokens_total`, `q27:client_cached_tokens_total`, `q27:client_output_tokens_total`,
+`q27:client_media_tokens_total`, `q27:client_errors_total`, `q27:client_cancelled_total`, `q27:client_queue_wait_seconds_total`
+and `q27:client_queue_wait_count` (the average wait is their ratio). Docker: `CLIENT_NAMES` in `compose.yaml`.
+
+The stats page (`/ui`) shows this as a **機器** (Machines) table right after the Agents table (running, waiting and the queued prompt tokens, requests, prompt and cached tokens with the hit ratio, output tokens, average queue wait, errors and cancelled, last seen; it is hidden when the server sends no `clients`), and the Log has a 機器 column with the record's `client`.
 
 ## Prefix cache
 

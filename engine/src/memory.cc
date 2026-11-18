@@ -174,7 +174,7 @@ Budget budget_for(size_t free, size_t total) {
   b.free_at_start = free, b.total = total;
   // VRAM_RESERVE_GIB: VRAM to leave unused (display driver, other programs; below it WDDM starts to move memory to the
   // host without an error). Negative or unparsable values count as 0, an empty one as the default.
-  double reserve = 1.5;
+  double reserve = 1.0;
   if (const char* r = getenv("VRAM_RESERVE_GIB"); r && *r) {
     char* end = nullptr;
     const double v = strtod(r, &end);

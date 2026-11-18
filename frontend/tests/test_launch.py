@@ -27,8 +27,8 @@ def settings():
 
 
 def test_auto_budget_is_the_engines():
-    # memory.cc budget_for: max(0, free - reserve), the reserve 1.5 GiB unless given.
-    assert abs(launch.auto_budget(*DEVICE) / GiB - 28.70) < 0.01
+    # memory.cc budget_for: max(0, free - reserve), the reserve 1.0 GiB unless given.
+    assert abs(launch.auto_budget(*DEVICE) / GiB - 29.20) < 0.01
     assert abs(launch.auto_budget(*DEVICE, reserve=0.5) / GiB - 29.70) < 0.01
     assert abs(launch.auto_budget(*DEVICE, reserve=0) / GiB - 30.20) < 0.01
     assert launch.auto_budget(int(1 * GiB), DEVICE[1]) == 0 and launch.auto_budget(int(2 * GiB), reserve=3) == 0
@@ -227,7 +227,7 @@ def _clean_engine_env(monkeypatch):
 def test_engine_defaults_applied_when_unset(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
     launch.set_engine_env(tmp_path)
-    assert os.environ["KV_POOL_TOKENS"] == "524288"
+    assert os.environ["KV_POOL_TOKENS"] == "0"
     assert os.environ["SPILL_RAM_GIB"] == "64"
     assert os.environ["SPILL_DIR"] == ("/cache/kv" if os.name != "nt" else launch.spill_dir_default())
     assert os.environ["MAX_TOKENS_FIT"] == "1" and os.environ["STATE_HOST_CACHE"] == "8"
@@ -235,11 +235,11 @@ def test_engine_defaults_applied_when_unset(monkeypatch, tmp_path):
 
 def test_engine_defaults_do_not_override_set_values(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
-    monkeypatch.setenv("KV_POOL_TOKENS", "0")
+    monkeypatch.setenv("KV_POOL_TOKENS", "524288")
     monkeypatch.setenv("SPILL_RAM_GIB", "0")
     monkeypatch.setenv("SPILL_DIR", "/elsewhere")
     launch.set_engine_env(tmp_path)
-    assert os.environ["KV_POOL_TOKENS"] == "0"
+    assert os.environ["KV_POOL_TOKENS"] == "524288"
     assert os.environ["SPILL_RAM_GIB"] == "0"
     assert os.environ["SPILL_DIR"] == "/elsewhere"
 
@@ -532,3 +532,14 @@ def test_media_env_changes():
     assert lc.env_changes() == {"VIDEO_MAX_TOKENS": "12288", "VIDEO_MAX_FRAMES": "768"}
     lc.at_start, lc.settings = lc.settings, dict(lc.settings, image_tokens=50000)
     assert lc.env_changes() == {"IMAGE_TOKENS": "50000"}
+
+
+def test_max_seqs_and_pool_defaults_are_the_compose_ones(monkeypatch):
+    import re
+    compose = (ROOT / "compose.yaml").read_text()
+    for var, want in (("MAX_SEQS", str(launch.MAX_SEQS)), ("KV_POOL_TOKENS", launch.ENGINE_ENV_DEFAULTS["KV_POOL_TOKENS"])):
+        m = re.search(rf"^\s+{var}: \$\{{{var}:-([^}}]*)\}}", compose, re.M)
+        assert m and m.group(1) == want, var
+    monkeypatch.delenv("MAX_SEQS", raising=False)
+    assert launch.env_settings()["max_seqs"] == 8
+    assert launch.ENGINE_ENV_DEFAULTS["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves

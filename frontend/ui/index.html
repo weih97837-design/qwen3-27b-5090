@@ -184,6 +184,8 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
   .seq .rid { overflow-wrap: anywhere; }
   .tile .value { white-space: normal; overflow-wrap: anywhere; }
 }
+tr.act td { background: var(--wash); }
+.cl-sub { display: block; color: var(--muted); font-size: 12px; }
 .brk { display: none; }
 .nar { display: none; }
 .slot .kv b { white-space: nowrap; }
@@ -200,7 +202,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
   .log td.lo.keep { display: block; }
   .log td:empty { display: none; }
   .log td.brk { display: block; flex-basis: 100%; height: 0; }
-  .log td.c-agent { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; text-align: right; }
+  .log td.c-agent { flex: 1 1 0; min-width: 0; white-space: normal; overflow-wrap: anywhere; text-align: right; }
   .log td.c-cached::before { content: "\2192\00a0"; color: var(--muted); }
   .log td.c-out::before { content: "輸出\00a0"; color: var(--muted); }
   .log td.c-ttft::before { content: "首字\00a0"; color: var(--muted); }
@@ -222,6 +224,22 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
   #agents td.lo { display: none; }
   #agents td.g2 { grid-column: span 2; }
   #agents td.g3 { grid-column: span 3; }
+  /* Clients: same stacked layout */
+  #clients, #clients tr, #clients td { display: block; }
+  #clients tr:first-child { display: none; }
+  #clients tr { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  #clients td { border: 0; padding: 0; text-align: left; white-space: nowrap; }
+  #clients td::before { content: attr(data-l); display: block; color: var(--muted); font-size: 12px; font-family: system-ui, "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; }
+  #clients td.cl-name { grid-column: 1 / -1; white-space: normal; word-break: normal; overflow-wrap: break-word; font-weight: 600; }
+  #clients td.cl-name::before { display: none; }
+  #clients td.lo { display: none; }
+  #clients td.g2 { grid-column: span 2; }
+  #clients td.g3 { grid-column: span 3; }
+  #clients td.o1 { order: 1; }
+  #clients tr.act { background: var(--wash); }
+  #clients tr.act td { background: transparent; }
+  #clients td.g6 { grid-column: 1 / -1; }
+  .log td.c-client { flex: 0 1 auto; max-width: 48%; min-width: 0; white-space: normal; overflow-wrap: anywhere; color: var(--muted); }
   /* settings table: key above value */
   .kvt, .kvt tr, .kvt td { display: block; }
   .kvt tr:first-child { display: none; }
@@ -305,6 +323,14 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
       <span class="muted" id="agents-sum"></span>
     </div>
     <div class="scroll"><table id="agents"></table></div>
+  </section>
+
+  <section class="card" id="clients-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">機器</h2>
+      <span class="muted" id="clients-sum"></span>
+    </div>
+    <div class="scroll"><table id="clients"></table></div>
   </section>
 
   <section class="card" id="deploy-sec" hidden>
@@ -679,7 +705,7 @@ function drawSessions() {
         el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[(s.state === "parked" || s.state === "admitted") && s.active === true ? "running" : s.state] || "--muted"})` }), `${REQ_STATE_ZH[(s.state === "parked" || s.state === "admitted") && s.active === true ? "running" : s.state] || s.state} · ${phase}`),
         el("span", { class: "rid" }, s.rid),
         el("span", { class: "sub" }, s.endpoint || ""),
-        el("span", { class: "muted" }, s.client || ""),
+        el("span", { class: "muted", title: s.client ? "機器：" + s.client : "" }, s.client || ""),
         el("span", { class: "muted num", style: "margin-left:auto" }, comp)),
       bar,
       el("div", { class: "kv" }, ...kv.map(([k, v]) => el("div", {}, el("span", {}, k + " "), el("b", {}, v)))),
@@ -700,6 +726,7 @@ function logRow(e) {
   const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? (FINISH_ZH[e.text] || e.text) : (KIND_ZH[e.kind] || e.kind));
   const cells = r ? [
     el("td", { class: "mono c-agent", title: r.agent_id || "" }, r.agent || ""),
+    el("td", { class: "mono lo keep c-client", title: "機器" }, r.client || m.client_name || ""),
     el("td", { class: "brk" }),
     el("td", { class: "r c-prompt" }, fmtTok(r.prompt_tokens)),
     el("td", { class: "r c-cached", title: r.diverged_at != null ? `在第 ${r.diverged_at} 個 token 偏離先前的序列` : "" },
@@ -714,14 +741,14 @@ function logRow(e) {
     el("td", { class: "prev lo" }, m.preview || ""),
   ] : [el("td", { colspan: 10, class: "prev", style: "max-width:none" }, e.text)];
   const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
-    el("td", { class: "muted lo", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted lo" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono c-agent", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : "")]), ...cells);
+    el("td", { class: "muted lo", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted lo" }, m.endpoint || ""), ...(r ? [] : [el("td", { class: "mono c-agent", title: m.agent_id || "" }, m.agent_id ? m.agent_id.split("/")[0] : ""), el("td", { class: "mono lo keep c-client", title: "機器" }, m.client_name || "")]), ...cells);
   tr.title = "點擊查看詳細資料";
   tr.addEventListener("click", () => { state.open.has(e.n) ? state.open.delete(e.n) : state.open.add(e.n); drawLog(); });
   const out = [tr];
   if (state.open.has(e.n)) {
     tr.className += " sel";
     const detail = { ...e }; delete detail.n;
-    out.push(el("tr", { class: "sel" }, el("td", { colspan: 15 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
+    out.push(el("tr", { class: "sel" }, el("td", { colspan: 16 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
   }
   return out;
 }
@@ -729,10 +756,10 @@ function drawLog() {
   const req = $("f-req").checked, sub = $("f-sub").checked, ev = $("f-ev").checked;
   const rows = state.log.filter((e) => e.kind === "done" ? req : e.kind === "submit" ? sub : ev).slice(-300).reverse();
   const tb = $("log"); tb.replaceChildren();
-  tb.append(el("tr", {}, el("th", {}, "時間"), el("th", {}, "結果"), el("th", { class: "lo" }, "請求"), el("th", { class: "lo" }, "端點"), el("th", {}, "Agent"),
+  tb.append(el("tr", {}, el("th", {}, "時間"), el("th", {}, "結果"), el("th", { class: "lo" }, "請求"), el("th", { class: "lo" }, "端點"), el("th", {}, "Agent"), el("th", { class: "lo" }, "機器"),
     el("th", { class: "r" }, "輸入"), el("th", { class: "r" }, "快取命中"), el("th", { class: "r" }, "輸出"), el("th", { class: "r lo" }, "首字時間 (TTFT)"),
     el("th", { class: "r lo" }, "預填 tok/s"), el("th", { class: "r" }, "解碼 tok/s"), el("th", { class: "r lo" }, "Tok/步"), el("th", { class: "r" }, "總計"), el("th", { class: "r lo" }, "媒體"), el("th", { class: "lo" }, "最後一則使用者訊息")));
-  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 15, class: "empty" }, "目前沒有紀錄。")));
+  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 16, class: "empty" }, "目前沒有紀錄。")));
   for (const e of rows) tb.append(...logRow(e));
   const done = state.log.filter((e) => e.kind === "done");
   const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);
@@ -908,7 +935,7 @@ function drawDeploy() {
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
       el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
-          el("td", { class: "r" }, typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
+          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "自動（最大）" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
   }
   body.replaceChildren(...kids);
 }
@@ -957,7 +984,31 @@ function drawAgents() {
     el("td", { class: "r g3", "data-l": "RAM" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
     el("td", { class: "r g3", "data-l": "SSD" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
 }
-function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawDeploy(); drawSessions(); }
+// 機器 (clients): one row per machine (X-Client-Id / CLIENT_NAMES / peer address; loopback = "local"), from tick.clients. Counting only.
+const fmtAgo = (s) => s == null ? "–" : s < 3600 ? fmtDur(s) + "前" : s < 86400 ? `${Math.floor(s / 3600)} 小時前` : `${Math.floor(s / 86400)} 天前`;
+function drawClients() {
+  const rows = state.tick?.clients, sec = $("clients-sec");
+  if (!Array.isArray(rows)) { sec.hidden = true; return; }
+  sec.hidden = false;
+  $("clients-sum").textContent = `${rows.length} 台機器`;
+  const tb = $("clients"); tb.replaceChildren();
+  if (!rows.length) { tb.append(el("tr", {}, el("th", {}, "機器")), el("tr", {}, el("td", { class: "empty cl-name" }, "目前沒有機器紀錄。"))); return; }
+  tb.append(el("tr", {}, el("th", {}, "機器"), el("th", { class: "r" }, "執行中"), el("th", { class: "r" }, "等待中"),
+    el("th", { class: "r" }, "請求數"), el("th", { class: "r" }, "輸入 token"), el("th", { class: "r" }, "快取命中"),
+    el("th", { class: "r" }, "輸出 token"), el("th", { class: "r" }, "平均排隊時間"), el("th", { class: "r" }, "錯誤"), el("th", { class: "r" }, "最後出現")));
+  for (const c of rows) tb.append(el("tr", { class: c.running + c.waiting > 0 ? "act" : "" },
+    el("td", { class: "cl-name", style: "font-family:ui-monospace,monospace", title: "機器：" + c.client }, wbrText(c.client)),
+    el("td", { class: "r g2", "data-l": "執行中" }, String(c.running)),
+    el("td", { class: "r g2", "data-l": "等待中" }, String(c.waiting), c.waiting > 0 && c.waiting_tokens ? el("span", { class: "cl-sub" }, `${fmtTok(c.waiting_tokens)} tok`) : null),
+    el("td", { class: "r g2", "data-l": "請求數" }, String(c.requests)),
+    el("td", { class: "r g2", "data-l": "輸入 token" }, fmtTok(c.prompt_tokens)),
+    el("td", { class: "r g3 o1", "data-l": "快取命中" }, `${fmtTok(c.cached_tokens)} (${fmtPct(c.hit)})`),
+    el("td", { class: "r g2", "data-l": "輸出 token" }, fmtTok(c.output_tokens)),
+    el("td", { class: "r g2", "data-l": "平均排隊時間" }, fmtS(c.avg_wait_s)),
+    el("td", { class: "r g3 o1", "data-l": "錯誤" }, String(c.errors || 0) + (c.cancelled ? ` · 取消 ${c.cancelled}` : "")),
+    el("td", { class: "r g6 o1", "data-l": "最後出現" }, fmtAgo(c.last_seen))));
+}
+function drawAll() { drawHeader(); drawGo(); drawTiles(); drawSlots(); drawCharts(); drawVram(); drawTiers(); drawAgents(); drawClients(); drawDeploy(); drawSessions(); }
 
 async function engineAction(a) {
   const n = state.tick?.seqs?.length || 0, changes = launchChanges();
@@ -1012,7 +1063,7 @@ const MEDIA_OPTS = [
     help: "單一影片最多取樣的影格數（未達上限前每秒取 2 張），也是請求的 num_frames 最多能要求的數量。留空：2,048（模型檢查點本身的預設是 768）。" },
 ];
 const mediaDefault = (k) => k !== "image_tokens" ? null : Math.max(16384, L.form.video_max_tokens || 0);
-const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "開" : "關") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "預設" : v.toLocaleString()) : k === "spill_dir" ? (v || "（無）") : k === "vram_reserve_gib" ? (v == null ? "1.5 GiB（預設）" : `${v} GiB`) :
+const fmtVal = (k, v) => typeof v === "boolean" ? (v ? "開" : "關") : MEDIA_OPTS.some((o) => o.key === k) ? (v == null ? "預設" : v.toLocaleString()) : k === "spill_dir" ? (v || "（無）") : k === "vram_reserve_gib" ? (v == null ? "1.0 GiB（預設）" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "放不下" : `${fmtTok(p.max_tokens)} · 池 ${fmtTok(p.kv_tokens)}`;
 function launchChanges() {  // (from the running engine, or the settings the next load uses)
@@ -1198,7 +1249,7 @@ function drawLaunch() {
     stackBar(bar, leg, pools.map(([name, bytes, c]) => ({ name, bytes, c })), p.budget, (q) => q.c, "規劃");
     sum.append(bar, leg);
     sum.append(el("div", { class: "muted" }, `裝置池 ${fmtGiB(p.device)}，預算 ${fmtGiB(p.budget)}` +
-      "（預算 = 可用 VRAM 減去留給其他程式的預留量" + (L.form.vram_reserve_gib == null ? "，預設 1.5 GiB）" : "）") +
+      "（預算 = 可用 VRAM 減去留給其他程式的預留量" + (L.form.vram_reserve_gib == null ? "，預設 1.0 GiB）" : "）") +
       ` · 固定主機記憶體 ${fmtGiB(p.host)} · 可用裝置記憶體 ${fmtGiB(dev.free)} ` +
       (dev.source === "engine" ? "（執行中引擎配置各個池之前的值）" : "（目前值，扣除引擎的 CUDA context：估計值）")));
   }

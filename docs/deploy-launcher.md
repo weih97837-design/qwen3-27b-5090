@@ -128,7 +128,7 @@
 - **第一次**：不需要手動建立。按 **Apply** 或 **Open settings.ini** 時，托盤程式會自行建立 `settings.ini`。
 - 視窗分為五組（群組與欄位名稱即視窗上的文字，對應變數在括號內）：
   - **Server: changing these restarts it**（改動會重新啟動伺服器）：**Address**（`HOST`，預設 `127.0.0.1`）、**Port**（`PORT`，預設 `46320`）、**Weights folder (HF_HOME)**（權重的資料夾）。
-  - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM reserve (GiB)**（`VRAM_RESERVE_GIB`：至少保留不用的 VRAM，預設 1.5；預算 = 可用 VRAM 減去它。保留給桌面與其他程式，並避免 Windows WDDM 把 GPU 記憶體換到系統 RAM 而使推論大幅變慢；調低可讓 KV 池更大，每 1 GiB 約多 58K tokens（NVFP4 KV，18 KiB/token），但有被換出的風險）。
+  - **Engine: what it loads**：**Weights**（`WEIGHTS`）、**KV cache type**（`KV_DTYPE`）、**Speculative decoding**（`SPEC`）、**Images (vision tower)**（`VISION`）、**Requests at once**（`MAX_SEQS`）、**Context limit (tokens)**（`MAX_TOKENS`）、**VRAM reserve (GiB)**（`VRAM_RESERVE_GIB`：至少保留不用的 VRAM，預設 1.0（顯示輸出預期在內顯 iGPU；若 dGPU 也接螢幕或有其他程式用 GPU，請調高到 1.5–2 以避開 WDDM 換出）；預算 = 可用 VRAM 減去它。保留給桌面與其他程式，並避免 Windows WDDM 把 GPU 記憶體換到系統 RAM 而使推論大幅變慢；調低可讓 KV 池更大，每 1 GiB 約多 58K tokens（NVFP4 KV，18 KiB/token），但有被換出的風險）。
   - **When it holds the VRAM**：**Load the engine**（`ENGINE_AUTOSTART`）、**Unload when idle (seconds)**（`ENGINE_IDLE_UNLOAD_S`，閒置多久後釋放 VRAM）、**Smallest KV pool (tokens)**（`MIN_KV_TOKENS`）。
   - **Tiered cache (RAM and SSD): changing these reloads the engine**：**RAM tier (GiB)**（`SPILL_RAM_GIB`，`0` 關閉分層快取）、**RAM retention (seconds)**（`SPILL_RAM_RETENTION_S`）、**SSD cap (GiB)**（`SPILL_SSD_GIB`）、**SSD minimum free (GiB)**（`SPILL_SSD_MIN_FREE_GIB`）、**SSD minimum entry (tokens)**（`SPILL_SSD_MIN_TOKENS`，短於此的 checkpoint 不寫入 SSD，`0` 不設下限）、**File lifetime (days)**（`SPILL_TTL_DAYS`）、**VRAM backup idle (seconds)**（`VRAM_BACKUP_IDLE_S`）、**Pinned RAM (GiB)**（`SPILL_PINNED_GIB`）、**Asynchronous copies**（`SPILL_ASYNC_IO`）、**Delay hits (async restore)**（`SPILL_ASYNC_PROMOTE`）、**Fair agents (evict from the biggest)**（`SPILL_FAIR_AGENTS`，RAM 與 SSD 滿時從用量最大的 agent 逐出，`0` 關閉）、**SSD folder**（`SPILL_DIR`，留空表示只用 RAM）。數值必須是 0 或以上的數字，大小沒有人為上限。
   - **Images and videos: changing these reloads the engine**（位於分層快取群組下方；留空 = 預設）：**Media tokens per request**（`IMAGE_TOKENS`，一個請求的圖片與影片 token 上限，超過回 HTTP 400；每 token 10 KiB 的 pinned 主機 RAM，引擎啟動時配置；留空時跟著下一欄，至少 16,384）、**Video tokens at most**（`VIDEO_MAX_TOKENS`，一支影片最多的 token 數，預設 131,072；編碼影片時縮圖畫面每 token 另佔 6 KiB 一般主機記憶體）、**Video frames at most**（`VIDEO_MAX_FRAMES`，預設 2,048）。三者都是 1 以上的整數（`IMAGE_TOKENS`、`VIDEO_MAX_TOKENS` 最多 262,144；`VIDEO_MAX_FRAMES` 至少 2、最多 16,384）。預設 131,072 時嵌入表 1.25 GiB、編碼時畫面 0.75 GiB；RAM 32 GiB 以下請改小（例如 32,768）。pinned 記憶體在 Windows 上計入 GPU 共用記憶體（約 RAM 的一半）：`STATE_HOST_CACHE`（8 GiB）、`SPILL_PINNED_GIB`、視覺塔（0.86 GiB）與這張嵌入表加起來不要超過它。檢查點自己的預設是 12,288 與 768（填入即可還原）。影片的用法與長度對應見 `docs/tiered-cache.md` 「影片輸入」。
@@ -150,8 +150,8 @@
 
 ```ini
 [env]
-KV_POOL_TOKENS=524288
-MAX_SEQS=4
+KV_POOL_TOKENS=0
+MAX_SEQS=8
 SPILL_RAM_GIB=64
 SPILL_SSD_GIB=100
 SPILL_DIR=D:\kvcache
@@ -159,7 +159,7 @@ SPILL_RAM_RETENTION_S=3600
 SPILL_TTL_DAYS=7
 ```
 
-- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：上下文池 512K tokens（`KV_POOL_TOKENS=524288`）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`。
+- **預設值**：在原生 Windows 上，`frontend/launch.py` 會套用預設值：KV 池取 VRAM 預算剩下的最大值（`KV_POOL_TOKENS=0`，預估約 60 萬 token 以上（實際大小以啟動 log 或監控頁為準），設定列顯示為 auto (max)）、同時最多 8 個請求（`MAX_SEQS=8`；7 個停放區各約 190 MiB，未使用時借給 KV 快取，`target_seqs` 預設等於它，要較少請在 /ui 設定）、RAM 分層 64 GiB（`SPILL_RAM_GIB=64`），SSD 層位於 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`（`SPILL_DIR`）。只有要改的才需要寫入 `[env]`；`settings.ini` 或托盤明確設定的 `MAX_SEQS`、`KV_POOL_TOKENS` 會覆蓋這些預設值（上方範例的 `0` 與 `8` 即預設值，寫出來只是為了說明；要固定 512K 池請寫 `KV_POOL_TOKENS=524288`）。
 - **生效方式**：視窗沒有欄位的 `[env]` 變數，變更不經過設定視窗的 **Apply**（Apply 只處理視窗內的欄位，不會重新啟動伺服器）。修改 `settings.ini` 後，在托盤選單按 **Stop server**，再按 **Start server** 才會套用（托盤選單沒有 Restart 項目；結束托盤程式再重新開啟也可以）。
 - 其他變數的說明見 `docs/tiered-cache.md` 與 `docs/configuration.md`。
 
@@ -185,7 +185,7 @@ SPILL_TTL_DAYS=7
 | vision | `VISION` | `host`、`fp8`、`bf16`、`off` |
 | max_seqs | `MAX_SEQS` | 1 到 8 |
 | max_tokens | `MAX_TOKENS` | 2,048 到 262,144 |
-| vram_reserve_gib | `VRAM_RESERVE_GIB` | 留空（預設 1.5 GiB）或 0 到裝置記憶體的 GiB 數 |
+| vram_reserve_gib | `VRAM_RESERVE_GIB` | 留空（預設 1.0 GiB）或 0 到裝置記憶體的 GiB 數 |
 | image_tokens | `IMAGE_TOKENS` | `null`（16,384，或 `video_max_tokens` 較大時用它）或 1 到 262,144 |
 | video_max_tokens | `VIDEO_MAX_TOKENS` | `null`（預設 131,072）或 1 到 262,144 |
 | video_max_frames | `VIDEO_MAX_FRAMES` | `null`（預設 2,048）或 2 到 16,384 |
@@ -236,7 +236,7 @@ SPILL_TTL_DAYS=7
 
 1. **確認伺服器就緒**：在 /ui 頁面看到引擎狀態為可用（托盤提示為 `Ready`，或 `Waiting: the first request loads the model`）。
 2. **用戶端設定**：Base URL 設為 `http://127.0.0.1:46320/v1`，API key 填任意值，模型名稱用 `http://127.0.0.1:46320/v1/models` 查到的名稱（預設 `qwen3.8-27b`）。
-3. **並行**：用戶端同時送出的請求數最多為 **Requests at once**（`MAX_SEQS`，預設 4）時可並行執行；超過的請求排隊等候。
+3. **並行**：用戶端同時送出的請求數最多為 **Requests at once**（`MAX_SEQS`，預設 8）時可並行執行；超過的請求排隊等候。
 4. **確認**：送出一則請求得到回應；在 /ui 頁面可以看到請求的進行。
 
 ---

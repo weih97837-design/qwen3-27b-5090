@@ -127,7 +127,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 At startup the engine computes a plan, allocates each pool once and never calls `cudaMalloc` while serving.
 
 - **Budget**: the free VRAM at startup (with other programs counted: the server passes what NVML sees, since
-  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `VRAM_RESERVE_GIB` (1.5 GiB by default: VRAM kept for the desktop and below WDDM's paging to system RAM; about the old automatic budget on a 5090, 30.3 GiB of 31.84). If a configuration
+  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `VRAM_RESERVE_GIB` (1.0 GiB by default, because the display is expected on the iGPU: VRAM kept clear of WDDM's paging to system RAM; raise it to 1.5–2 if the dGPU drives a display; the old default of 1.5 GiB gave a 30.3 GiB budget of 31.84 on a 5090). If a configuration
   does not fit, the engine stops with the breakdown in the log; the server's `MAX_TOKENS_FIT=1` instead lowers
   `MAX_TOKENS` to what fits.
 - **Pools** (separate, no padding to a common page size):
@@ -136,9 +136,9 @@ At startup the engine computes a plan, allocates each pool once and never calls 
      (64 rows), shared in time by the prefill, the vision tower and its weight staging.
   3. The running sequence's state: GDN states (FP32), convolution states, the draft's context ring.
   4. Per-lane buffers of batched steps ([§10](#10-scheduler-and-concurrency)), about 0.25 GiB for eight lanes.
-  5. **The KV pool**: everything left, in pages of 64 tokens. Uncapped (`KV_POOL_TOKENS=0`) with the defaults of the
-     upstream engine (`gdnfp4`, NVFP4 KV, `MAX_SEQS=8`, `VISION=host`, DSpine) it holds 601,856 tokens (605,504 with
-     DFlash2); this fork's defaults cap the pool at 524,288 tokens with `MAX_SEQS=4`.
+  5. **The KV pool**: everything left, in pages of 64 tokens. Uncapped (`KV_POOL_TOKENS=0`, this fork's default as well as the
+     engine's) with the defaults (`gdnfp4`, NVFP4 KV, `MAX_SEQS=8`, `VISION=host`, DSpine) it holds 601,856 tokens at the former 1.5 GiB reserve, about 29K more with 1.0 (605,504 with
+     DFlash2) on an RTX 5090 with the whole budget free; with less free VRAM it is smaller (the stats page and the log show the pool the engine got).
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
   draft state (189.9 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,

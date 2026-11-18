@@ -39,16 +39,18 @@ GiB = 2**30
 MiB = 2**20
 
 # VRAM (section 5: the engine budget is the free VRAM minus VRAM_RESERVE_GIB, the default of memory.cc).
-VRAM_RESERVE_GIB = 1.5
+VRAM_RESERVE_GIB = 1.0  # the display runs on the iGPU; 1.5-2 when the dGPU drives a display
 # Weights + draft + state + activations, derived from the documented 605,504-token pool at the 30.3 GiB budget of a 5090 with
 # 18 KiB/token NVFP4 KV.
 NON_KV_GIB = 19.9
-PARKING_GIB = 0.57  # 3 parking areas for MAX_SEQS = 4
+PARKING_AREA_GIB = 0.19  # one parking area (about 190 MiB); MAX_SEQS = n has n - 1 of them, lent to the KV cache while unused
+PARKING_GIB = 7 * PARKING_AREA_GIB  # 7 parking areas for MAX_SEQS = 8: about 1.33 GiB
 KV_BYTES_PER_TOKEN = 18432  # 18 KiB, NVFP4 KV
-POOL_STEP_TOKENS = 65536  # the pool is laid out in steps of this many tokens
-POOL_CAP_TOKENS = 524288  # spec default KV_POOL_TOKENS (512K)
+POOL_STEP_TOKENS = 1024  # estimates are rounded down to this many tokens
+# (no cap: KV_POOL_TOKENS=0 gives the pool the VRAM budget leaves, with the parking areas lent to it; an estimated 600K+ tokens
+# on an RTX 5090 with MAX_SEQS 8 and DSpine)
 FULL_CONTEXT_TOKENS = 262144  # MAX_TOKENS when the pool holds it
-POOL_FLOOR_TOKENS = 1024  # never emit 0 for KV_POOL_TOKENS / MAX_TOKENS (0 means "whatever VRAM leaves")
+POOL_FLOOR_TOKENS = 1024  # never emit 0 for MAX_TOKENS (the pool estimate is floored to this; KV_POOL_TOKENS=0 is the deliberate "auto")
 TOO_SMALL_POOL_TOKENS = 65536  # warn that the GPU is too small below this
 
 # RAM (pinned host memory of the engine: embeddings 2.4 + prefix state cache 4 + vision 0.9 + frontend).
@@ -75,7 +77,7 @@ SSD_FRACTION = 0.5
 SSD_WARN_GIB = 20
 
 # Fixed recommendations.
-MAX_SEQS = 4
+MAX_SEQS = 8  # the engine's maximum; fewer when the parking areas do not fit (max_seqs_that_fit)
 KV_DTYPE = "nvfp4"
 SPILL_RAM_RETENTION_S = 3600
 SPILL_TTL_DAYS = 7
@@ -83,7 +85,7 @@ SPILL_TICK_S = 30
 SPILL_DIR_DEFAULT = "/cache/kv"
 
 # compose.yaml defaults, used when a value cannot be detected.
-DEFAULT_KV_POOL_TOKENS = 524288
+DEFAULT_KV_POOL_TOKENS = 0  # 0: what the VRAM budget leaves
 DEFAULT_MAX_TOKENS = 262144
 DEFAULT_SPILL_RAM_GIB = 64
 DEFAULT_SPILL_SSD_GIB = 100
@@ -266,11 +268,20 @@ def detect(spill_dir: str | None = None, measure_cache: bool = True) -> dict[str
 # Recommendation. Pure functions of the detected dict.
 # ---------------------------------------------------------------------------------------------------------------
 def kv_pool_tokens(kv_gib: float) -> int:
-    """Tokens of KV pool that fit in kv_gib, in POOL_STEP_TOKENS steps, capped at POOL_CAP_TOKENS."""
+    """Tokens the KV pool holds with KV_POOL_TOKENS=0 when kv_gib is left after weights, state and activations (the
+    parking areas are pages of that pool), in POOL_STEP_TOKENS steps."""
     if kv_gib <= 0:
         return 0
-    steps = math.floor(kv_gib * GiB / KV_BYTES_PER_TOKEN / POOL_STEP_TOKENS)
-    return min(steps * POOL_STEP_TOKENS, POOL_CAP_TOKENS)
+    return math.floor(kv_gib * GiB / KV_BYTES_PER_TOKEN / POOL_STEP_TOKENS) * POOL_STEP_TOKENS
+
+
+def max_seqs_that_fit(kv_gib: float) -> int:
+    """The largest MAX_SEQS (at most 8) whose parking areas leave a pool of TOO_SMALL_POOL_TOKENS in kv_gib; 1 if none."""
+    least = TOO_SMALL_POOL_TOKENS * KV_BYTES_PER_TOKEN / GiB
+    for n in range(MAX_SEQS, 1, -1):
+        if kv_gib - (n - 1) * PARKING_AREA_GIB >= least:
+            return n
+    return 1
 
 
 def video_max_tokens(ram_gib: float | None) -> int:
@@ -307,12 +318,16 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
     if total is None or used is None:
         env["KV_POOL_TOKENS"] = str(DEFAULT_KV_POOL_TOKENS)
         env["MAX_TOKENS"] = str(DEFAULT_MAX_TOKENS)
-        reasons["KV_POOL_TOKENS"] = "GPU 未偵測，使用 compose.yaml 預設值。"
+        env["MAX_SEQS"] = str(MAX_SEQS)
+        reasons["KV_POOL_TOKENS"] = "GPU 未偵測，使用 compose.yaml 預設值（0：VRAM 預算剩下的全部）。"
+        reasons["MAX_SEQS"] = "GPU 未偵測，使用 compose.yaml 預設值（8 個並行請求，7 個停放區）。"
         reasons["MAX_TOKENS"] = "GPU 未偵測，使用 compose.yaml 預設值。"
     else:
-        budget = max(0.0, total - used - VRAM_RESERVE_GIB)  # (the pool is still capped at POOL_CAP_TOKENS)
-        kv_gib = budget - NON_KV_GIB - PARKING_GIB
+        budget = max(0.0, total - used - VRAM_RESERVE_GIB)
+        kv_gib = budget - NON_KV_GIB  # (the parking areas are pages of the pool: lent to the KV cache while unused)
+        seqs = max_seqs_that_fit(kv_gib)
         pool = kv_pool_tokens(kv_gib)
+        env["MAX_SEQS"] = str(seqs)
         if used > VRAM_USED_WARN_GIB:
             warnings.append(
                 f"VRAM 已用 {used:.1f} GiB。若 serve 正在執行，這包含引擎自己的用量；"
@@ -331,11 +346,16 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             max_tokens = FULL_CONTEXT_TOKENS
-        env["KV_POOL_TOKENS"] = str(pool)
+        env["KV_POOL_TOKENS"] = str(DEFAULT_KV_POOL_TOKENS)  # 0: the engine takes what the budget leaves (max); `pool` is its estimate
         env["MAX_TOKENS"] = str(max_tokens)
         reasons["KV_POOL_TOKENS"] = (
             f"{detected.get('gpu_name') or 'GPU'}：預算 {budget:.2f} GiB"
-            + f"（可用 VRAM 扣除保留 {VRAM_RESERVE_GIB} GiB），扣除非 KV {NON_KV_GIB} 與 3 個停放區 {PARKING_GIB} 後可容納 {pool:,} tokens。"
+            + f"（可用 VRAM 扣除保留 {VRAM_RESERVE_GIB} GiB），0 = 引擎取預算剩下的全部；扣除非 KV {NON_KV_GIB} 後"
+            + f"預估約 {pool:,} tokens（僅為估計，引擎實際的池可能大約多 2%；停放區借用其中的頁面）。"
+        )
+        reasons["MAX_SEQS"] = (
+            f"{seqs} 個並行請求，{seqs - 1} 個停放區（每個約 {PARKING_AREA_GIB * 1024:.0f} MiB，未使用時借給 KV 快取）；"
+            f"上限 {MAX_SEQS}，停放區放不下時降低。"
         )
         reasons["MAX_TOKENS"] = (
             f"池大於等於 {FULL_CONTEXT_TOKENS:,} tokens 時維持 {FULL_CONTEXT_TOKENS:,}，否則為池大小（向下取整到 1024）。"
@@ -401,13 +421,11 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
         warnings.append("測量的路徑在 /mnt/（Windows 磁碟，drvfs 很慢）。SSD 層請使用 WSL 的具名磁碟區。")
 
     # --- fixed values ---
-    env["MAX_SEQS"] = str(MAX_SEQS)
     env["KV_DTYPE"] = KV_DTYPE
     env["SPILL_DIR"] = os.environ.get("SPILL_DIR") or SPILL_DIR_DEFAULT
     env["SPILL_RAM_RETENTION_S"] = str(SPILL_RAM_RETENTION_S)
     env["SPILL_TTL_DAYS"] = str(SPILL_TTL_DAYS)
     env["SPILL_TICK_S"] = str(SPILL_TICK_S)
-    reasons["MAX_SEQS"] = "固定值（4 個並行請求，3 個停放區）。"
     reasons["KV_DTYPE"] = "固定值（NVFP4 KV，預設）。"
     reasons["SPILL_DIR"] = "容器內路徑（kvcache 具名磁碟區）；不是主機路徑。"
     reasons["SPILL_RAM_RETENTION_S"] = "固定值（閒置 1 小時後寫入 SSD）。"

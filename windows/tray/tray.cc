@@ -1159,7 +1159,7 @@ std::wstring plan_text(const Json& plan) {
 }
 
 std::wstring value_name(const Row& row, const std::wstring& value) {
-    if (value.empty() && !wcscmp(row.var, L"VRAM_RESERVE_GIB")) return L"1.5 (default)";
+    if (value.empty() && !wcscmp(row.var, L"VRAM_RESERVE_GIB")) return L"1.0 (default)";
     return value;
 }
 

@@ -15,6 +15,7 @@ import threading
 import time
 
 import agent
+import clients
 
 SAMPLE_S = float(os.environ.get("STATS_SAMPLE_S", 1.0))  # s between GPU samples (0: no sampling)
 HISTORY_S = 600   # s of samples kept
@@ -101,7 +102,7 @@ def media_of(images):
     return {"images": n_images, "videos": len(videos), "tokens": sum(gh * gw for _, gh, gw in spans)}
 
 
-def request_meta(path, headers, body):
+def request_meta(path, headers, body, peer=None, names=""):
     """What the log shows of a request: endpoint, client, options and the start of the last user message."""
     msgs = body.get("messages") or body.get("input") or []
     last = ""
@@ -122,9 +123,38 @@ def request_meta(path, headers, body):
     return {"endpoint": path, "client": (headers.get("User-Agent") or "")[:80], "model": body.get("model"),
             "stream": bool(body.get("stream")), "messages": len(msgs) if isinstance(msgs, list) else 1,
             "tools": len(body.get("tools") or []),
+            "client_name": clients.resolve(headers, peer, names),  # (the machine: X-Client-Id / CLIENT_NAMES / peer address)
             "agent_id": agent.from_request(headers, body),  # (None: the worker derives auto:<hash>)
             "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens") or body.get("max_output_tokens"),
             "preview": last[:PREVIEW] + ("…" if len(last) > PREVIEW else "")}
+
+
+def clients_block(seqs, totals, now=None):
+    """Per-client (machine) counts for the stats JSON (worker.Scheduler.stats; docs/configuration.md "Client counting").
+    seqs: the snapshot's request rows ("client", "state", "prompt"); totals: client -> counters since the worker
+    started (worker.Scheduler.client_count). running: admitted requests; waiting: queued or restoring ones, and
+    waiting_tokens the prompt tokens of those. last_seen: seconds since the client's last request began, ended or
+    arrived. Sorted by running + waiting, then by last_seen. Counting only: nothing is limited."""
+    now = time.time() if now is None else now
+    out = {}
+    for c, t in totals.items():
+        out[c] = {"client": c, "running": 0, "waiting": 0, "waiting_tokens": 0, "requests": t["requests"],
+                  "prompt_tokens": t["prompt_tokens"], "cached_tokens": t["cached_tokens"],
+                  "hit": t["cached_tokens"] / t["prompt_tokens"] if t["prompt_tokens"] else None,
+                  "output_tokens": t["output_tokens"], "media_tokens": t["media_tokens"],
+                  "avg_wait_s": t["wait_s"] / t["wait_n"] if t["wait_n"] else None,
+                  "errors": t["errors"], "cancelled": t["cancelled"],
+                  "first_seen_s": max(0.0, now - t["first_seen"]), "last_seen": max(0.0, now - t["last_seen"])}
+    for r in seqs:
+        row = out.get(r.get("client"))
+        if row is None:
+            continue
+        if r["state"] in ("waiting", "restoring"):
+            row["waiting"] += 1
+            row["waiting_tokens"] += r["prompt"]
+        else:
+            row["running"] += 1
+    return sorted(out.values(), key=lambda r: (-(r["running"] + r["waiting"]), r["last_seen"]))
 
 
 def agents_block(seqs, totals, use=None):
@@ -619,7 +649,8 @@ class Hub:
                 r = self.rates.get(s["rid"], {})
                 meta = self.meta.get(s["rid"], {})
                 seqs.append(dict(s, decode_now=r.get("decode", 0.0), prefill_now=r.get("prefill", 0.0),
-                                 endpoint=meta.get("endpoint"), client=meta.get("client"), preview=meta.get("preview")))
+                                 endpoint=meta.get("endpoint"), user_agent=meta.get("client"),
+                                 client=s.get("client") or meta.get("client_name"), preview=meta.get("preview")))
             cache = snap["cache"] if snap else None
             return {"t": time.time(), "engine": self.engine_state, "seqs": seqs, "vram": self.vram(), "cache": cache,
                     "idle": self.engine_idle() if self.engine_idle else None,
@@ -627,6 +658,7 @@ class Hub:
                     "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None,
                     "slots": snap.get("slots", []) if snap else [],
                     "agents": snap.get("agents", []) if snap else [],
+                    "clients": snap.get("clients", []) if snap else [],
                     "tiers": snap.get("tiers") if snap else None,
                     "prefix": prefix_block(snap, self.memory),
                     "host": host_info(self.started),
