@@ -232,7 +232,7 @@ uint64_t Model::spill_fingerprint() const {
   // The draft's context ring is part of a checkpoint's state: its kind, window and slot layout (position p lives in slot
   // p % (window + kRingPad)) decide how those bytes read, beyond their count (ckpt_bytes_). Bump kCkptLayout when it changes.
   {
-    constexpr int kCkptLayout = 2;  // 1: ring of `window` slots (DFlash2); 2: window + kRingPad slots, DSpine drafts
+    constexpr int kCkptLayout = 3;  // 1: ring of `window` slots (DFlash2); 2: window + kRingPad slots, DSpine drafts; 3: upstream v0.6 GDN prefill numerics (old KV files differ in rounding)
     const int dl[4] = {kCkptLayout, draft_ ? int(draft_->kind()) + 1 : 0, draft_ ? draft_->window() : 0, ddims::kRingPad};
     h = fnv(h, dl, sizeof dl);
   }
