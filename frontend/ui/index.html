@@ -147,6 +147,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
 .slot .lane { color: var(--ink2); font-size: 12px; white-space: nowrap; }
 .slot .speed { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .slot .speed span { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.slot .speed small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 8px; }
 .tiers-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 @media (max-width: 600px) { .tiers-grid { grid-template-columns: 1fr; } }
 .tier .meter { margin-top: 6px; }
@@ -811,6 +812,14 @@ const fmtSetting = (v) => v == null ? "–" : typeof v === "number" ? v.toLocale
 const SLOT_STATE = { running: ["推論中", "--good"], parked: ["暫停", "--s1"], admitted: ["待命", "--warning"], idle: ["閒置", "--muted"],
   closed: ["未開放", "--muted"] };
 const PHASE_ZH = { prefill: "預填", decode: "解碼" };
+// Big number: the recent decode rate (tok_s_now) while there is one; the average since the first token (tok_s) is the small
+// note, and the big number as before when no recent rate exists yet.
+function speedBlock(s) {
+  const live = s.tok_s_now > 0;
+  return el("div", { class: "speed num" }, live ? fmtRate(s.tok_s_now) : s.tok_s == null ? "–" : fmtRate(s.tok_s),
+    el("span", {}, live ? "tok/s 生成速度（即時）" : "tok/s 生成速度"),
+    live && s.tok_s != null ? el("small", {}, "平均 " + fmtRate(s.tok_s)) : null);
+}
 function slotTile(s, i) {
   const key = SLOT_STATE[s.state] ? s.state : "idle", [label, color] = SLOT_STATE[key];
   const idle = key === "idle", closed = key === "closed";
@@ -834,7 +843,7 @@ function slotTile(s, i) {
       kvRow("快取", cached != null ? `${fmtTok(cached)} (${pct})` : "–"),
       kvRow("輸出", s.out != null ? fmtTok(s.out) + " tok" : "–"),
       kvRow("已執行時間", fmtS(s.age))),
-    el("div", { class: "speed num" }, s.tok_s == null ? "–" : fmtRate(s.tok_s), el("span", {}, "tok/s 生成速度")));
+    speedBlock(s));
 }
 function drawSlots() {
   const slots = snapSlots(), sec = $("slots-sec");

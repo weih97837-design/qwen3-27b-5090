@@ -264,7 +264,7 @@ def test_scheduler_stats_lanes_tiers_and_hub_tick():
     hub = stats.Hub()
     hub.set_snapshot(snap)
     tick = hub.tick()
-    assert tick["slots"] == snap["slots"]
+    assert [{k: v for k, v in r.items() if k != "tok_s_now"} for r in tick["slots"]] == snap["slots"]
     assert tick["tiers"]["in_ram"] == 2
     assert set(tick["host"]) == {"cpu_count", "load1", "load5", "ram_total_bytes", "ram_avail_bytes", "uptime_s"}
     assert tick["deploy"]["engine_state"] == "loading"
@@ -514,3 +514,26 @@ def test_the_page_has_the_clients_panel_and_log_column():
     assert "台機器" in html and "目前沒有機器紀錄。" in html and "取消 " in html and "waiting_tokens" in html
     # the Log has the Machine column (after Agent) and the record's client
     assert 'el("th", { class: "lo" }, "機器")' in html and "r.client || m.client_name" in html
+
+
+# ------------------------------------------------------------ slot cards: instantaneous speed
+
+def test_tick_joins_the_instantaneous_decode_rate_into_slot_lanes():
+    hub = stats.Hub()
+    snap = {"seqs": [{"rid": "a", "out": 5}, {"rid": "b", "out": 0}], "cache": None, "running": 2, "waiting": 0, "blocked": None,
+            "target_seqs": 2, "slots": [{"lane": 1, "rid": "a", "tok_s": 12.5, "state": "running"},
+                                        {"lane": 2, "rid": "b", "tok_s": None, "state": "running"},
+                                        {"lane": 3, "rid": "zz", "tok_s": 3.0, "state": "running"},
+                                        {"lane": 4, "rid": None, "tok_s": None, "state": "idle"}]}
+    hub.snap = snap
+    hub.rates = {"a": {"decode": 87.5, "prefill": 0.0}, "b": {"decode": 0.0, "prefill": 900.0}}
+    lanes = hub.tick()["slots"]
+    assert [r["tok_s_now"] for r in lanes] == [87.5, None, None, None]   # 0.0 (no sample yet), unknown rid, idle: None
+    assert [r["tok_s"] for r in lanes] == [12.5, None, 3.0, None]        # the average is kept as it was
+    assert "tok_s_now" not in snap["slots"][0]                           # the snapshot itself is not modified
+
+
+def test_the_slot_card_shows_the_instantaneous_speed_big_and_the_average_small():
+    html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
+    assert "tok/s 生成速度（即時）" in html and '"平均 " + fmtRate(s.tok_s)' in html and "s.tok_s_now > 0" in html
+    assert ".slot .speed small { font-size: 12px" in html
