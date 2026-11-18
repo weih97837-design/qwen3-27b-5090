@@ -1136,6 +1136,11 @@ async function loadLaunch(resetForm) {
     L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state; L.idle = d.idle_unload_s; L.keep = d.keep_env || {};
     if (resetForm || !L.form) L.form = { ...d.settings };
   } catch (e) { L.err = String(e); }
+  try {  // the live admission settings (a stopped engine answers 503: no value)
+    const r = await fetch("/admin/concurrency");
+    const d = await r.json();
+    L.share = r.ok && typeof d.decode_share === "number" ? d.decode_share : null;
+  } catch (e) { L.share = null; }
   replan();
 }
 function replan() {
@@ -1247,6 +1252,28 @@ function idleRow() {
   row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "自訂 "), inp, el("span", { class: "n" }, "分鐘")));
   return row;
 }
+// DECODE_SHARE: seconds of decoding per second of prefill; like the idle time it changes at once, without the engine.
+async function setShare(v) {
+  try {
+    const r = await fetch("/admin/concurrency", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decode_share: v }) });
+    const d = await r.json();
+    if (!r.ok) alert(`DECODE_SHARE 設定失敗：${d.error?.message || r.status}`);
+  } catch (e) { alert(`DECODE_SHARE 設定失敗：${e}`); }
+  await loadLaunch(false);
+}
+function shareRow() {
+  const row = el("div", { class: "choices", id: "decode-share" }), values = [0.5, 1.5, 3];
+  for (const v of values) {
+    const b = el("button", { class: "opt", "aria-pressed": String(L.share === v), type: "button", title: "只保留到伺服器重新啟動為止" }, el("b", {}, String(v)));
+    b.addEventListener("click", () => setShare(v));
+    row.append(b);
+  }
+  const inp = el("input", { type: "number", min: "0", max: "10", step: "0.1", placeholder: "0–10", "aria-label": "預填時給解碼的時間比例（DECODE_SHARE）" });
+  if (L.share != null && !values.includes(L.share)) inp.value = L.share;
+  inp.addEventListener("change", () => { const v = parseFloat(inp.value); if (isFinite(v) && v >= 0 && v <= 10) setShare(v); });
+  row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "自訂 "), inp));
+  return row;
+}
 function drawLaunch() {
   const box = $("opts"), sum = $("plan-sum");
   if (!L.form) { box.replaceChildren(el("div", { class: "empty" }, L.err || "正在載入設定…")); sum.replaceChildren(); return; }
@@ -1267,6 +1294,8 @@ function drawLaunch() {
     box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
   }
   box.append(el("div", { class: "k" }, "閒置時卸載", el("small", {}, "立即生效")), idleRow());
+  if (L.share != null) box.append(el("div", { class: "k" }, "預填時給解碼的時間比例（DECODE_SHARE）",
+    el("small", {}, "每預填 1 秒，讓解碼中的請求跑幾秒。越大 → 預填期間解碼越不會掉速，但長 prompt 的預填變慢。立即生效")), shareRow());
   if (MEDIA_OPTS.some((o) => L.form[o.key] !== undefined)) {
     box.append(el("div", { class: "k", style: "grid-column:1/-1;margin-top:10px" }, "影片與圖片",
       el("small", {}, "圖片與影片最多可佔用的 token 數（見 docs/configuration.md「Long videos」）。留空為預設值。重新啟動引擎後生效。")));

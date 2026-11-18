@@ -1560,14 +1560,16 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ tokenizer endpoints (vLLM)
 
     def concurrency(self, body):
-        """Admission settings (P7-14): target_seqs (1 .. MAX_SEQS), min_seq_tps (0: off), admit_kv, kv_reserve."""
-        least = {"target_seqs": 1, "min_seq_tps": 0, "kv_reserve": 0}  # (admit_kv: a boolean)
+        """Admission settings (P7-14): target_seqs (1 .. MAX_SEQS), min_seq_tps (0: off), admit_kv, kv_reserve,
+        decode_share (0 to 10: seconds of decoding per second of prefill)."""
+        least = {"target_seqs": 1, "min_seq_tps": 0, "kv_reserve": 0, "decode_share": 0}  # (admit_kv: a boolean)
         for k, v in body.items():
             if k == "admit_kv":
                 ok = isinstance(v, bool)
             elif k in least:
                 ok = isinstance(v, (int, float)) and not isinstance(v, bool) and v >= least[k]
-                ok = ok and (k == "min_seq_tps" or float(v).is_integer())
+                ok = ok and (k in ("min_seq_tps", "decode_share") or float(v).is_integer())
+                ok = ok and (k != "decode_share" or v <= 10)
             else:
                 raise ApiError(400, f"unknown setting {k!r} (settings: admit_kv, {', '.join(least)})")
             if not ok:
@@ -1645,7 +1647,7 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError as e:
                 raise ApiError(400, str(e)) from e
             # (the admission settings of /admin/concurrency stay; the target number of requests with the same MAX_SEQS)
-            keep = ("admit_kv", "kv_reserve", "min_seq_tps") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
+            keep = ("admit_kv", "kv_reserve", "min_seq_tps", "decode_share") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
             self.srv.use_template_of(s["weights"])
             launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
             note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())

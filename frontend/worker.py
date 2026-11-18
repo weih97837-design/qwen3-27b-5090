@@ -297,6 +297,7 @@ class Scheduler:
     clock = NullClock()  # (__init__ makes the real EngineClock)
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
+    share = 0.5  # DECODE_SHARE (live: configure())
     dec_tok = None  # the plain tokenizer of the divergence log (made with the first divergence)
     returns = ()  # (video loans to give back; __init__ makes the deque)
     user = None  # the id of "user" and the ids of blank-line tokens (checkpoints: after the last blank line of a final user message)
@@ -350,7 +351,6 @@ class Scheduler:
         self.held_until = (None, 0.0)  # (request, time): skip checking it again until then
         self.batch = self.spec and cfg.get("batch_decode", True) and self.engine.max_lanes > 1
         self.chunk = cfg["prefill_chunk"]
-        self.share = cfg["decode_share"]
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
         self.im_start = cfg["im_start"]
@@ -363,6 +363,7 @@ class Scheduler:
         self.by_id = {}
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
+        self.configure({"decode_share": cfg["decode_share"]})  # (live: /admin/concurrency)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
         self.decoder = None      # threads that decode images (prefetch)
         # Loans of KV pool memory for decoding videos on NVDEC (Engine.kv_lend: the driver allocates the decoder's
@@ -759,10 +760,16 @@ class Scheduler:
             self.kv_reserve = max(0, int(c["kv_reserve"]))
         if c.get("min_seq_tps") is not None:
             self.min_tps = max(0.0, float(c["min_seq_tps"]))
+        if c.get("decode_share") is not None:
+            x = float(c["decode_share"])
+            if x == x:  # (NaN: unchanged)
+                self.share = min(max(x, 0.0), 10.0)
+                # the decode time already owed was earned at the old share: at most one second of prefill's worth
+                self.credit = min(getattr(self, "credit", 0.0), self.share)
 
     def settings(self):
         return {"target_seqs": self.max_seqs, "engine_seqs": self.engine_seqs, "admit_kv": self.admit_kv,
-                "kv_reserve": self.kv_reserve, "min_seq_tps": self.min_tps,
+                "kv_reserve": self.kv_reserve, "min_seq_tps": self.min_tps, "decode_share": self.share,
                 "rates": {n: round(self.rate(n), 1) for n in sorted(self.rates)},
                 "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked}
 
@@ -1653,7 +1660,7 @@ class Scheduler:
         st = self.engine.cache_stats()
         out = dict(self.m)
         out.update({"q27:num_requests_running": len(self.alive), "q27:num_requests_waiting": len(self.waiting),
-                    "q27:target_seqs": self.max_seqs, "q27:engine_seqs": self.engine_seqs,
+                    "q27:target_seqs": self.max_seqs, "q27:engine_seqs": self.engine_seqs, "q27:decode_share": self.share,
                     'q27:admission_blocked{reason="kv"}': int(self.blocked == "kv"),
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
