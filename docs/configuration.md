@@ -468,6 +468,19 @@ and `q27:client_queue_wait_count` (the average wait is their ratio). Docker: `CL
 
 The stats page (`/ui`) shows this as a **機器** (Machines) table right after the Agents table (running, waiting and the queued prompt tokens, requests, prompt and cached tokens with the hit ratio, output tokens, average queue wait, errors and cancelled, last seen; it is hidden when the server sends no `clients`), and the Log has a 機器 column with the record's `client`.
 
+### Engine time split (引擎時間分配)
+
+The stats page has a **引擎時間分配** card (hidden when the server sends no `engine_time`) showing where the engine loop's wall-clock
+time goes, as one stacked bar for the last 60 s plus the share since the engine started. Prefill and decode take turns on the GPU
+(they never run at the same time), so the shares add up to 100%. Kinds: `prefill` and `decode` (turns, single and batched; what
+ran inside them is taken out), `restore` (a synchronous tier restore inside `prefix_begin`, while the loop is blocked; the
+background restores of `SPILL_ASYNC_PROMOTE` are not loop time), `spill` (the tiered cache's tick and the idle backups), `media`
+(image / video encode and the wait for their decoding), `idle` (waiting for a request or a restore) and `other` (the rest: admission,
+polling, sending). Not separable: KV page writes and checkpoint saves the engine does inside a prefill or decode call stay in
+those two. `/ui/state` has `engine_time` (`recent` and `total`: `wall`, `seconds`, `share` per kind, `prefill_tokens`,
+`decode_tokens`); `/metrics` has `q27:engine_seconds_total{kind="prefill|decode|restore|spill|media|idle|other"}` (cumulative seconds
+since the engine started).
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from
