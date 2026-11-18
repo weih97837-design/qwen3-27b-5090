@@ -480,10 +480,12 @@ class Scheduler:
         pool smaller than the context (KV_POOL_TOKENS set low, MIN_KV_TOKENS) and a prompt of long videos, which the
         admission would otherwise run and suspend again and again, or keep waiting at the head of the queue."""
         try:
+            # (pool_pages includes the parking areas: alone, a request has them, they are lent to the KV cache while unused)
             pool = int(self.engine.cache_stats().get("pool_pages") or 0)
         except Exception:  # noqa: BLE001 - no statistics: the admission decides, as before
             return None
-        need = -(-len(s.prompt) // PAGE) + -(-min(s.max_new, self.kv_reserve) // PAGE)
+        # (one ceiling over the whole length; a verify block writes up to kSpecBlock = 16 positions past the committed length)
+        need = -(-(len(s.prompt) + min(s.max_new, self.kv_reserve) + 16) // PAGE)
         if not pool or need <= pool:
             return None
         media = sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0

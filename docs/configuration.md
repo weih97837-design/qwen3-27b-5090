@@ -368,9 +368,9 @@ variables:
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
 | `vram_reserve_gib` | `VRAM_RESERVE_GIB` | `null` (the default, 1.5 GiB) or a number of GiB from 0 up to the device's memory |
-| `image_tokens` | `IMAGE_TOKENS` | `null` (16,384, or `video_max_tokens` when that is more) or 1 to 262,144: image and video tokens of one request. Pinned host memory, 10 KiB per token, allocated when the engine starts (it changes the plan's host memory) |
-| `video_max_tokens` | `VIDEO_MAX_TOKENS` | `null` (the checkpoint's 12,288) or 1 to 262,144: tokens of one video. The server's own bound: no pool changes. While a video is encoded its resized frames take 6 KiB of host memory per token |
-| `video_max_frames` | `VIDEO_MAX_FRAMES` | `null` (the checkpoint's 768) or 2 to 16,384: frames sampled from a video, and the most a request may ask for |
+| `image_tokens` | `IMAGE_TOKENS` | `null` (16,384, or `video_max_tokens` when that is more: 131,072 by default) or 1 to 262,144: image and video tokens of one request. Pinned host memory, 10 KiB per token, allocated when the engine starts (it changes the plan's host memory) |
+| `video_max_tokens` | `VIDEO_MAX_TOKENS` | `null` (131,072; the checkpoint's own: 12,288) or 1 to 262,144: tokens of one video. The server's own bound: no pool changes. While a video is encoded its resized frames take 6 KiB of host memory per token |
+| `video_max_frames` | `VIDEO_MAX_FRAMES` | `null` (2,048; the checkpoint's own: 768) or 2 to 16,384: frames sampled from a video, and the most a request may ask for |
 | `spill_ram_gib` | `SPILL_RAM_GIB` | A number of GiB, 0 or more (64 by default; 0: no tiered cache) |
 | `spill_ram_retention_s` | `SPILL_RAM_RETENTION_S` | Seconds, 0 or more (3600) |
 | `spill_ssd_gib` | `SPILL_SSD_GIB` | GiB, 0 or more (100) |
