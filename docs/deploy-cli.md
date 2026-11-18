@@ -209,7 +209,7 @@ curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_'
   ```
 
 - **成功判準**：輸出 `200`；瀏覽器可以看到引擎狀態、VRAM、分層快取與請求記錄。
-- 頁面上的 **Start**、**Stop**、**Restart** 按鈕控制引擎；「Start settings」對話框的按鈕為 **Reset**、**Save for the next load**、**Start**、**Close**（`frontend/ui/index.html`）。說明見 `docs/configuration.md#start-settings`。
+- 頁面上的 **啟動**、**停止**、**重新啟動** 按鈕控制引擎；「啟動設定」對話框的按鈕為 **重設**、**儲存供下次載入**、**啟動**（已載入時為 **重新啟動**）、**關閉**（`frontend/ui/index.html`）。說明見 `docs/configuration.md#start-settings`。
 
 ---
 
@@ -243,7 +243,7 @@ scripts/serve.sh up --build
 
 ## 10. 停止與清除
 
-**停止引擎（保留伺服器，釋放 VRAM）**：在 `/ui` 按 **Stop**，或：
+**停止引擎（保留伺服器，釋放 VRAM）**：在 `/ui` 按 **停止**，或：
 
 ```bash
 curl -s -X POST http://127.0.0.1:46320/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'

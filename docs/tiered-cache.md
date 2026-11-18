@@ -52,9 +52,9 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 以下全部是 `compose.yaml` 中 `serve` 服務的環境變數，可在 `.env` 或 shell 中覆寫，於容器啟動時生效。
 
 `SPILL_RAM_GIB`、`SPILL_RAM_RETENTION_S`、`SPILL_SSD_GIB`、`SPILL_SSD_MIN_FREE_GIB`、`SPILL_SSD_MIN_TOKENS`、`SPILL_TTL_DAYS`、`VRAM_BACKUP_IDLE_S`、
-`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`、`SPILL_FAIR_AGENTS` 與 `SPILL_DIR` 也是啟動設定：可以在 /ui 的「Start settings」
+`SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`、`SPILL_FAIR_AGENTS` 與 `SPILL_DIR` 也是啟動設定：可以在 /ui 的「啟動設定」
 （**分層快取** 區段）和 Windows 托盤程式的設定視窗（**Tiered cache** 群組）直接修改，不必手動編輯 `settings.ini` 的 `[env]`。
-引擎程序與 `TierPolicy` 在引擎載入時才讀取這些值，所以要重新啟動引擎才會生效（/ui 按 **Restart**，托盤按 **Apply**）。
+引擎程序與 `TierPolicy` 在引擎載入時才讀取這些值，所以要重新啟動引擎才會生效（/ui 按 **重新啟動**，托盤按 **Apply**）。
 環境變數與 `settings.ini` 的值仍是伺服器啟動時的初始值；在 /ui 改的值只持續到伺服器重新啟動，要永久保留請寫入變數
 （頁面會列出要加入的行）。RAM 與 SSD 的大小沒有人為上限，由機器決定；`SPILL_TICK_S`、`SPILL_FLUSH_ON_STOP_S` 與
 `SPILL_PINNED_SLAB_MIB` 仍只能用變數設定。

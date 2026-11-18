@@ -457,7 +457,7 @@ def test_the_log_record_has_the_media_in_its_meta():
 
 def test_the_log_table_has_a_media_column():
     html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
-    assert 'el("th", { class: "r lo" }, "Media")' in html and "fmtMedia(m.media)" in html
+    assert 'el("th", { class: "r lo" }, "媒體")' in html and "fmtMedia(m.media)" in html
     # the event rows span the table: 15 columns (Time, Result, Request, Endpoint, Agent, eight figures, Media, Last user message)
     assert html.count('colspan: 15') == 2 and 'colspan: 10, class: "prev"' in html
 
