@@ -435,10 +435,14 @@ class EngineClient:
     def update_metrics(self, m):
         """Merges the worker's metrics; the per-client series (q27:client_*) are replaced as a set, so a client the
         worker no longer counts (its table is bounded) goes from /metrics too."""
+        # (the reader thread is the only writer: build a new dict and swap it in, so a /metrics scrape iterating the old
+        # one never sees it change size)
         if any(k.startswith("q27:client_") for k in m):
-            for k in [k for k in self.metrics if k.startswith("q27:client_")]:
-                del self.metrics[k]
-        self.metrics.update(m)
+            new = {k: v for k, v in self.metrics.items() if not k.startswith("q27:client_")}
+        else:
+            new = dict(self.metrics)
+        new.update(m)
+        self.metrics = new
 
     def submit(self, req):
         rid = new_id("req-", 16)
@@ -1108,7 +1112,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
-            body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
+            body = "".join(f"{k} {v}\n" for k, v in sorted(list(self.srv.engine.metrics.items()))).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))

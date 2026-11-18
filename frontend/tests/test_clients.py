@@ -137,3 +137,24 @@ def test_metrics_escape_labels_and_snapshot_is_json():
     json.dumps(stats.clients_block([], s.client_totals))
     h = stats.Hub()
     assert h.tick()["clients"] == []
+
+
+def test_names_in_any_script_stay_distinct_and_unsafe_characters_go():
+    assert clients.sanitize("電腦甲") == "電腦甲" and clients.sanitize("電腦乙") == "電腦乙"
+    assert clients.sanitize("PC-甲") != clients.sanitize("PC-乙")
+    assert clients.sanitize('PC"A\nB{x}') == "PC_A_B_x_"  # (quotes, newlines, braces cannot reach a label or a log line)
+    assert len(clients.sanitize("甲" * 200)) == clients.MAX_CLIENT
+
+
+def test_update_metrics_swaps_the_dict_instead_of_changing_it_under_a_scrape():
+    import types
+
+    import server
+    old = {"q27:requests_total": 1, 'q27:client_requests_total{client="PC-A"}': 5}
+    eng = types.SimpleNamespace(metrics=old)
+    server.EngineClient.update_metrics(eng, {"q27:requests_total": 2, 'q27:client_requests_total{client="PC-B"}': 7})
+    assert eng.metrics is not old
+    assert old == {"q27:requests_total": 1, 'q27:client_requests_total{client="PC-A"}': 5}  # (a reader of the old dict sees no change)
+    assert eng.metrics == {"q27:requests_total": 2, 'q27:client_requests_total{client="PC-B"}': 7}  # (the per-client set was replaced)
+    server.EngineClient.update_metrics(eng, {"q27:requests_total": 3})  # (no client series in the message: they stay)
+    assert eng.metrics['q27:client_requests_total{client="PC-B"}'] == 7 and eng.metrics["q27:requests_total"] == 3

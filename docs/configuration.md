@@ -440,7 +440,7 @@ are the job of the client machines' own agent programs (see `docs/agent-client-g
 
 Who a request comes from, in this order:
 
-1. The header `X-Client-Id: <name>` (at most 64 characters of `A-Za-z0-9._/-`; other characters become `_`; empty counts as none).
+1. The header `X-Client-Id: <name>` (at most 64 characters: letters of any script, so a Chinese name works, digits and `. _ - /`; other characters become `_`; empty counts as none. HTTP headers carry bytes: send a non-ASCII name UTF-8 encoded; a client library that only accepts latin-1 header values should use an ASCII name).
 2. The setting `CLIENT_NAMES` (environment, empty by default): a comma-separated list of `address=name` or `network/prefix=name`,
    e.g. `192.168.1.11=PC-A,192.168.1.12=PC-B,192.168.2.0/24=Lab`. An exact address is a `/32` (or `/128`); the longest matching
    prefix wins. Entries that do not parse are ignored.
@@ -450,6 +450,9 @@ A loopback peer (127.0.0.0/8, `::1`: the stats page, the tray app, tests on the 
 Behind a reverse proxy: the first entry of `X-Forwarded-For` replaces the peer address, but only when the immediate peer is a
 loopback or private address and the header is present. A public peer cannot choose its address that way. The header
 `X-Client-Id` is trusted as sent (there is no authentication): it is a label, not an identity check.
+Any client on a private network can also choose its address through `X-Forwarded-For`: the counts are for looking, not for
+security. With Docker, source addresses are kept when the port is published normally; a userland proxy or a rootless setup
+makes every machine appear as the bridge gateway (a 172.x address): then give each machine an `X-Client-Id`.
 
 Counted per client since the server's engine started (the table keeps at most 256 clients; the least recently seen go first):
 requests, requests running and waiting (queued or restoring), prompt tokens, cached tokens (and the hit ratio), output tokens,

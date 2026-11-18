@@ -1,7 +1,7 @@
 """Which machine a request comes from (docs/configuration.md "Client counting"). Counting only: nothing here admits,
 orders, limits or rejects a request.
 
-Order: the header `X-Client-Id` (sanitized: [A-Za-z0-9._/-], at most 64 characters), else the name CLIENT_NAMES gives
+Order: the header `X-Client-Id` (sanitized: letters of any script, digits and . _ - /, at most 64 characters), else the name CLIENT_NAMES gives
 the peer address (`192.168.1.11=PC-A,192.168.1.0/24=Office`: an exact address wins, then the longest prefix), else
 the address itself. Loopback peers are "local" (the stats page, the tray app, tests on the server itself).
 The peer is the socket's address; X-Forwarded-For (its first entry) is used only when the immediate peer is a
@@ -13,7 +13,7 @@ import re
 MAX_CLIENT = 64
 LOCAL = "local"
 UNKNOWN = "unknown"
-_BAD = re.compile(r"[^A-Za-z0-9._/-]")
+_BAD = re.compile(r"[^\w.\-/]")  # (letters of any script, so a name like 「電腦甲」 stays itself; digits . _ - /)
 _cache = {}
 
 
