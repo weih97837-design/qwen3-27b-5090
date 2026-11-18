@@ -432,6 +432,37 @@ The stats page shows an **Agents** table (requests running and waiting, requests
 bytes are placeholders) and an Agent column in the Log. In `/ui/state` each request row has `agent` and `agent_id`, and the
 `agents` block lists the aggregates.
 
+## Client counting
+
+The server counts the requests of each client machine, so you can see who uses it. It is counting only: admission and
+ordering stay as they are (one queue), and nothing is limited, capped or rejected here, and there are no API keys. Limits
+are the job of the client machines' own agent programs (see `docs/agent-client-guide.md`).
+
+Who a request comes from, in this order:
+
+1. The header `X-Client-Id: <name>` (at most 64 characters of `A-Za-z0-9._/-`; other characters become `_`; empty counts as none).
+2. The setting `CLIENT_NAMES` (environment, empty by default): a comma-separated list of `address=name` or `network/prefix=name`,
+   e.g. `192.168.1.11=PC-A,192.168.1.12=PC-B,192.168.2.0/24=Lab`. An exact address is a `/32` (or `/128`); the longest matching
+   prefix wins. Entries that do not parse are ignored.
+3. The peer's IP address itself.
+
+A loopback peer (127.0.0.0/8, `::1`: the stats page, the tray app, tests on the server's own machine) is `local`.
+Behind a reverse proxy: the first entry of `X-Forwarded-For` replaces the peer address, but only when the immediate peer is a
+loopback or private address and the header is present. A public peer cannot choose its address that way. The header
+`X-Client-Id` is trusted as sent (there is no authentication): it is a label, not an identity check.
+
+Counted per client since the server's engine started (the table keeps at most 256 clients; the least recently seen go first):
+requests, requests running and waiting (queued or restoring), prompt tokens, cached tokens (and the hit ratio), output tokens,
+media tokens, errors, cancelled requests, the average queue wait (arrival until the prefill begins) and when the client was last seen.
+
+Where to read it: `/ui/state` has a `clients` list (`client`, `running`, `waiting`, `waiting_tokens`, `requests`,
+`prompt_tokens`, `cached_tokens`, `hit`, `output_tokens`, `media_tokens`, `avg_wait_s`, `errors`, `cancelled`, `first_seen_s`,
+`last_seen` in seconds ago); each request row has `client`, and so does the finished-request record in the Log. `/metrics` has
+labelled series `q27:client_requests_total{client="PC-A"}`, `q27:client_running`, `q27:client_waiting`,
+`q27:client_prompt_tokens_total`, `q27:client_cached_tokens_total`, `q27:client_output_tokens_total`,
+`q27:client_media_tokens_total`, `q27:client_errors_total`, `q27:client_cancelled_total`, `q27:client_queue_wait_seconds_total`
+and `q27:client_queue_wait_count` (the average wait is their ratio). Docker: `CLIENT_NAMES` in `compose.yaml`.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from

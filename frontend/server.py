@@ -376,7 +376,7 @@ class EngineClient:
                 elif kind == "event":
                     HUB.event(msg[1], msg[2], msg[3])
                 elif kind == "metrics":
-                    self.metrics.update(msg[1])
+                    self.update_metrics(msg[1])
                 elif kind == "config":
                     with self.config_seen:
                         self.config = msg[1]
@@ -394,7 +394,7 @@ class EngineClient:
                 else:
                     rid = msg[1]
                     if kind == "done":
-                        self.metrics.update(msg[3].pop("metrics", {}))
+                        self.update_metrics(msg[3].pop("metrics", {}))
                         HUB.finished(rid, msg[2], msg[3])
                     elif kind == "error":
                         HUB.failed(rid, msg[2])
@@ -432,6 +432,14 @@ class EngineClient:
             return ApiError(503, "the engine is stopped (start it at /ui or with POST /admin/engine)", "overloaded_error")
         return ApiError(503, "the engine is loading", "overloaded_error")
 
+    def update_metrics(self, m):
+        """Merges the worker's metrics; the per-client series (q27:client_*) are replaced as a set, so a client the
+        worker no longer counts (its table is bounded) goes from /metrics too."""
+        if any(k.startswith("q27:client_") for k in m):
+            for k in [k for k in self.metrics if k.startswith("q27:client_")]:
+                del self.metrics[k]
+        self.metrics.update(m)
+
     def submit(self, req):
         rid = new_id("req-", 16)
         q = queue.Queue()
@@ -456,6 +464,8 @@ class EngineClient:
         meta = getattr(HUB.local, "meta", None)  # (the HTTP thread's request_meta: the client's X-Agent-Id / "user")
         if meta and meta.get("agent_id"):
             req = dict(req, agent_id=meta["agent_id"])
+        if meta and meta.get("client_name"):  # (counting only: docs/configuration.md "Client counting")
+            req = dict(req, client=meta["client_name"])
         try:
             with self.send_lock:
                 self.conn.send(("submit", rid, req))
@@ -1192,7 +1202,7 @@ class Handler(BaseHTTPRequestHandler):
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
-        HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
+        HUB.local.meta = request_meta(path, self.headers, body, self.client_address[0], os.environ.get("CLIENT_NAMES", "")) if path in GENERATE else None
         try:
             fn(body)
         except ApiError as e:

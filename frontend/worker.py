@@ -51,6 +51,7 @@ import agent as agents  # (the frontend dir is on sys.path)
 PREFILL, DECODE = "prefill", "decode"
 AGENT_NOTES = 4096    # checkpoint fingerprints kept for Scheduler.agent_of_ids
 AGENT_STATS = 256     # agents the per-agent counters keep (the oldest go first)
+CLIENT_STATS = 256    # clients (machines) the per-client counters keep (the least recently seen go first)
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 ACTIVE_WINDOW_S = 1.5  # s after a PREFILL sequence last ran a chunk that the stats UI still shows it as active (a decoding one is always active)
@@ -174,6 +175,7 @@ class Seq:
         # (Scheduler.submit); agent is the fairness key, the part before the first "/".
         self.agent_id = req.get("agent_id") or None
         self.agent = agents.agent_of(self.agent_id)
+        self.client = req.get("client") or "unknown"  # the machine (server.py EngineClient.submit; counting only)
         self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
 
     @property
@@ -473,6 +475,7 @@ class Scheduler:
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+        self.client_count(s, "submit")
 
     def never_fits(self, s):
         """Why request s cannot run even alone (the message of its HTTP 400), or None: its prompt and the output the
@@ -513,6 +516,57 @@ class Scheduler:
         """The agent that saved a checkpoint covering ids[:pos] (pos: all of ids), or None when unknown (never noted,
         or dropped from the bounded dict)."""
         return self.__dict__.get("agent_notes", {}).get(agents.prefix_fingerprint(ids, len(ids) if pos is None else pos))
+
+    def client_count(self, s, event, **kw):
+        """Per-client counters (frontend/clients.py; counting only, nothing here limits or orders a request): a bounded
+        table (CLIENT_STATS, the least recently seen go first). event: "submit" (arrival), "begin" (the prefill starts:
+        prompt, cached, wait, media) or "finish" (reason, out)."""
+        tot = self.__dict__.setdefault("client_totals", collections.OrderedDict())
+        now = time.time()
+        t = tot.get(s.client)
+        if t is None:
+            t = tot[s.client] = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "output_tokens": 0,
+                                 "media_tokens": 0, "errors": 0, "cancelled": 0, "wait_s": 0.0, "wait_n": 0,
+                                 "first_seen": now, "last_seen": now}
+            while len(tot) > CLIENT_STATS:
+                tot.popitem(last=False)
+        tot.move_to_end(s.client)
+        t["last_seen"] = now
+        if event == "submit":
+            t["requests"] += 1
+        elif event == "begin":
+            t["prompt_tokens"] += kw["prompt"]
+            t["cached_tokens"] += kw["cached"]
+            t["media_tokens"] += kw["media"]
+            t["wait_s"] += kw["wait"]
+            t["wait_n"] += 1
+        elif event == "finish":
+            t["output_tokens"] += kw["out"]
+            if kw["reason"] == "error":
+                t["errors"] += 1
+            elif kw["reason"] == "cancelled":
+                t["cancelled"] += 1
+
+    def client_metrics(self):
+        """The per-client series of /metrics (labelled q27:client_*; at most CLIENT_STATS clients)."""
+        from clients import label
+        live = {}
+        for s in self.alive + list(self.waiting):
+            if not s.dead:
+                live.setdefault(s.client, [0, 0])[0 if s in self.alive else 1] += 1
+        out = {}
+        for c, t in self.__dict__.get("client_totals", {}).items():
+            lb = f'{{client="{label(c)}"}}'
+            run, wait = live.get(c, (0, 0))
+            out.update({f"q27:client_requests_total{lb}": t["requests"], f"q27:client_running{lb}": run,
+                        f"q27:client_waiting{lb}": wait, f"q27:client_prompt_tokens_total{lb}": t["prompt_tokens"],
+                        f"q27:client_cached_tokens_total{lb}": t["cached_tokens"],
+                        f"q27:client_output_tokens_total{lb}": t["output_tokens"],
+                        f"q27:client_media_tokens_total{lb}": t["media_tokens"],
+                        f"q27:client_errors_total{lb}": t["errors"], f"q27:client_cancelled_total{lb}": t["cancelled"],
+                        f"q27:client_queue_wait_seconds_total{lb}": t["wait_s"],
+                        f"q27:client_queue_wait_count{lb}": t["wait_n"]})
+        return out
 
     def agent_count(self, s, prompt, cached):
         """Per-agent totals for the stats block (once per request, when its prefill begins)."""
@@ -1162,6 +1216,9 @@ class Scheduler:
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.agent_count(s, len(s.prompt), cached)
+            from stats import media_of  # (the frontend dir is on sys.path)
+            self.client_count(s, "begin", prompt=len(s.prompt), cached=cached, wait=s.begun - s.arrival,
+                              media=(media_of(s.images) or {}).get("tokens", 0))
             self.note_checkpoints(s, s.prompt, s.at)  # (s.at grew if a sibling shared a prefix with it since submit)
             self.m["q27:reusable_tokens_total"] += s.reusable
             if s.reusable > 0:  # (a continuing conversation: what the cache itself can be judged by)
@@ -1490,7 +1547,8 @@ class Scheduler:
                 "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
                 "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
-                "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id}
+                "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id, "client": s.client}
+        self.client_count(s, "finish", reason=reason, out=len(s.out))
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -1509,6 +1567,7 @@ class Scheduler:
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
+        out.update(self.client_metrics())
         if self.tiers is not None:
             sp, ts = self.engine.spill_stats(), self.tiers.status()
             out.update({"q27:tier_ram_bytes": sp["ram_bytes"], "q27:tier_in_ram": sp["in_ram"],
@@ -1530,7 +1589,7 @@ class Scheduler:
 
     def stats(self):
         """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
-        from stats import agents_block, media_of, slot_rows, tiers_block  # (the frontend dir is on sys.path)
+        from stats import agents_block, clients_block, media_of, slot_rows, tiers_block  # (the frontend dir is on sys.path)
         self.last_stats = now = time.time()
         if not hasattr(self, "slot_lanes"):  # (a Scheduler built without __init__, as the tests do)
             self.slot_lanes = {}
@@ -1553,7 +1612,7 @@ class Scheduler:
                          "wait": getattr(s, "held_reason", None) if s.held and s in self.waiting else None,
                          "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
                          "media": media_of(s.images),
-                         "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id,
+                         "marks": s.marks, "agent": s.agent, "agent_id": s.agent_id, "client": s.client,
                          # working now (stats UI 推論中): the resident sequence, any DECODE one (batched / quantum turns can be
                          # longer than a window), or a PREFILL one that ran a chunk within ACTIVE_WINDOW_S (held ones are not)
                          "active": s in self.alive and (s is self.cur or s.phase == DECODE
@@ -1573,6 +1632,7 @@ class Scheduler:
                 "tiers": tiers_block(self.engine, getattr(self, "tiers", None)),
                 "agents": agents_block(seqs, self.__dict__.get("agent_totals", {}),
                                        getattr(getattr(self, "tiers", None), "agent_rows", None)),
+                "clients": clients_block(seqs, self.__dict__.get("client_totals", {}), now),
                 "hits": {"requests": self.m["q27:requests_total"], "prompt_tokens": self.m["q27:prompt_tokens_total"],
                          "cached_tokens": self.m["q27:cached_tokens_total"],
                          "turn2_requests": self.m["q27:turn2_requests_total"],
