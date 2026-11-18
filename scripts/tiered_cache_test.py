@@ -56,7 +56,7 @@ checks the spill counters to show that the intended path was taken.
                       writing it. Every restored follow-up (B from RAM, A's from the file) must equal the uncached reference. Prompts
                       are >= 25K tokens (superseded needs more than kKeepShort = 16384).
 
-  l  Video input      (docs/tiered-cache.md "影片輸入"; needs the vision tower and NVDEC, else skipped.) The prompts are a text
+  l  Video input      (docs/tiered-cache.md, the video input section; needs the vision tower and NVDEC, else skipped.) The prompts are a text
                       prefix and the video bench/vision/colors.mp4 sampled to ~9,000 tokens (num_frames: the frames are looped, so the
                       prompt has two or more 4096-token chunks of video ids) and a question, ~12K tokens in all (the engine's own
                       media path: server.Images.prepare, videoproc, mm_encode_frames, as worker.py runs it). A asks question 1; B the
@@ -1113,6 +1113,12 @@ def scen_args(a, scen):
 
 
 def main():
+    # (a Windows console or a pipe may use a code page that cannot show every character: never die on a message)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS,
                     help="weight profile: nvidia | gdnfp4 | quasar | a model directory (default: %(default)s)")

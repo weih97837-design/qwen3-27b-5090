@@ -161,3 +161,14 @@ def test_blank_line_b_alone_spacing_and_replacement():
     # b at the document start of the final message: close to starts[-2], dropped
     p = prompt(text(300), [BRK] + text(900, 7500))
     assert p.index(BRK) + 1 not in sched().checkpoints(p, 0)
+
+
+def test_the_test_scripts_print_nothing_a_windows_code_page_cannot_show():
+    """`tiered_cache_test.py --help` prints the module docstring: on the Windows CI runner stdout is a pipe in cp1252, and a
+    character outside it ended the smoke test (and would end a run in a console with another code page)."""
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "scripts"
+    for name in ("tiered_cache_test.py", "tiered_cache_bench.py"):
+        doc = ast.get_docstring(ast.parse((root / name).read_text(encoding="utf-8"))) or ""
+        doc.encode("cp1252")  # raises UnicodeEncodeError for CJK, arrows, ...

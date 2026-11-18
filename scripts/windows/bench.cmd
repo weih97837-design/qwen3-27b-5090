@@ -4,6 +4,7 @@ rem with the package's Python. The SSD files go to a bench folder of the kvcache
 rem there). Arguments are added: --sizes 32768 for one size, or --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8" for
 rem variants (docs/deploy-windows.md). Stop the server first.
 setlocal
+set "PYTHONUTF8=1"
 cd /d "%~dp0"
 python\python.exe app\scripts\tiered_cache_bench.py --spill-dir "%LOCALAPPDATA%\qwen3-27b-5090\kvcache\bench" %*
 set "RC=%errorlevel%"
