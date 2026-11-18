@@ -543,3 +543,17 @@ def test_max_seqs_and_pool_defaults_are_the_compose_ones(monkeypatch):
     monkeypatch.delenv("MAX_SEQS", raising=False)
     assert launch.env_settings()["max_seqs"] == 8
     assert launch.ENGINE_ENV_DEFAULTS["KV_POOL_TOKENS"] == "0"  # auto: what the VRAM budget leaves
+
+
+def test_cold_agent_and_probation_settings(monkeypatch):
+    want = {"spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 1800, "num"), "spill_cold_after_s": ("SPILL_COLD_AFTER_S", 600, "num"),
+            "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"), "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", True, "flag"),
+            "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num")}
+    for key, spec in want.items():
+        assert launch.TIER_SETTINGS[key] == spec and launch.ENV_NAMES[key] == spec[0]
+        monkeypatch.delenv(spec[0], raising=False)
+    assert launch.env_settings()["spill_cold_first"] is True
+    monkeypatch.setenv("SPILL_SSD_WARM_ONLY", "0")
+    monkeypatch.setenv("SPILL_UNUSED_TTL_S", "0")
+    s = launch.env_settings()
+    assert s["spill_ssd_warm_only"] is False and s["spill_unused_ttl_s"] == 0

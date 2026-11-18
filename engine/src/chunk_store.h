@@ -307,8 +307,9 @@ struct VictimCand {
   double agent_use = 0;    // bytes the candidate's agent uses in this tier (the same number for all of an agent's candidates)
   uint32_t hits = 0;       // times it (or the checkpoint it was spilled from) was restored / hit
   bool superseded = false;
+  bool cold = false;       // its agent is cold in this tier (retention.h cold_agents); false for every candidate: no step 0
 };
-inline int pick_victim(const std::vector<VictimCand>& v, bool fair = true) {
+inline int pick_victim(const std::vector<VictimCand>& v, bool fair = true, bool cold_first = true) {
   if (v.empty()) return -1;
   std::vector<size_t> pool(v.size());
   for (size_t i = 0; i < v.size(); i++) pool[i] = i;
@@ -318,6 +319,11 @@ inline int pick_victim(const std::vector<VictimCand>& v, bool fair = true) {
       if (pred(v[i])) r.push_back(i);
     pool.swap(r);
   };
+  if (cold_first) {  // (0) the entries of cold agents, if there are any (then (1) picks the cold agent with the most bytes)
+    bool any = false;
+    for (size_t i : pool) any = any || v[i].cold;
+    if (any) keep([&](const VictimCand& c) { return c.cold; });
+  }
   if (fair) {  // (1) the agent with the most bytes (ties: the smaller id)
     size_t top = pool[0];
     for (size_t i : pool)
@@ -347,8 +353,9 @@ struct VictimChoice {
   int pass = -1;  // 0 / 1; -1: no candidate
   int idx = -1;
 };
-inline VictimChoice choose_victim(const std::vector<VictimCand>& backups, const std::vector<VictimCand>& sole, bool fair = true) {
-  const int k0 = pick_victim(backups, fair), k1 = pick_victim(sole, fair);
+inline VictimChoice choose_victim(const std::vector<VictimCand>& backups, const std::vector<VictimCand>& sole, bool fair = true,
+                                  bool cold_first = true) {
+  const int k0 = pick_victim(backups, fair, cold_first), k1 = pick_victim(sole, fair, cold_first);
   if (k0 >= 0) {
     const VictimCand& b = backups[size_t(k0)];
     size_t best_sole = 0;

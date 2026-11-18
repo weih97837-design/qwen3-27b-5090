@@ -1061,6 +1061,11 @@ std::vector<Row> make_rows() {
         {L"Asynchronous copies", L"SPILL_ASYNC_IO", "spill_async_io", K::choice, T::engine, nullptr},
         {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
         {L"Fair agents (evict from the biggest)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
+        {L"Never-hit entry lifetime (seconds)", L"SPILL_UNUSED_TTL_S", "spill_unused_ttl_s", K::edit, T::engine, L"Dropped from RAM and SSD. 0: off"},
+        {L"Cold agent after (seconds)", L"SPILL_COLD_AFTER_S", "spill_cold_after_s", K::edit, T::engine, L"No hits and nothing newer than this: evicted first"},
+        {L"Evict cold agents first", L"SPILL_COLD_FIRST", "spill_cold_first", K::choice, T::engine, nullptr},
+        {L"SSD only for proven agents", L"SPILL_SSD_WARM_ONLY", "spill_ssd_warm_only", K::choice, T::engine, nullptr},
+        {L"SSD probation quota (GiB)", L"SPILL_PROBATION_GIB", "spill_probation_gib", K::edit, T::engine, L"Entries of agents without a hit yet"},
         {L"SSD folder", L"SPILL_DIR", "spill_dir", K::edit, T::engine, nullptr},
         // Images and videos (docs/configuration.md, "Long videos"): numbers or empty (the default; the numbers are
         // frontend/launch.py MEDIA_DEFAULTS: 131,072 and 2,048, IMAGE_TOKENS following the first). IMAGE_TOKENS is read by the engine, VIDEO_MAX_* by the server's video
@@ -1082,14 +1087,16 @@ Row* row_of(const std::wstring& var) {
 bool tier_number_row(const Row& row) {
     static const char* const keys[] = {"spill_ram_gib", "spill_ram_retention_s", "spill_ssd_gib", "spill_ssd_min_free_gib",
                                        "spill_ssd_min_tokens",
-                                       "spill_ttl_days", "vram_backup_idle_s", "spill_pinned_gib"};
+                                       "spill_ttl_days", "vram_backup_idle_s", "spill_pinned_gib", "spill_unused_ttl_s",
+                                       "spill_cold_after_s", "spill_probation_gib"};
     if (!row.key) return false;
     for (const char* key : keys)
         if (!strcmp(row.key, key)) return true;
     return false;
 }
 bool tier_flag_row(const Row& row) {
-    return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote") || !strcmp(row.key, "spill_fair_agents"));
+    return row.key && (!strcmp(row.key, "spill_async_io") || !strcmp(row.key, "spill_async_promote") || !strcmp(row.key, "spill_fair_agents") ||
+                        !strcmp(row.key, "spill_cold_first") || !strcmp(row.key, "spill_ssd_warm_only"));
 }
 // The rows of the images and videos: a whole number within the setting's range, or empty (the default).
 bool media_row(const Row& row) {

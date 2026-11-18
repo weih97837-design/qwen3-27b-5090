@@ -27,6 +27,16 @@ decides whether an entry is dropped instead of written) and
 per agent the bytes it holds in each tier (spill_agents); an engine without them gives the defaults (owner 0, no hits, nothing
 superseded) and the order is the old "oldest written first".
 
+Three more rules for entries and agents that never prove their value (docs/tiered-cache.md "Retention"; they only act on entries the
+engine reports "hits" for, so an engine without the retention fields keeps the old behaviour):
+  A. SPILL_UNUSED_TTL_S (1800; 0: off): an entry with no hit for that long since it came to RAM / was written is dropped from RAM and
+     the SSD by tick(), whatever the free capacity (not: hit entries, entries of <= KEEP_SHORT_TOKENS tokens, backups, busy ones). "expired".
+  B. cold agents (SPILL_COLD_FIRST, SPILL_COLD_AFTER_S): see _pick_victim. The engine's retention.h cold_agents is the same rule.
+  C. SPILL_SSD_WARM_ONLY (1): an entry is written to the SSD only when it was hit or its agent has a hit in some reported entry
+     ("warm"). An unproven entry of an agent with an explicit id (not `auto:`) is written within the PROBATION quota
+     (SPILL_PROBATION_GIB, 4: all unproven entries on the SSD together; the oldest unproven one goes first); one of an `auto:` agent
+     (no X-Agent-Id: a new id per prompt) is dropped instead. "not_written".
+
 Everything runs on the caller's thread: the engine is not thread-safe.
 """
 
@@ -48,6 +58,7 @@ MOSTLY_SHARED = 0.25               # an entry whose unique bytes are under this 
 # 15 s to exit on an unload or restart and 10 s on shutdown (EngineClient._stop, stop); a flush cut off by the
 # server's terminate would leave a file half written.
 STOP_FLUSH_MAX_S = 8.0
+KEEP_SHORT_TOKENS = 16384          # engine/src/retention.h kKeepShortTokens (a test compares): the shared system-prompt prefixes are never expired / gated
 DEFAULT_WRITE_BPS = 1e9            # flush() assumes this write speed until an export has been timed (conservative: an NVMe SSD does more)
 WRITE_RATE_MIN_BYTES = 64 << 20    # an export smaller than this does not update the measured speed
 
@@ -101,10 +112,31 @@ def _owner(e):
     return e.get("owner") or 0
 
 
+def _known(e):
+    """The engine reports this entry's hits (an engine without the retention fields does not: then no rule below applies to it)."""
+    return "hits" in e
+
+
+def _cold_owners(entries, times, now, after):
+    """The cold agents of a tier (engine/src/retention.h cold_agents): none of the agent's entries has hits, and its newest entry is
+    at least `after` s old. entries: the whole tier; times: id -> when the entry came to the tier. Agent 0 (unknown) is never cold; an
+    agent with an entry the engine reports no hits for, or no time for, is not cold."""
+    agents = {}  # owner -> [any hit / unknown, newest time]
+    for e in entries:
+        t = times.get(e["id"])
+        a = agents.setdefault(_owner(e), [False, None])
+        if not _known(e) or _hit(e) or t is None:
+            a[0] = True
+        elif a[1] is None or t > a[1]:
+            a[1] = t
+    return {o for o, (warm, newest) in agents.items() if o != 0 and not warm and newest is not None and now - newest >= after}
+
+
 class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=100, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
-                 backup_victims=8, ssd_min_tokens=32768, fair_agents=True):
+                 backup_victims=8, ssd_min_tokens=32768, fair_agents=True, unused_ttl_s=1800, cold_after_s=600,
+                 cold_first=True, ssd_warm_only=True, probation_gib=4):
         self.engine = engine
         self.directory = Path(directory) if directory else None  # None: no SSD tier
         self.ram_retention_s = float(ram_retention_s)
@@ -119,6 +151,14 @@ class TierPolicy:
         # carries the same ~190 MiB recurrent state, and a short prefix recomputes in about the time a read takes (0: off).
         self.ssd_min_tokens = max(0, int(ssd_min_tokens))
         self.fair_agents = bool(fair_agents)           # SPILL_FAIR_AGENTS: the SSD victim comes from the agent using the most SSD
+        self.unused_ttl_s = max(0.0, float(unused_ttl_s))   # SPILL_UNUSED_TTL_S: never-hit entries older than this are dropped (0: off)
+        self.cold_after_s = max(0.0, float(cold_after_s))   # SPILL_COLD_AFTER_S: an agent without hits whose newest entry is this old is cold
+        self.cold_first = bool(cold_first)                  # SPILL_COLD_FIRST: cold agents' entries are the SSD victims first
+        self.ssd_warm_only = bool(ssd_warm_only)            # SPILL_SSD_WARM_ONLY: no unproven entry goes to the SSD (but the probation quota)
+        self.probation_bytes = max(0.0, float(probation_gib)) * GiB  # SPILL_PROBATION_GIB: the SSD room of all unproven entries together
+        self.auto_owners = set()                            # owner ids of `auto:` agents (note_agent): the worker tells; lost at a restart
+        self.expired = 0                                    # entries dropped by the never-hit TTL (A)
+        self.not_written = 0                                # unproven entries refused / removed by the warm-only rule (C)
         self.skipped_short = 0                         # short entries dropped instead of written
         self.skipped_superseded = 0                    # superseded entries dropped instead of written
         self.agent_rows = []                           # the engine's per-agent bytes / entries at the last look (spill_agents), for status()
@@ -151,16 +191,27 @@ class TierPolicy:
                                   ("VRAM_BACKUP_IDLE_S", "backup_idle_s", 60),
                                   ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8),
                                   ("VRAM_BACKUP_VICTIMS", "backup_victims", 8),
-                                  ("SPILL_SSD_MIN_TOKENS", "ssd_min_tokens", 32768)):
+                                  ("SPILL_SSD_MIN_TOKENS", "ssd_min_tokens", 32768),
+                                  ("SPILL_UNUSED_TTL_S", "unused_ttl_s", 1800),
+                                  ("SPILL_COLD_AFTER_S", "cold_after_s", 600),
+                                  ("SPILL_PROBATION_GIB", "probation_gib", 4)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
-        text = os.environ.get("SPILL_FAIR_AGENTS")  # (a flag: 1 / 0; unset or empty: on)
-        opts["fair_agents"] = True if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
+        for env, key in (("SPILL_FAIR_AGENTS", "fair_agents"), ("SPILL_COLD_FIRST", "cold_first"),
+                         ("SPILL_SSD_WARM_ONLY", "ssd_warm_only")):  # (flags: 1 / 0; unset or empty: on)
+            text = os.environ.get(env)
+            opts[key] = True if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
             log(f"tiered cache: SPILL_FLUSH_ON_STOP_S {opts['flush_on_stop_s']:g} cut to {STOP_FLUSH_MAX_S:g} s "
                 "(the server stops the engine within 10-15 s)")
             opts["flush_on_stop_s"] = STOP_FLUSH_MAX_S
         return cls(engine, os.environ.get("SPILL_DIR", ""), log=log, **opts)
+
+    def note_agent(self, agent, owner):
+        """The worker tells which agent an owner id is (agent.owner_id): `auto:` agents (no X-Agent-Id) are remembered, since the owner
+        id is a hash. Lost at a restart: after it the agent counts as one with an explicit id (probation quota, not dropped at once)."""
+        if owner and isinstance(agent, str) and agent.startswith("auto:"):
+            self.auto_owners.add(owner)
 
     # ------------------------------------------------------------ SSD layout
 
@@ -275,8 +326,10 @@ class TierPolicy:
                 if e["on_disk"] and entry_id not in self.written:
                     self.written[entry_id] = _mtime(e["path"], now)
 
+        entries = self._expire(entries, now)  # A (also without an SSD: RAM entries nobody used go too)
         if self.directory is None:  # no SSD tier: RAM entries stay until the engine's own cap drops them
             return
+        probation = self._probation_state(entries, now)  # C: also removes unproven entries that reached the SSD some other way
 
         # RAM -> SSD: the oldest checkpoints first; when busy, only after twice the retention. An idle backup is not
         # written: its checkpoint is still in VRAM, so the file would be a copy of data that is not lost.
@@ -296,6 +349,8 @@ class TierPolicy:
             if self._short(e):
                 self.skipped_short += 1
                 self._drop(e["id"], f"shorter than SPILL_SSD_MIN_TOKENS ({e['pos']} < {self.ssd_min_tokens} tokens)")
+                continue
+            if not self._gate(e, probation):
                 continue
             self._to_disk(e, now)
 
@@ -337,14 +392,92 @@ class TierPolicy:
         return self.ssd_min_tokens > 0 and e.get("pos", 0) < self.ssd_min_tokens
 
     def _drop(self, entry_id, why):
+        """True when the entry was dropped."""
         try:
             self.engine.spill_drop(entry_id)
         except RuntimeError as ex:
             self._error(f"drop {entry_id} ({why}): {ex}")
-            return
+            return False
         self.written.pop(entry_id, None)
         self.ram_since.pop(entry_id, None)
         self.log(f"tiered cache: entry {entry_id} dropped ({why})")
+        return True
+
+    # ------------------------------------------------------------ never-hit entries (A, C)
+
+    def _expire(self, entries, now):
+        """A: drops the entries that have had no hit for unused_ttl_s since they came to RAM / were written, from RAM and from the SSD,
+        whatever the free room. Not: entries with hits, the shared short prefixes (<= KEEP_SHORT_TOKENS, as "superseded"), idle backups
+        (their checkpoint is still in VRAM, and the idle backup would copy it again), busy ones, and entries the engine reports no hits
+        for. Returns the engine's list again when something went."""
+        if self.unused_ttl_s <= 0:
+            return entries
+        gone = False
+        for e in entries:
+            if e.get("busy") or e.get("backup") or not _known(e) or _hit(e) or (e.get("pos") or 0) <= KEEP_SHORT_TOKENS:
+                continue
+            since = self.ram_since.get(e["id"]) if e["ram_bytes"] > 0 else self.written.get(e["id"])
+            if since is None or now - since < self.unused_ttl_s:
+                continue
+            if self._drop(e["id"], f"never hit for {now - since:.0f} s (SPILL_UNUSED_TTL_S {self.unused_ttl_s:g})"):
+                self.expired += 1
+                gone = True
+        if gone:
+            entries = self.engine.spill_list()
+            self.listed = entries
+        return entries
+
+    def _ssd_size(self, e):
+        return e.get("logical_bytes") or _size(e.get("path")) or e.get("ram_bytes") or 0
+
+    def _unproven(self, e, warm):
+        """C: no hit on the entry and none on any entry of its agent (agent 0, unknown, is not an agent: never unproven), and not one of
+        the short shared prefixes."""
+        return (_known(e) and not _hit(e) and _owner(e) != 0 and _owner(e) not in warm
+                and (e.get("pos") or 0) > KEEP_SHORT_TOKENS)
+
+    def _probation_state(self, entries, now):
+        """C: the unproven entries on the SSD ({"warm": agents with a hit, "disk": [(time written, id, bytes)], "used"}), after removing
+        the ones that must not be there: those of `auto:` agents, and the oldest ones beyond SPILL_PROBATION_GIB. None: rule off."""
+        if not self.ssd_warm_only:
+            return None
+        warm = {_owner(e) for e in entries if _known(e) and _hit(e)}
+        disk = sorted((self.written.get(e["id"], now), e["id"], self._ssd_size(e)) for e in entries
+                      if e["on_disk"] and not e.get("busy") and self._unproven(e, warm))
+        st = {"warm": warm, "disk": [], "used": 0}
+        owner = {e["id"]: _owner(e) for e in entries}
+        for t, i, size in disk:
+            if owner[i] in self.auto_owners and self._drop(i, "unproven agent without an id is not kept on the SSD (SPILL_SSD_WARM_ONLY)"):
+                self.not_written += 1
+                continue
+            st["disk"].append((t, i, size))
+            st["used"] += size
+        while st["used"] > self.probation_bytes and st["disk"]:
+            t, i, size = st["disk"].pop(0)
+            st["used"] -= size  # (a failed drop stays on the SSD but no longer counts: the loop must end)
+            if self._drop(i, "SPILL_PROBATION_GIB: the oldest unproven entry goes"):
+                self.not_written += 1
+        return st
+
+    def _gate(self, e, st):
+        """C: whether a RAM entry may be written to the SSD now. A hit entry or one of a warm agent: yes. An unproven one of an `auto:`
+        agent: no (dropped, "not_written"). An unproven one of an agent with an id: yes within the probation quota, after dropping the
+        oldest unproven entries on the SSD to make room; larger than the whole quota: no (dropped)."""
+        if st is None or not self._unproven(e, st["warm"]):
+            return True
+        size = self._ssd_size(e)
+        if _owner(e) in self.auto_owners or size > self.probation_bytes:
+            if self._drop(e["id"], "unproven agent: not written to the SSD (SPILL_SSD_WARM_ONLY)"):
+                self.not_written += 1
+            return False
+        while st["used"] + size > self.probation_bytes and st["disk"]:
+            t, i, old = st["disk"].pop(0)
+            st["used"] -= old
+            if self._drop(i, "SPILL_PROBATION_GIB: the oldest unproven entry goes"):
+                self.not_written += 1
+        st["disk"].append((self.clock(), e["id"], size))
+        st["used"] += size
+        return True
 
     def _to_disk(self, e, now):
         """Writes one RAM entry to a file in the directory. Returns "written", "kept" (the SSD room could not be
@@ -396,6 +529,7 @@ class TierPolicy:
                      key=lambda e: (not _hit(e), -(e.get("pos") or 0), self.ram_since.get(e["id"], now)))
         rate = self.write_bps or DEFAULT_WRITE_BPS
         skipped = 0
+        probation = self._probation_state(self.engine.spill_list(), now)
         for i, e in enumerate(ram):
             remaining = deadline - clock()
             if remaining <= 0:
@@ -406,6 +540,8 @@ class TierPolicy:
             incoming = e.get("new_disk_bytes", e["ram_bytes"]) if self._layout() else e["ram_bytes"]
             if incoming / rate > remaining:
                 skipped += 1
+                continue
+            if not self._gate(e, probation):
                 continue
             if self._to_disk(e, now) == "written":
                 result["written"] += 1
@@ -451,7 +587,7 @@ class TierPolicy:
         self.ssd_use = self._use_of(disk, lambda e: sizes[e["id"]], "ssd_bytes")
         skipped = set()
         while not fits():
-            e = self._pick_victim([x for x in disk if not x.get("busy") and x["id"] not in skipped], 0)  # (busy: its file is read now)
+            e = self._pick_victim([x for x in disk if not x.get("busy") and x["id"] not in skipped], 0, disk)  # (busy: its file is read now)
             if e is None:
                 break
             entry_id = e["id"]
@@ -469,15 +605,25 @@ class TierPolicy:
         return fits()
 
 
-    def _pick_victim(self, disk, need):
+    def _pick_victim(self, disk, need, tier=None):
         """The entry to delete next, among the SSD entries that can be dropped (a small function, so the policy can be swapped).
         The retention order (the engine applies the same to RAM): the agent using the most SSD bytes (self.ssd_use; with
         fair_agents), then in it superseded entries, never-hit before hit ones, then the old rule: an entry that is mostly
         shared (little of it would be freed, MOSTLY_SHARED) only after the ones that free real bytes, and among those the oldest
-        written. `need`: bytes still to free."""
+        written. `need`: bytes still to free.
+        Before the agent step (B): entries of COLD agents (self.cold_first): the agent has no hit in any entry of the tier (`tier`: all
+        entries on the SSD, busy ones too; default `disk`) and its newest entry was written at least cold_after_s ago. If any candidate
+        belongs to one the candidates are restricted to them; the agent step then takes the cold agent with the MOST bytes (so the order
+        among cold agents is "most bytes first"; with fair_agents off: all cold entries, then the entry order below)."""
         if not disk:
             return None
         cand = disk
+        if self.cold_first:
+            now = self.clock()
+            whole = disk if tier is None else tier
+            cold = _cold_owners(whole, {e["id"]: self.written.get(e["id"], now) for e in whole}, now, self.cold_after_s)
+            if cold and any(_owner(e) in cold for e in cand):
+                cand = [e for e in cand if _owner(e) in cold]
         if self.fair_agents:
             use = self.ssd_use
             top = max({_owner(e) for e in cand}, key=lambda o: (use.get(o, 0.0), -o))  # (ties: the smaller id, as the engine)
@@ -537,7 +683,7 @@ class TierPolicy:
         while not fits():
             disk = [e for e in entries if e["on_disk"] and not e.get("busy") and e["id"] not in skipped]
             need = max(used + incoming - self.budget, self.reserve - (free - incoming) if reserve_reachable else 0)
-            e = self._pick_victim(disk, need)
+            e = self._pick_victim(disk, need, [x for x in entries if x["on_disk"]])
             if e is None:
                 break
             victim = e["id"]
@@ -604,6 +750,9 @@ class TierPolicy:
                 "ssd_dedup_ratio": ssd_logical / ssd_physical if dedup and ssd_logical and ssd_physical else None,
                 "backup_entries": sum(1 for e in self.listed if e.get("backup")), **split, **reuse,
                 "fair_agents": self.fair_agents, "ssd_skipped_superseded": self.skipped_superseded,
+                "expired": self.expired, "not_written": self.not_written, "cold_first": self.cold_first,
+                "unused_ttl_s": self.unused_ttl_s, "cold_after_s": self.cold_after_s, "ssd_warm_only": self.ssd_warm_only,
+                "probation_bytes": int(self.probation_bytes),
                 "agent_rows": list(self.agent_rows),
                 "ssd_budget_bytes": int(self.budget), "ssd_min_tokens": self.ssd_min_tokens,
                 "ssd_skipped_short": self.skipped_short, "last_error": self.last_error}

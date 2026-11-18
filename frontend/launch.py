@@ -55,6 +55,13 @@ TIER_SETTINGS = {
     "spill_async_io": ("SPILL_ASYNC_IO", True, "flag"),
     "spill_async_promote": ("SPILL_ASYNC_PROMOTE", True, "flag"),
     "spill_fair_agents": ("SPILL_FAIR_AGENTS", True, "flag"),  # a tier's victim comes from the agent using the most of it (retention)
+    # never-hit entries and cold agents (docs/tiered-cache.md "Retention"): dropped after this many seconds without a hit (0: off) / an
+    # agent without hits whose newest entry is this old is evicted first / that step off / no unproven entry on the SSD but the quota
+    "spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 1800, "num"),
+    "spill_cold_after_s": ("SPILL_COLD_AFTER_S", 600, "num"),
+    "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"),
+    "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", True, "flag"),
+    "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num"),
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down

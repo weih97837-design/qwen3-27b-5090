@@ -127,6 +127,11 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
 | `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
 | `SPILL_FAIR_AGENTS` | `1` | RAM／SSD 層滿時，從用量最大的 agent 挑逐出對象；`0` 關閉 |
+| `SPILL_COLD_FIRST` | `1` | 冷 agent（在該層沒有命中、最新 entry 超過 `SPILL_COLD_AFTER_S`）的 entry 先被逐出；`0` 關閉 |
+| `SPILL_COLD_AFTER_S` | `600` | 冷 agent 的門檻（秒） |
+| `SPILL_UNUSED_TTL_S` | `1800` | 從未命中的 entry 超過這麼多秒就從 RAM／SSD 丟棄；`0` 關閉 |
+| `SPILL_SSD_WARM_ONLY` | `1` | 從未命中且其 agent 也沒有命中的 entry 不寫入 SSD（沒有 id 的 `auto:` agent 直接丟棄，有 id 的受 `SPILL_PROBATION_GIB` 限制）；`0` 全部寫入 |
+| `SPILL_PROBATION_GIB` | `4` | 這類「未證明」entry 在 SSD 上合計的容量上限（GiB） |
 
 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 自 v0.3.2 起預設開啟；pinned 記憶體在 Windows 上計入 GPU 共用記憶體，記憶體吃緊時可設 `SPILL_PINNED_GIB=0`（見 `docs/tiered-cache.md`）。
 `HOST=0.0.0.0` 會讓區網其他電腦連線；第一次啟動時 Windows 防火牆會詢問是否允許 Python，允許前請確認網路環境。

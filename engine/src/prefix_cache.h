@@ -99,6 +99,7 @@ struct Checkpoint {
   uint64_t owner = 0;
   uint32_t hits = 0;
   uint64_t last_hit = 0;
+  double born = 0;  // retention.h ret_now_s() when the entry came to RAM (spill_add): the age cold_agents() looks at (per run, not in the manifest)
   mutable std::vector<uint64_t> bh;  // retention.h block_hashes(ids), filled when the retention rules first look at it (ids never change)
   // SPILL_ASYNC_PROMOTE: a checkpoint whose pages are still being filled by a host -> device copy on the I/O stream
   // (Model::spill_restore_begin). load_ev is recorded behind that copy and load_id is the spill_ entry it comes from.

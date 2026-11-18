@@ -54,6 +54,10 @@ struct Options {
   // Retention (retention.h, docs/tiered-cache.md): SPILL_FAIR_AGENTS (default on): spill_enforce_ram takes its victim from the agent
   // that uses the most bytes of the RAM tier. false: the order within the whole tier (superseded, never hit, least recently used).
   bool spill_fair_agents = true;
+  // SPILL_COLD_FIRST (default on) / SPILL_COLD_AFTER_S (default 600): entries of COLD agents (no hit in the tier, newest entry older than
+  // this) are evicted before anything else (retention.h cold_agents). The frontend reads the same variables for the SSD.
+  bool spill_cold_first = true;
+  double spill_cold_after_s = 600;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
