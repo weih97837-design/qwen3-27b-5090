@@ -652,11 +652,17 @@ class Hub:
                                  endpoint=meta.get("endpoint"), user_agent=meta.get("client"),
                                  client=s.get("client") or meta.get("client_name"), preview=meta.get("preview")))
             cache = snap["cache"] if snap else None
+            # slot lanes: tok_s is the average since the first token; tok_s_now the recent rate of the lane's request
+            # (None for an idle lane, an unknown rid, or before a rate was measured)
+            slots = []
+            for lane in snap.get("slots", []) if snap else []:
+                now_rate = (self.rates.get(lane.get("rid")) or {}).get("decode") if lane.get("rid") else None
+                slots.append(dict(lane, tok_s_now=now_rate if now_rate else None))
             return {"t": time.time(), "engine": self.engine_state, "seqs": seqs, "vram": self.vram(), "cache": cache,
                     "idle": self.engine_idle() if self.engine_idle else None,
                     "sample": self.samples[-1] if self.samples else None,
                     "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None,
-                    "slots": snap.get("slots", []) if snap else [],
+                    "slots": slots,
                     "agents": snap.get("agents", []) if snap else [],
                     "clients": snap.get("clients", []) if snap else [],
                     "tiers": snap.get("tiers") if snap else None,
