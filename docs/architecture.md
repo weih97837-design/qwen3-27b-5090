@@ -86,9 +86,10 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   memory plan does not depend on a profiling run. (In the vLLM setup this replaced, the KV cache size varied
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
   The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
-  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
-  resized with PIL and normalized on the GPU (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
-  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
+  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, images are
+  resized with PIL and normalized on the GPU, and videos are read and decoded by the engine library itself
+  (NVDEC; `frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` and `test_videoproc.py` compare prompts,
+  ids, image grids and video frames with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
   download): a distroless base (glibc and libstdc++), the CUDA runtime library, `libq27.so`, Python and those
   packages (1.21 GB on the nvidia/cuda base image, 456 MB of it the forward-compatibility driver package, which
   GeForce GPUs do not use; 350 MB on ubuntu:24.04).
@@ -148,6 +149,18 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   failing that it raises `KvFull` without changing anything. The kernels see only page numbers: the page table
   holds `(p / G) * 32G + p % G`. As a result, starting with `MAX_SEQS=8` costs only the lanes' buffers, and one
   request still gets the full 262K context.
+- **Video decoding borrows from the KV pool.** NVDEC's decode surfaces are allocated by the driver when a decoder is
+  created, outside the pools: about 0.4 GiB per decoder for 4K 10-bit (0.8 GiB with the two decoders of one
+  video), 0.05 to 0.1 GiB below 1080p. Reserving that at startup would cost every user about 47K tokens of KV
+  cache for a feature few use, and leaving it out of the plan pushes a full process past the point where WDDM
+  starts moving memory to the host. So the KV pool is mapped through CUDA's virtual memory management (32 MiB
+  chunks, the same addresses for its whole life) and, before a video is decoded, the server lends the memory the
+  decode will take: `q27_video_memory` reads the stream's first sequence header with NVDEC's parser alone (on the
+  CPU) and sizes the surfaces, `kv_lend` empties whole blocks just below the parking areas as parking does (pages
+  moved, checkpoints evicted if it must) and unmaps their chunks, and `kv_unlend` maps them again when the decode
+  is done (tens of milliseconds each way; running kernels are not waited for). If the pool cannot spare it, the
+  video is decoded with one decoder and the memory is taken beyond the budget. Without VMM (`Q27_KV_VMM=0`) the
+  pool is one allocation and nothing is lent.
 - **Host memory** (pinned): the embedding table (2.4 GiB), the prefix-cache checkpoints (`STATE_HOST_CACHE`,
   8 GiB), the vision tower (0.9 GiB) and the image embeddings.
 
@@ -164,7 +177,9 @@ request decodes at 96.6 tok/s at a short context.
   a cp.async ring of 3 stages per warp with `ldmatrix`, and split-K so that 170 SMs stay busy. At 1 to 8 rows the
   loads of the activations are 4-byte, at 16 to 32 rows 16-byte with a transpose in registers (P6-11), and at
   64 rows the activations are staged once per CTA in shared memory (P7-4). When the outputs are split along K,
-  a separate kernel sums the partials (P7-4) from two rows up. CUTLASS's 128 x 128 tiles reached 0.08 to
+  a separate kernel sums the partials (P7-4) from two rows up. The split does not depend on the number of rows,
+  so a token's row is bit-identical whether it is computed alone (decode) or among verify or batched rows
+  (before v0.6.2 one-row calls split more finely, and plain decode differed from verify). CUTLASS's 128 x 128 tiles reached 0.08 to
   0.9 TB/s on these shapes; the skinny GEMMs reach 1.3 to 1.67 TB/s.
 - **One CUDA graph per step, chained with PDL.** Every kernel triggers its dependents first and then waits for its
   predecessor (`griddepcontrol`), so the next GEMM is resident and prefetches its weights into L2 while the
@@ -196,7 +211,11 @@ tokens at a 32K context, shorter steps), and after every layer a code bridge tha
 predecessor into it. A step drafts up to 15 tokens; the top-16 candidates of each position are scored again with the
 last layer's write redone for every candidate of the predecessor (a 16 x 16 table per position), and the selector
 below walks that table. A sequence verifies 16 rows while its tokens per step stay high and 8 otherwise
-(`Q27_SPEC_ADAPT`); batched steps draft 8 rows per sequence. `SPEC=dflash2` selects DFlash2, described next.
+(`Q27_SPEC_ADAPT`). In batched steps each sequence verifies 4, 8, 12 or 16 rows of its own (`Q27_SPEC_ADAPT_BATCH`):
+the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
+lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
+the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
+every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
 
 The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
@@ -220,7 +239,8 @@ from an anchor and verifies all 8 rows in one forward of the target.
 - **Lossless sampling.** Acceptance is rejection sampling against the target's distribution with the request's
   own temperature, top-k, min-p and top-p, so the output has the target's distribution exactly (checked with
   chi-square tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give
-  identical tokens (`scripts/bench_spec.py --check-greedy`).
+  identical tokens (`scripts/bench_spec.py --check-greedy`), with the default settings since v0.6.2 (the skinny
+  GEMMs' split above).
 - **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
   vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
   steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the
@@ -277,8 +297,8 @@ Prefill runs in chunks of 2,048 tokens through the same weights.
     of context), instead of once per CTA (P7-8).
   - Tiles follow absolute positions (64-token blocks, blocks ending past 1,024 split their keys in two), so a row's
     result does not depend on where a chunk starts.
-- **GDN**: a chunked delta rule with chunks of 64 (WY representation: the per-chunk matrices in FP32 by forward
-  substitution, the inter-chunk state update on BF16 MMAs; P5-2). Chunk boundaries are fixed at multiples of 64
+- **GDN**: a chunked delta rule with chunks of 64 (WY representation: (I + L)^-1 per chunk in FP32 by forward
+  substitution, the inter-chunk state update on BF16 MMAs and delta from (I + L)^-1 on F16 MMAs; P5-2, P5-14). Chunk boundaries are fixed at multiples of 64
   absolute positions, and so are the prefill chunk boundaries and the checkpoints. A prefill resumed from a
   checkpoint is therefore bit-identical to one that ran through.
 - **Draft context**: only the last 2,048 tokens of a prompt go through the draft.
@@ -294,7 +314,10 @@ it (reference-counted, shared between checkpoints of the same conversation) and 
 convolution, the draft's context ring: 189.9 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
-  holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
+  holds the system prompt and tools; the starts of the last message and of the generation prompt), after the last
+  blank line of a final user message (a document followed by a question: a second question about the same document
+  reuses all of it; without this the generation prompt's checkpoint, rounded down to 64, often fell just past the
+  document and the next question resumed from the last interval checkpoint, up to one interval back), where the prompt diverges from the previous
   one, every `CHECKPOINT_INTERVAL` (4,096) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 8 GiB = about 42 checkpoints). Saving copies the
@@ -359,6 +382,45 @@ images.
 - M-RoPE: rows of an image get (t, h, w) positions; after the last image, positions continue as position + delta
   (one device integer), so decode and the speculative graphs are unchanged, and text-only requests are
   bit-identical to the text path.
+
+**Videos.** The checkpoint's video processor samples 2 frames per second (4 to 768, an even count), resizes all of
+them to one size and caps the pixels per frame as qwen-vl-utils does (at most 768 tokens per pair of frames, 12,288
+per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video).
+Each pair of frames (the temporal patch) is, to the language model,
+an image of its own after its time as text, `<1.3 seconds><|vision_start|>...<|vision_end|>`, with the M-RoPE
+positions of an image (transformers' `get_rope_index` splits a video the same way), so the engine's image path
+takes it unchanged. In the vision tower a pair differs from an image only in that its patches take the two frames
+over the temporal patch instead of one image twice; attention, position embeddings and RoPE stay within the pair.
+
+- The vision tower encodes many pairs of one grid in one pass (attention over each pair's patches: the third
+  grid dimension of the attention kernel), as many as `IMAGE_MAX_PIXELS` holds, so a 5-minute video's 300 pairs
+  take 0.25 s instead of 300 weight streams (about 20 ms each with `VISION=host`). The result is bit-identical to
+  one pair per call.
+- The engine library reads the container itself (`engine/src/video_mp4.cc`: MP4 / MOV, fragmented files and edit
+  lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
+  libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
+  timestamps; compressed frames (`ContentEncoding`) are refused) and decodes on NVDEC through the driver's
+  `libnvcuvid` with its bitstream parser (H.264, HEVC, AV1, VP9; 8 or 10 bits; 4:2:0, and 4:2:2 / 4:4:4 where NVDEC
+  decodes them: H.264 and HEVC 4:2:2, HEVC 4:4:4 on an RTX 5090; `engine/src/video_nvdec.cu`). A rotation in the
+  container (an MP4 track's display matrix, Matroska's `ProjectionPoseRoll`, in quarter turns) is applied as FFmpeg
+  applies it: the frames are resized to the turned size and then turned, so a portrait phone video comes upright. No
+  FFmpeg: PyAV's wheel doubled the serving image. The server reads the frame count, rate and size from the header
+  (`q27_video_probe`, no GPU), enough for the plan (the frames, the size, the token ids and the times); the engine
+  process decodes the videos it has to encode while the request waits. Pairs in a cached prefix are not encoded
+  again, nor decoded: the decode starts at the closed key frame before the first pair past the prefix (asking a
+  4K, 60-second video again with a new question decodes 0.24 s instead of 2.5 s).
+- Only the sampled frames leave the decoder: the parser queues four pictures ahead, so decoding overlaps the
+  mapping of a wanted one, which is converted to RGB (BT.601 / 709 / 2020 per the stream, each pixel taking its
+  2x2 block's chroma as FFmpeg's default conversion does, which is what the reference readers give the model) and
+  resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
+  `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
+  vision tower's input path.
+- One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
+  closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
+  of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,
+  120 frames sampled: 4K AV1 10-bit in 2.65 s (CPU time 1.3 s; FFmpeg on 24 CPU threads: 8.98 s, 43 s of CPU time),
+  4K HEVC 10-bit 2.01 s (6.61 s), 1080p H.264 at 20 Mbit/s 1.01 s (1.28 s). Through the API, the 4K AV1 video
+  (11,954 prompt tokens) answers in 5.7 s.
 
 ## 12. API server
 
@@ -437,7 +499,8 @@ and computes plainly.
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),
   - a request in a batch equals the request alone,
   - a prefill resumed from a checkpoint equals the prefill that ran through, at any 64-aligned boundary,
-  - parking, swapping and moving KV pages change nothing,
+  - parking, swapping and moving KV pages change nothing, nor does lending KV pool memory for a video decode
+    (`scripts/lend_test.py`) or mapping the pool through VMM (golden identical with `Q27_KV_VMM=0`),
   - `VISION=host` equals `VISION=bf16`.
 
   One caveat: the skinny GEMM splits K differently for one row than for several (it is faster), so a decode row

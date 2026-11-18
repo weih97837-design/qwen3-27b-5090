@@ -129,9 +129,10 @@ def test_plans_match_the_engine():
     # The serve default's startup log on this device: kv pool 9461 pages (605504 tokens), device 28.377 GiB
     # (28.378 until the own GEMMs replaced CUTLASS and its 7.8 MiB workspace, then 28.370 until the penalty
     # counts of the 8 sequences, 7.6 MiB). With the DSpine draft (the default since; window 2048): 601856 tokens,
-    # 28.3924 GiB (its codebook is in host memory, its sender table of the draft vocabulary, 256 MB, on the device).
+    # 28.3924 GiB (its codebook is in host memory, its sender table of the draft vocabulary, 256 MB, on the device);
+    # 28.3985 since the per-lane verify rows of batched steps (P3-38, 5.6 MiB of step buffers; the pool is the same).
     assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 601856, True)
-    assert abs(p["device"] / GiB - 28.3924) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
+    assert abs(p["device"] / GiB - 28.3985) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
     kv = {v["value"]: v["plan"] for v in out["variants"]["kv_dtype"]}
     assert kv["nvfp4"] == p and kv["fp8"]["kv_tokens"] < kv["nvfp4"]["kv_tokens"]
     big = {v["value"]: v["plan"] for v in out["variants"]["vram_reserve_gib"]}
@@ -425,3 +426,19 @@ def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
     monkeypatch.setenv("SPEC", "dspine")  # (asked for: no fallback)
     assert launch.default_spec() == "dspine"
     assert launch.env_settings()["spec"] == "dspine"
+
+
+def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
+    """IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when more; set, it stays."""
+    env = {}
+    monkeypatch.setattr(os, "environ", env)  # (set_engine_env also sets the engine's defaults)
+    for video, image, want in ((None, None, "16384"), ("8192", "", "16384"), ("131072", "", "131072"),
+                               ("131072", "20000", "20000")):
+        env.clear()
+        env.update({k: v for k, v in (("VIDEO_MAX_TOKENS", video), ("IMAGE_TOKENS", image)) if v is not None})
+        launch.set_engine_env(tmp_path)
+        assert env["IMAGE_TOKENS"] == want
+    for bad in ("0", "-1", "1e5", "x"):
+        env["VIDEO_MAX_FRAMES"] = bad
+        with pytest.raises(ValueError):
+            launch.set_engine_env(tmp_path)

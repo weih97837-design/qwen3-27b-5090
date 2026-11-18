@@ -127,9 +127,18 @@ gate without an explicit decision, recorded below with its numbers.
   a table in local memory (270 -> 37 us), and the candidates' sender projections now come from a table built at load
   for the draft vocabulary (256 MB) instead of codebook rows read over PCIe. Batched steps of several
   requests draft 8 rows each; there DSpine accepts fewer tokens than DFlash2, and through the server the sum of
-  four and eight concurrent sampled requests is 0.96 and 0.94 times DFlash2's (one request 1.15 times; 2026-11-13,
-  [benchmarks.md](benchmarks.md#concurrent-requests)). DSpine stays the default because one request at a time is
-  the common case (a coding agent), and `SPEC=dflash2` remains for servers that mostly batch. The width depends only on past steps, so the output distribution
+  four and eight concurrent sampled requests was 0.96 and 0.94 times DFlash2's (one request 1.15 times; 2026-11-13). DSpine stays the default because one request at a time is
+  the common case (a coding agent), and `SPEC=dflash2` remains for servers that mostly batch. Since then (2026-11-14,
+  P3-38) each request of a batched step verifies 4, 8, 12 or 16 rows of its own. A step costs by its total rows in
+  steps of 16 (not per row), so the rule searches moves of one lane at a time against a model of that cost, every 8
+  steps, with a 1% hysteresis: deciding at every step changed the split nearly every step, and each change updates
+  the CUDA graph (1.2 ms). Each lane keeps its measured tokens per width it ran, averaged at 1/32: a first version
+  extrapolated every width from the current one and averaged at the single request's 1/8, and four sampled
+  reasoning requests lost 5% (reasoning gains almost nothing from wider blocks, and lanes of one kind looked
+  different by chance); now -1.7% (in-process). Against 8 rows each, greedy (the same output, so the comparison
+  pairs): mixed prompts +9.1% / +4.3% at 4 / 8 requests, four code requests +20.6%, eight Japanese +4.4%. Through the
+  server on reasoning ([benchmarks.md](benchmarks.md#concurrent-requests)) four and eight requests are as fast as with
+  v0.5.0 (899-901 and 1,313-1,314 tok/s), and DFlash2 is still 3% and 6% faster there. The width depends only on past steps, so the output distribution
   is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
@@ -142,6 +151,16 @@ gate without an explicit decision, recorded below with its numbers.
 - **DFlash2 with an 8-row chain** (Phase 3). The chain verify was built first, with every verify row
   bit-identical to the decode of the same token, so greedy speculative decoding must reproduce plain decoding
   exactly (a strict test). Short-context decode came out 1.36 to 1.62 times SGLang's DFlash2 on the same GPU.
+- **One split-K for every row count** (2026-11, v0.6.2, issue #9). From 2026-10-05 the skinny GEMMs split K more
+  finely for one row (plain decode) than for verify and batched rows, and the strict test above kept passing only
+  because it set `Q27_SKINNY_EXACT=1`. With the default settings the different summation order flipped FP4
+  roundings of the activations, and greedy output of `SPEC=none` and of a drafter parted within 5 to 82 tokens
+  (NVIDIA's weights, NVFP4 KV, DSpine): both were exact samples of slightly different logits, but "lossless" did
+  not hold against plain decoding. Making every M use the split that a single row now shares with the wider calls
+  costs the verify and batched steps nothing (13.26 ms per greedy DSpine step either way; using the one-row
+  split for every M instead made eight batched requests 4.6% slower), and costs plain decode about 1% (11.50 to
+  11.62 ms per step). Resuming after the last generated token (one row) now also matches a run that computed
+  that token among the verify rows.
 - **GDN verify writes no state; the next step replays the accepted tokens** (Phase 3). Engines that keep one state
   per verified position need 8 state copies per request with DFlash2 (0.9 GiB per request; at most 5 concurrent
   requests in one measurement). Replay needs one state per request and no separate commit pass. A race was found
@@ -310,6 +329,28 @@ gate without an explicit decision, recorded below with its numbers.
   instructions alike): one GEMM for qkv | z (slower than the two), as many tiles on every CTA (154 x 5), a dynamic
   tile counter, the producer's loads from an elected lane without the per-lane loop the lane-0 branch compiled to
   (14% of the instructions: kept, but no faster). As a pair qkv and z are 1.7% faster than CUTLASS's.
+- **P5-14: the GDN chunk prep writes only (I + L)^-1.** The P5-2 prep solved [W | U] for 256 columns and wrote
+  W, U, M and BF16 q / k: 188 MB for one layer of 2,048 tokens, so its 121 us were memory time. With A = (I + L)^-1,
+  delta = U - W S = A (diag(beta) V - diag(beta e^gamma) K S): the chunk kernel computes K S (K is already in shared
+  memory for the state update) and multiplies by A, so W and U are never written (prep 121 -> 53 us, 76 MB). The
+  extra product runs on F16 MMAs with each state column of X scaled by a power of 2, which keeps the error against
+  the FP64 recurrence at the old level (o 3.5e-3, state 2.6e-3; BF16 operands there gave 3.9e-3 / 3.1e-3). The
+  inverse is solved by four lanes per column, rows interleaved and L read as float4 (a lane per column: 66 us).
+  One layer 256 -> 187 us of kernel time; prefill 19K +1.9%, 73K +1.1%; golden against BF16 KL 0.0454 -> 0.0459
+  (two builds of the same code differ by 0.047). F16 accumulators (twice the MMA rate, `micro/mma_peak`) are not
+  used yet; the chunk kernel holds 250 registers, and adding a bound-based scale there spilled (+30 us).
+- **P5-16: in_proj_a / b split over K.** The prefill kernel ran a block per 32 tokens through all 5,120 k in
+  80 steps of about 0.9 us whatever the pipeline depth (a latency chain at 12 warps per SM): 77 us at any T > 8.
+  Blocks of 16 tokens and a quarter of K, the four of a token tile in a cluster, block 0 adding the partial sums
+  in order from the others' shared memory (no workspace; plain distributed shared memory loads, not the bulk
+  copies that compile to driver calls): 18 us for 16 tokens, 45 us for 2,048. Prompts of 128 / 512 tokens
+  +7.4 / +6.4%; at 19K the gain (-17 ms of kernel time) is taken back by the power limit (+0.4%, energy per token
+  unchanged). Error against FP64 1.2e-5 -> 3.7e-6; golden KL against BF16 0.0467 (noise).
+- **P5-17: in_proj_a / b normalizes the residual itself.** The GDN layer's input RMSNorm wrote its FP32 rows
+  (42 MB per 2,048 tokens) only for in_proj_a / b. In the prefill it now writes 1 / rms per token, and the
+  in_proj_a / b kernel forms (x rstd) (1 + w) per element as the RMSNorm does: bit-identical, the norm 10.7 ms
+  less at 19K, in_proj_a / b 1.8 ms more; 19K +0.5%, energy per token -0.8%. The verify and decode preps still
+  read the normed rows.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision
@@ -336,6 +377,41 @@ gate without an explicit decision, recorded below with its numbers.
   (finer scales still left 3.6%: the 3-bit mantissa dominates). On 70 synthetic questions with exact answers:
   `bf16` and `host` 67 (identical replies), `fp8` 68, vLLM 70; the differences are three close counting questions
   that the FP32 reference model also misses the same way.
+
+- **P4-16: videos** (`video_url`). A pair of frames is an image to both the language model (its span, after
+  its time as text) and the vision tower (two frames over the temporal patch), so the M-RoPE, the prefix cache and
+  the image path take videos unchanged; transformers' prompt ids and positions match
+  (`frontend/tests/test_videoproc.py`). The vision tower encodes the pairs of one grid in one pass (attention per
+  pair), bit-identical to one pair per call; one pass per pair would stream the weights 300 times for a 5-minute
+  video with `VISION=host`. The per-frame pixel cap of qwen-vl-utils (transformers' default from v5.22; without it a
+  10-second clip costs nearly the 12,288 tokens of a long video).
+- **P4-18: the checkpoint's video bounds by default, more on request.** A video takes at most 12,288 tokens and 768
+  frames by default, as the checkpoint's processor (and vLLM / transformers) does it; `VIDEO_MAX_TOKENS` /
+  `VIDEO_MAX_FRAMES` raise them for the server and `mm_processor_kwargs.size.longest_edge` for a request
+  (transformers' own key, so its plan and ids still match). The defaults stay because answers then match the
+  reference engines; on a 3-minute video at 129,857 tokens the model gave the same times as at 13,445 for two
+  scenes, but described the video without the times it was asked for.
+- **Videos decoded by the engine on NVDEC, without FFmpeg.** PyAV (FFmpeg) took the serving image from 198 to
+  369 MB and, through FFmpeg's NVDEC path (one picture at a time), was slower than its CPU decoder: NVDEC was 19 to
+  46% busy. The engine feeds the driver's parser itself with up to four pictures in flight, maps only the sampled
+  frames, and decodes the parts of a long video on both NVDEC engines; it beats 24 CPU threads 3.3 to 3.4 times on 4K
+  AV1 / HEVC. The MP4 reader is our own (about 500 lines: one video track, the sample table, fragments, edit lists);
+  a library (minimp4) lacked fragmented files, `hev1` and edit lists. Matroska / WebM goes through libwebm's
+  `mkvparser` (vendored, BSD; continuously fuzzed upstream), whose EBML parsing is not worth writing again. No CPU fallback: codecs NVDEC does not
+  decode get HTTP 400. Each pixel takes its 2x2 block's chroma, as FFmpeg's default conversion: interpolating it
+  moved colorful frames 5 to 7 steps away from what the reference readers (transformers', qwen-vl-utils') give.
+- **A video's rotation is applied, unlike transformers' default reader.** PyAV (transformers' default) returns the
+  frames as stored and leaves `frame.rotation` to the caller, so a portrait phone video reaches the model on its
+  side; FFmpeg's command line, players and browsers turn it. The engine turns it the way FFmpeg does.
+- **10-bit chroma as for 8 bits.** Each pixel takes its block's chroma sample at every bit depth. FFmpeg's 8-bit
+  conversion does the same; for 10-bit HEVC its RGB is within 1.3 steps of ours, for 10-bit H.264 (rare) it is 4 to
+  6 steps away on average by a conversion not reproduced here.
+- **NVDEC's memory lent by the KV pool, not reserved.** A decode takes up to 0.8 GiB (4K, two decoders) that the
+  driver allocates outside the plan. A fixed reserve would cost every user 6.5% of the KV cache (about 47K tokens),
+  and nothing at all leaves a full process 0.5 GiB past the budget for the decode. The KV pool is mapped through
+  CUDA's virtual memory management (available on WSL2 and on native Windows), and the server lends the blocks below
+  the parking areas for the decode's duration: unmapping 1 GiB takes 3 to 7 ms in 32 MiB chunks, does not wait for
+  running kernels, and gives the memory back to the device (NVML used drops by as much).
 
 ## Weights
 

@@ -76,11 +76,21 @@ def engine_env_defaults(platform=os.name, env=os.environ):
     return dict(ENGINE_ENV_DEFAULTS, SPILL_DIR=spill_dir_default(platform, env))
 
 
+IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
+
+
 def set_engine_env(root):
     """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package).
+    IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when that is more (one video of that many tokens, its
+    time stamps aside). Raises ValueError for a VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES that is not a positive integer.
     Called before the engine process is spawned (it copies os.environ) and before TierPolicy.from_env reads it."""
     for k, v in engine_env_defaults().items():
         os.environ.setdefault(k, v)
+    for k in ("VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"):
+        if (v := os.environ.get(k)) and not (v.isdigit() and int(v) > 0):
+            raise ValueError(f"{k} must be a positive integer, got {v!r}")
+    if not os.environ.get("IMAGE_TOKENS"):
+        os.environ["IMAGE_TOKENS"] = str(max(IMAGE_TOKENS, int(os.environ.get("VIDEO_MAX_TOKENS") or 0)))
     vocab = root / "bench/draft-vocab/vocab-128k.txt"
     if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)

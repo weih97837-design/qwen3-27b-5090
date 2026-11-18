@@ -31,9 +31,14 @@ SIGNATURES = {
     "q27_add_checkpoint_at": ([P, I, I, P], I),
     "q27_share_mark": ([P, I], I),
     "q27_seq_suspend": ([P, I], I),
+    "q27_kv_lend": ([P, I64, P], I),
+    "q27_kv_unlend": ([P, I], I),
+    "q27_kv_lent": ([P], I64),
     "q27_has_draft": ([P], I),
     "q27_spec_block": ([P], I),
     "q27_last_step_block": ([P], I),
+    "q27_last_lane_block": ([P, I], I),
+    "q27_spec_set_block": ([P, I, I], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
     "q27_spec_step_lanes": ([P, P, I, P, P], I),
@@ -67,6 +72,10 @@ SIGNATURES = {
     "q27_mm_set": ([P, P, I], I),
     "q27_mm_encode": ([P, I, P], I),
     "q27_mm_encode_rgb": ([P, I, P, P], I),
+    "q27_mm_encode_frames": ([P, I, I, P, P], I),
+    "q27_video_probe": ([P, I64, P], I),
+    "q27_video_frames": ([P, I64, P, I, I, I, I, P, P], I),
+    "q27_video_memory": ([P, I64, I, I, I, I, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),
@@ -124,6 +133,7 @@ SIGNATURES = {
     "q27t_silu_mul_quant_fp4_glu_bf16": ([P, I, I, F, F, F, P, P], I),
     "q27t_gemm_fp4_bf16": ([I, I, I, P, P, P, P, F, P], I),
     "q27t_linear_bf16_pair": ([P, P, P, I, I, I, P, P], I),
+    "q27t_norm_linear_bf16_pair": ([P, P, F, P, P, I, P, P, P, P], I),
     "q27t_attn_prep": ([P, P, P, P, P, I, I, P, P, I, P, P], I),
     "q27t_attention": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
     "q27t_attention_decode": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
@@ -298,7 +308,7 @@ class Engine:
     @property
     def spec_block(self):
         """Rows of a single sequence's speculative step: the last token and the drafted ones (DFlash2 8, DSpine up to
-        16; batched steps take 8 per lane)."""
+        16; batched steps take their lane's width, 2..16)."""
         return lib().q27_spec_block(self.h)
 
     @property
@@ -336,12 +346,13 @@ class Engine:
         self._check(lib().q27_spec_set_masked(self.h, -1 if area is None else area), "q27_spec_set_masked")
 
     def spec_draft_lanes(self, lanes):
-        """spec_draft for a batched step with masked lanes (spec_step_lanes follows): per lane its 8 verify tokens."""
+        """spec_draft for a batched step with masked lanes (spec_step_lanes follows): per lane its verify tokens (its
+        block's rows: the host's mask rows of lane z are 16 z ..)."""
         n = len(lanes)
         src = (ctypes.c_int32 * n)(*[-1 if a is None else a for a in lanes])
-        out = (ctypes.c_int32 * (8 * n))()
+        out = (ctypes.c_int32 * (16 * n))()
         self._check(lib().q27_spec_draft_lanes(self.h, src, n, out), "q27_spec_draft_lanes")
-        return [list(out[8 * z:8 * z + 8]) for z in range(n)]
+        return [[t for t in out[16 * z:16 * z + 16] if t >= 0] for z in range(n)]
 
     def spec_step(self, ahead=True):
         """One draft + verify step; returns the new tokens (1..spec_block). ahead=False: the next step is not launched
@@ -359,12 +370,20 @@ class Engine:
 
     def spec_step_lanes(self, lanes):
         """One batched speculative step (P6-10) of the decoding sequences `lanes` (None: the running one, else
-        a parking area): the same tokens as a spec_step of each. Returns their new tokens (lists of 1..8)."""
+        a parking area): the same tokens as a spec_step of each. Returns their new tokens (lists of 1..16)."""
         n = len(lanes)
         src = (ctypes.c_int32 * n)(*[-1 if a is None else a for a in lanes])
-        out, counts = (ctypes.c_int32 * (8 * n))(), (ctypes.c_int32 * n)()
+        out, counts = (ctypes.c_int32 * (16 * n))(), (ctypes.c_int32 * n)()
         self._check(lib().q27_spec_step_lanes(self.h, src, n, out, counts), "q27_spec_step_lanes")
-        return [list(out[8 * z:8 * z + counts[z]]) for z in range(n)]
+        return [list(out[16 * z:16 * z + counts[z]]) for z in range(n)]
+
+    def last_lane_block(self, z):
+        """Rows of lane z's block in the last spec_step_lanes (0 for builds without the entry)."""
+        return lib().q27_last_lane_block(self.h, z) if hasattr(lib(), "q27_last_lane_block") else 0
+
+    def spec_set_block(self, area, block):
+        """Pins a decoding sequence's verify width (area None: the running one) for its single and batched steps."""
+        self._check(lib().q27_spec_set_block(self.h, -1 if area is None else area, block), "q27_spec_set_block")
 
     def prefill(self, ids, budget, spec=False):
         """Prompt chunks of ids (the rest of the prompt) while more than one prefill chunk is left, at least
@@ -413,6 +432,20 @@ class Engine:
     def seq_drop(self, area):
         """Gives the pages of the sequence parked in `area` back."""
         self._check(lib().q27_seq_drop(self.h, area), "q27_seq_drop")
+
+    def kv_lend(self, nbytes):
+        """Lends `nbytes` of device memory out of the KV pool (video decoding); returns the loan id, or -1 when the
+        pool cannot spare it (or is not VMM). Return it with kv_unlend."""
+        out = ctypes.c_int()
+        self._check(lib().q27_kv_lend(self.h, int(nbytes), ctypes.byref(out)), "q27_kv_lend")
+        return out.value
+
+    def kv_unlend(self, loan):
+        self._check(lib().q27_kv_unlend(self.h, loan), "q27_kv_unlend")
+
+    def kv_lent(self):
+        """Bytes of the KV pool on loan now."""
+        return lib().q27_kv_lent(self.h)
 
     def seq_suspend(self, area):
         """Saves the sequence parked in `area` as a prefix cache checkpoint, then drops it."""
@@ -696,6 +729,14 @@ class Engine:
         """Runs the vision tower on image i from the resized image: rgb [32 * gh][32 * gw][3] uint8 bytes, norm
         mean[3] + std[3] (the server's image processor; normalized and arranged into patches on the device)."""
         self._check(lib().q27_mm_encode_rgb(self.h, i, rgb, (ctypes.c_float * 6)(*norm)), "q27_mm_encode_rgb")
+
+    def mm_encode_frames(self, i, frames, norm):
+        """Runs the vision tower on a video's frame pairs, images i .. i + len(frames) // 2 - 1 (one grid): frames
+        the resized frames as in mm_encode_rgb (bytes), two per pair, in order. Batched into few passes."""
+        n = len(frames) // 2
+        ptrs = (ctypes.c_char_p * (2 * n))(*frames[:2 * n])
+        self._check(lib().q27_mm_encode_frames(self.h, i, n, ptrs, (ctypes.c_float * 6)(*norm)),
+                    "q27_mm_encode_frames")
 
     def mm_embeds(self, i, rows):
         """Embeddings of image i as a uint16 (BF16 bits) numpy array [rows, 5120]."""

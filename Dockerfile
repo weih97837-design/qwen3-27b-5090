@@ -58,9 +58,10 @@ COPY --from=python /opt/python /opt/python
 COPY --from=python /opt/venv /opt/venv
 COPY --from=python --chown=1000:1000 /cache/kv /cache/kv
 COPY --from=build /usr/local/cuda/lib64/libcudart.so.13* /opt/q27/
-# (what the nvidia/cuda images set for the container runtime: all GPUs, the compute and nvidia-smi libraries)
+# (for the container runtime: all GPUs, the compute and nvidia-smi libraries as the nvidia/cuda images ask, and the
+# video decoder's libnvcuvid for video input: native Linux mounts it only when asked; WSL2 mounts every driver library)
 ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     LD_LIBRARY_PATH=/opt/q27 \
     PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     Q27_LIB=/opt/q27/libq27.so \
@@ -70,6 +71,10 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 COPY --from=build /opt/q27/libq27.so /opt/q27/libq27.so
 WORKDIR /work
 COPY LICENSE ./
+# (the notices of the code compiled into libq27.so: libwebm's mkvparser, BSD; NVIDIA's NVDEC headers, MIT)
+COPY engine/src/third_party/libwebm/LICENSE.TXT licenses/libwebm-LICENSE.txt
+COPY engine/src/third_party/libwebm/PATENTS.TXT licenses/libwebm-PATENTS.txt
+COPY engine/src/third_party/nvcodec/LICENSE.txt licenses/nv-codec-headers-LICENSE.txt
 COPY bench/draft-vocab bench/draft-vocab
 COPY reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/image_tokens.py reference/qwen27b/
 COPY engine/python engine/python

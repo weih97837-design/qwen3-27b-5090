@@ -122,12 +122,12 @@ class Model {
   // the caller will not continue right away (another sequence runs next), so no step is wasted.
   int spec_step(int32_t* out, bool ahead = true);
   // Grammar masks (structured output): kMaskRows bitmasks of kMaskWords words in pinned host memory that the
-  // host writes (bit t % 32 of word t / 32: token t allowed); row 8 z + i masks verify row i of lane z (z = 0 alone).
+  // host writes (bit t % 32 of word t / 32: token t allowed); row 16 z + i masks verify row i of lane z (z = 0 alone).
   // A sequence begun with SpecSampling::masked steps in two calls: spec_draft drafts the step and returns its verify
-  // tokens (chain[8]: the last token, then the 7 drafted ones; such a sequence verifies a chain), the host writes the
+  // tokens (chain[16]: the last token, then the drafted ones; such a sequence verifies a chain), the host writes the
   // mask of each row (the grammar after the row's tokens), and spec_step verifies and accepts with them (no step is
-  // launched ahead). spec_draft_lanes is the same for spec_step_lanes (chain [n][8]; lanes without masks need it too
-  // when one lane has them).
+  // launched ahead). spec_draft_lanes is the same for spec_step_lanes (chain [n][16], each lane's block rows, -1
+  // after them; lanes without masks need it too when one lane has them).
   static constexpr int kMaskWords = (dims::kVocab + 31) / 32;
   static constexpr int kMaskRows = kMaxLanes * kSpecBlock;
   uint32_t* mask_rows() const { return mask_host_; }
@@ -137,9 +137,14 @@ class Model {
   // SpecSampling::masked (the grammar starts after the reasoning; its end, stop[2], no longer ends a step); a step
   // launched ahead is dropped.
   void spec_set_masked(int area);
+  // Pins a decoding sequence's verify width (area -1: the running one) to `block` rows (2 .. the draft's block; DFlash2
+  // 8) for its single and batched steps: tests (batched lanes of given widths against single runs).
+  void spec_set_block(int area, int block);
   bool has_draft() const { return draft_ != nullptr; }
   int spec_block() const { return draft_ ? draft_->block() : 0; }
   int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
+  // Rows of lane z's block in the last spec_step_lanes / spec_draft_lanes.
+  int last_lane_block(int z) const { return z >= 0 && z < blr_.n ? blr_.rows(z) : 0; }
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -272,12 +277,22 @@ class Model {
   // the covered-first eviction until a prefix_begin uses it or kShareTtl further uses of the cache have passed.
   void share_mark(int pos);
 
-  // Batched speculative steps (P6-10). One step of each of n (2..4) sequences in decode (after spec_begin):
+  // Device memory lent for a while (video decoding on NVDEC, whose surfaces the driver allocates outside the pools):
+  // kv_lend moves the KV pages out of whole blocks just below the parking areas (below earlier loans), evicting
+  // checkpoints if it must, as seq_park does, and gives their memory back to the device (the KV pool is VMM).
+  // Returns a loan id, or -1 with nothing changed but evicted checkpoints when the pool cannot spare `bytes` or
+  // the pool is not VMM. kv_unlend(id) maps memory there again and gives the pages back to the pool.
+  int kv_lend(size_t bytes);
+  void kv_unlend(int id);
+  size_t kv_lent() const;  // bytes on loan now
+
+  // Batched speculative steps (P6-10). One step of each of n (2..8) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
-  // batch (the GEMMs read the weights once for all), each lane exactly as its own spec_step: the tokens are
-  // the same, bit for bit. Lane z's new tokens go to out[8 z ..], their count to counts[z]. While the same
-  // lanes keep stepping their state stays in the batch; any other call first ends it (the lanes then hold
-  // their sequences as before, nothing pending). Chains only (Q27_SPEC_PATHS 1); no lookup drafting.
+  // batch (the GEMMs read the weights once for all), each lane exactly as its own spec_step of the same width: the
+  // tokens are the same, bit for bit, unless the step's row budget cut a lane's width. Lane z's new tokens
+  // go to out[16 z ..], their count to counts[z]. While the same lanes keep stepping their state stays in the batch;
+  // any other call first ends it (the lanes then hold their sequences as before, nothing pending). Chains only
+  // (Q27_SPEC_PATHS 1); no lookup drafting.
   void spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* counts);
   int max_lanes() const { return draft_ ? draft_->lanes() : 0; }
 
@@ -286,10 +301,11 @@ class Model {
   // start .. start + gh * gw - 1, gh x gw the merged grid. mm_set (after reset / prefix_begin, before the
   // forward call) gives the request's images: spans [n][3] = (start, gh, gw), ascending. mm_encode runs
   // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
-  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_embeds copies them
-  // out (tests).
+  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_encode with n > 1
+  // encodes images i .. i + n - 1 of one grid (a video's frame pairs, pixels[n]) in as few passes as the
+  // workspace allows. mm_embeds copies them out (tests).
   void mm_set(const int32_t* spans, int n);
-  void mm_encode(int i, const VisionPixels& pixels);
+  void mm_encode(int i, const VisionPixels* pixels, int n = 1);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
   bool has_vision() const { return opt_.vision != 0; }
@@ -411,7 +427,8 @@ class Model {
   uint64_t spill_fingerprint() const;
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
-  cudaGraphExec_t capture(const std::function<void()>& body);
+  // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
+  cudaGraphExec_t capture(const std::function<void()>& body, cudaGraphExec_t update = nullptr);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
@@ -608,20 +625,26 @@ class Model {
   bool bwarm_ = false;
   AcceptLanes bacc_;                 // the lanes' sampling (chains) and top-k list lengths
   SeqLanes bsl_;                     // positions, rotary deltas and page tables of the lanes
+  LaneRows blr_;                     // the rows of the lanes' blocks in the current step
+  int batch_rows_ = 0;               // rows of a batched step, at most (batch_row_budget)
   float *bconv_[kMaxLanes] = {}, *bssm_[kMaxLanes] = {};  // their GDN states (replayed in place)
   bf16 *bring_k_[kMaxLanes] = {}, *bring_v_[kMaxLanes] = {};  // their draft context rings
   int32_t *b_pos_ = nullptr, *b_delta_ = nullptr, *b_par_ = nullptr, *b_nc_ = nullptr, *b_budget_ = nullptr;
-  int32_t *b_ids_ = nullptr, *b_blk_ = nullptr, *b_cpath_ = nullptr, *b_pt_ = nullptr;  // [lanes][8] / [lanes][max_pages_]
+  // The step's verify / block ids (packed rows: blr_), the lanes' anchors, commit paths ([lanes][kLaneSlot]), the first
+  // rows of their previous verify (GdnSpec::prow0) and page tables ([lanes][max_pages_]).
+  int32_t *b_ids_ = nullptr, *b_blk_ = nullptr, *b_anchor_ = nullptr, *b_cpath_ = nullptr, *b_prow0_ = nullptr;
+  int32_t* b_pt_ = nullptr;
   uint64_t* b_rng_ = nullptr;        // [lanes][2]
   SpecTree* b_tree_ = nullptr;       // [lanes]
   SpecOut *b_out_ = nullptr, *b_out_dev_ = nullptr;  // [lanes][2] (by step parity), mapped pinned
   struct BatchGraph {
     std::vector<int32_t> lanes;
     int sbuf;
-    AcceptLanes acc;
+    AcceptLanes acc;  // (acc.lr: the rows of the lanes)
     cudaGraphExec_t exec;  // (masked lanes: the draft part)
     uint64_t used;
     cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
+    LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -631,6 +654,7 @@ class Model {
     int32_t* spec_last;
   };
   LaneRef lane_ref(int z);
+  SpecSampling& lane_smp(int z);  // the sampling of lane z's sequence (its own, not bacc_'s copy)
   void batch_enter(const int32_t* lanes, int n);
   void batch_exit();                 // replays the pending commits, gives the lanes their step scalars back
   void batch_body(int n, int part = 0);  // one step of the lanes (captured; part: as spec_body's)
@@ -638,6 +662,13 @@ class Model {
   struct BatchGraph;
   BatchGraph& batch_graph(int n);
   void batch_prepare(const int32_t* lanes, int n);
+  void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
+  void lane_note(SpecSampling& m, int rows, int tokens) const;
+  bool batch_adapt_ = false;
+  float batch_hyst_ = 0.01f;
+  int batch_period_ = 8;   // batched steps between the decisions (Q27_SPEC_ADAPT_PERIOD)
+  float batch_alpha_ = 0.03125f;  // the lanes' moving averages (Q27_SPEC_ADAPT_BATCH_ALPHA)
+  uint64_t bstep_ = 0;     // batched steps run
   bool batch_part(int n, int part);
   GdnSpec gdn_spec_lanes(int gdn_layer) const;
   struct Region {
@@ -649,6 +680,12 @@ class Model {
   void seq_scalars(int32_t* host, bool save);          // device scalars of the running sequence <-> host
   int area_first(int a) const;                         // the first KV page of parking area a
   void reserve_area(int a);                            // moves the KV pages out of area a and takes it
+  void reserve_range(int lo, int hi);                  // moves the KV pages out of [lo, hi) and takes them (KvFull)
+  struct Loan {
+    int lo = 0, hi = 0;                                // KV pages taken
+    std::pair<size_t, size_t> mem;                     // the kv_ pool's bytes released
+  };
+  std::vector<Loan> loans_;                            // (index: loan id; hi == 0: returned)
   void release_area(int a);                            // gives area a's pages to the KV pool
   void seq_take(SeqState& st);                         // the running sequence's host state -> st (none left)
   void seq_give(SeqState& st);                         // st -> the running sequence (after reset / seq_take)
@@ -697,6 +734,9 @@ class Model {
   // Captured graphs by sampling settings (sequences with different settings take turns, Phase 6); the
   // least recently used one is destroyed beyond kGraphCache. graph_exec_ / spec_graph_ point into them.
   static constexpr int kGraphCache = 4;
+  // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
+  // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
+  static constexpr int kBatchGraphCache = 8;
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;
