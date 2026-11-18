@@ -173,7 +173,7 @@ SPILL_TTL_DAYS=7
 
 - 頁面上方的引擎區有三個按鈕：**Start**、**Stop**、**Restart**。
 - 頁面標題列顯示目前引擎的啟動設定（引擎停止時，顯示下一次啟動會用的設定）。點它會開啟 **Start settings** 對話框。
-- 頁面其他區塊：推理 Slot、GPU 與吞吐量、VRAM、KV cache 池、權重、**分層快取**、部署與硬體、請求，以及記錄。
+- 頁面其他區塊：推論 Slot、GPU 與吞吐量、VRAM、KV cache 池、權重、**分層快取**、部署與硬體、請求，以及記錄。
 
 **Start settings 對話框**（可調整的項目與 `docs/configuration.md#start-settings` 相同）：
 
