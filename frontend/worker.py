@@ -297,7 +297,7 @@ class Scheduler:
     clock = NullClock()  # (__init__ makes the real EngineClock)
     # (class defaults: a Scheduler made without __init__, as some tests do, has no tiers and no backup state)
     tiers = None
-    share = 0.5  # DECODE_SHARE (live: configure())
+    share = 1.5  # DECODE_SHARE (live: configure())
     dec_tok = None  # the plain tokenizer of the divergence log (made with the first divergence)
     returns = ()  # (video loans to give back; __init__ makes the deque)
     user = None  # the id of "user" and the ids of blank-line tokens (checkpoints: after the last blank line of a final user message)

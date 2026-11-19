@@ -61,9 +61,10 @@ h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
   border-radius: 6px; padding: 1px 10px; cursor: pointer; }
 .ctl button:hover:not(:disabled) { background: var(--wash); }
 .ctl button:disabled { color: var(--muted); cursor: default; opacity: 0.6; }
-.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 12px; }
+.chart { min-width: 0; }
 .chart svg { display: block; width: 100%; height: 150px; overflow: visible; }
-.chart .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.chart .head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; min-width: 0; }
 .chart .cur { font-weight: 600; font-variant-numeric: tabular-nums; }
 .tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); color: var(--ink);
   border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px;

@@ -87,3 +87,11 @@ def test_the_status_page_has_the_control():
     assert "預填時給解碼的時間比例（DECODE_SHARE）" in html
     assert "每預填 1 秒，讓解碼中的請求跑幾秒。越大 → 預填期間解碼越不會掉速，但長 prompt 的預填變慢" in html
     assert 'id: "decode-share"' in html and "decode_share: v" in html
+
+
+def test_default_is_1_5():
+    """v0.6.2.5: 1.5 (decoding held 80-100 tok/s during a long prefill on the 5090; 0.5 fell to 2-10)."""
+    import worker
+    assert worker.Scheduler.share == 1.5
+    src = (pathlib.Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+    assert 'env("DECODE_SHARE", 1.5)' in src

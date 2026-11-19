@@ -73,7 +73,7 @@ services:
       MIN_SEQ_TPS: ${MIN_SEQ_TPS:-0}               # start another request only if each keeps this many tok/s (0: off)
       ADMIT_KV: ${ADMIT_KV:-1}                     # 1: a request waits for room in the KV pool (rather than suspend one later)
       KV_RESERVE_TOKENS: ${KV_RESERVE_TOKENS:-4096} # output tokens per request the KV admission keeps room for
-      DECODE_SHARE: ${DECODE_SHARE:-0.5}           # decode time of running requests per second of prefill
+      DECODE_SHARE: ${DECODE_SHARE:-1.5}           # decode time of running requests per second of prefill
       SCHED_QUANTUM_MS: ${SCHED_QUANTUM_MS:-50}    # decode turn of a request while several decode
       BATCH_DECODE: ${BATCH_DECODE:-1}             # 1: decoding requests step together (P6-10); 0: they take turns
       PREFILL_CHUNK: ${PREFILL_CHUNK:-2048}
