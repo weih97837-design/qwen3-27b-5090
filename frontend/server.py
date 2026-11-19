@@ -1803,7 +1803,7 @@ def main():
                     help="1: a request waits until the KV pool has room for it (instead of suspending one later)")
     ap.add_argument("--kv-reserve", type=int, default=int(env("KV_RESERVE_TOKENS", 4096)),
                     help="tokens of output per request the KV admission keeps room for")
-    ap.add_argument("--decode-share", type=float, default=float(env("DECODE_SHARE", 0.5)),
+    ap.add_argument("--decode-share", type=float, default=float(env("DECODE_SHARE", 1.5)),
                     help="decode time given to running requests per second of prefill")
     ap.add_argument("--quantum-ms", type=float, default=float(env("SCHED_QUANTUM_MS", 50)),
                     help="decode turn of a request when several decode")
