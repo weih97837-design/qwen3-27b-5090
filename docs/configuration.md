@@ -448,6 +448,13 @@ The stats page shows an **Agents** table (requests running and waiting, requests
 bytes are placeholders) and an Agent column in the Log. In `/ui/state` each request row has `agent` and `agent_id`, and the
 `agents` block lists the aggregates.
 
+- `AGENT_STATS` (default 1024): how many agents the per-agent counters keep; the least recently seen go first. Each entry is
+  four integers (a few hundred bytes), so even 1024 is well under 1 MiB. Agents cut off from the table keep their tier bytes
+  (the engine tags checkpoints with the agent's owner id), which the table cannot name: they show as one row
+  **其他 N 個 agent（超出統計表）** with their count and RAM / SSD bytes. Owner 0 (checkpoints without an agent) is its own row,
+  **未知（owner 0）**. The two rows add up to what the old single "unknown" row showed. Raise `AGENT_STATS` when the
+  overflow row is not empty.
+
 ## Client counting
 
 The server counts the requests of each client machine, so you can see who uses it. It is counting only: admission and
@@ -496,6 +503,14 @@ polling, sending). Not separable: KV page writes and checkpoint saves the engine
 those two. `/ui/state` has `engine_time` (`recent` and `total`: `wall`, `seconds`, `share` per kind, `prefill_tokens`,
 `decode_tokens`); `/metrics` has `q27:engine_seconds_total{kind="prefill|decode|restore|spill|media|idle|other"}` (cumulative seconds
 since the engine started).
+
+## Request trace
+
+Off by default. `REQUEST_TRACE=<directory or file name prefix>` (or `--request-trace`) records one JSON line per request start, request end
+and every 10 s while busy, with counts and hashes only (no prompt or output text, no token ids), for a trace-driven simulator of the cache's
+eviction policies. `REQUEST_TRACE_HASH_AGENTS=1` replaces agent ids by a short hash; `REQUEST_TRACE_MAX_MIB` (default 512) caps the total
+size of the files (64 MiB each, the oldest are deleted). About 8 KB per request with 50-125K token prompts. Fields, privacy and
+`tools/trace_summary.py`: [request-trace.md](request-trace.md) (Traditional Chinese).
 
 ## Prefix cache
 

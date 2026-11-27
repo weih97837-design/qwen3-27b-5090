@@ -163,8 +163,9 @@ def agents_block(seqs, totals, use=None):
     worker started. use: the engine's per-agent tier bytes (TierPolicy.agent_rows: [{"owner", "ram_bytes", "ssd_bytes",
     "ram_entries", "ssd_entries"}], shared chunks split between the agents that reference them); an owner is the agent's
     id (agent.owner_id) and is matched to the names this snapshot knows. ram_bytes / ssd_bytes are None without it (an older
-    engine); an owner no known agent maps to (owner 0, or an agent of an earlier run: the SSD keeps them) is the "unknown"
-    row. Sorted by running + waiting, then by requests."""
+    engine); owner 0 (no agent) is the UNKNOWN_AGENT row ("kind": "owner0"); the other owners no known agent maps to
+    (beyond the AGENT_STATS table, or an agent of an earlier run: the SSD keeps them) are one OVERFLOW_AGENT row
+    ("kind": "overflow", "count": how many owners), so owner 0 is not lumped with them. Sorted by running + waiting, then by requests."""
     have_use = use is not None and len(use) > 0
 
     def blank(a):
@@ -185,15 +186,29 @@ def agents_block(seqs, totals, use=None):
         row["waiting" if r["state"] in ("waiting", "restoring") else "running"] += 1
     if have_use:
         names = {agent.owner_id(a): a for a in out}
+        others = set()
         for u in use:
-            name = names.get(u.get("owner"), UNKNOWN_AGENT)
+            owner = u.get("owner")
+            name = names.get(owner)
+            if name is None:
+                if not owner:
+                    name = UNKNOWN_AGENT
+                else:  # an owner with tier bytes but no row in the stats table (cut off by AGENT_STATS, or an earlier run's)
+                    name = OVERFLOW_AGENT
+                    others.add(owner)
             row = out.setdefault(name, blank(name))
             for k in ("ram_bytes", "ssd_bytes", "ram_entries", "ssd_entries"):
                 row[k] += int(u.get(k) or 0)
+        if UNKNOWN_AGENT in out:
+            out[UNKNOWN_AGENT]["kind"] = "owner0"
+        if OVERFLOW_AGENT in out:
+            out[OVERFLOW_AGENT]["kind"] = "overflow"
+            out[OVERFLOW_AGENT]["count"] = len(others)
     return sorted(out.values(), key=lambda x: (-(x["running"] + x["waiting"]), -x["requests"], x["agent"]))
 
 
-UNKNOWN_AGENT = "unknown"
+UNKNOWN_AGENT = "未知（owner 0）"
+OVERFLOW_AGENT = "其他 agent（超出統計表）"  # the UI shows the count: 其他 N 個 agent（超出統計表）
 
 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",

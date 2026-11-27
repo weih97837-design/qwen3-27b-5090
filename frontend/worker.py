@@ -47,10 +47,11 @@ import time
 import traceback
 
 import agent as agents  # (the frontend dir is on sys.path)
+import request_trace
 
 PREFILL, DECODE = "prefill", "decode"
 AGENT_NOTES = 4096    # checkpoint fingerprints kept for Scheduler.agent_of_ids
-AGENT_STATS = 256     # agents the per-agent counters keep (the oldest go first)
+AGENT_STATS = max(16, int(os.environ.get("AGENT_STATS", "1024") or 1024))  # agents the per-agent counters keep (the least recently seen go first; ~200 bytes each)
 CLIENT_STATS = 256    # clients (machines) the per-client counters keep (the least recently seen go first)
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
@@ -226,6 +227,7 @@ class Seq:
         self.restore_checked = False  # spill_match asked for this stay in the queue
         self.restore_id = None   # the spilled entry whose restore it waited for (engine.spill_release after begin)
         self.restore_pos = 0     # tokens of its prompt that entry covers (their pages are counted in its need, not as room)
+        self.trace_src = None    # where its async restore loaded from ("ram" / "ssd"; the request trace)
         self.no_sync = False     # recompute chosen over loading: prefix_begin must not promote a spilled match itself
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
@@ -305,6 +307,7 @@ class Scheduler:
     vision_end = None  # the id of <|vision_end|> (checkpoints: the end of a media span)
     last_active = 0.0
     backup_done = False
+    trace = None      # request_trace.Recorder (REQUEST_TRACE; None: off)
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
     # Delay hits (SPILL_ASYNC_PROMOTE): off unless the engine was started with it and has the calls.
     async_promote = False
@@ -376,6 +379,12 @@ class Scheduler:
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
         self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
         self.last_active = time.monotonic()  # the idle backup (touch, backup_due)
+        try:  # (REQUEST_TRACE: docs/request-trace.md; off by default)
+            pool = int(self.engine.cache_stats().get("pool_pages") or 0)
+            self.trace = request_trace.from_env(os.environ, {"PREFILL_CHUNK": cfg["prefill_chunk"], "MAX_SEQS": cfg["max_seqs"],
+                                                             "kv_pool_pages": pool, "kv_pool_tokens": pool * PAGE}, log)
+        except Exception as e:  # noqa: BLE001
+            log(f"request trace: not started ({e})")
 
     # ------------------------------------------------------------ messages
 
@@ -875,6 +884,7 @@ class Scheduler:
                     return False
                 rec["seqs"].append(s)
                 s.restoring, s.restore_id, s.restore_pos = rec, rec["id"], m["pos"]
+                s.trace_src = "ssd" if rec["on_disk"] else "ram"
                 return True
             if not self.worth_loading(m):
                 s.no_sync = True
@@ -896,6 +906,7 @@ class Scheduler:
                "seqs": [s], "late": False}
         self.restores[m["id"]] = rec
         s.restoring, s.restore_id, s.restore_pos = rec, m["id"], m["pos"]
+        s.trace_src = "ssd" if rec["on_disk"] else "ram"
         self.m["q27:restores_started_total"] += 1
         log(f"{s.rid}: loading a spilled checkpoint of {m['pos']} tokens ({m['bytes'] / 1e9:.2f} GB from "
             f"{'SSD' if m['on_disk'] else 'RAM'}, ~{self.est_load_s(m):.2f} s vs ~{self.est_recompute_s(m['pos']):.2f} s to compute)")
@@ -1157,6 +1168,8 @@ class Scheduler:
             self.send("config", self.settings(), None)
         if force or now - self.last_stats > STATS_INTERVAL:
             self.send("stats", self.stats())
+        if self.trace is not None:
+            self.trace.snap(self, now)
 
     def can_prefill(self, s):
         o = s.share_with
@@ -1284,6 +1297,25 @@ class Scheduler:
         except Exception:  # noqa: BLE001 - only the time split depends on it
             return None
 
+    def trace_split(self):
+        """(restored_ram, restored_disk) of the engine's counters, or None (the request trace: where a synchronous restore came from)."""
+        try:
+            sp = self.engine.spill_stats() if self.tiers is not None else {}
+            return (sp["restored_ram"], sp["restored_disk"]) if "restored_ram" in sp else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def trace_restored_from(self, s, before):
+        """"ram" / "ssd" when this request's start restored a tiered entry (a synchronous restore in prefix_begin, or the
+        background one it waited for), else None."""
+        after = self.trace_split() if before is not None else None
+        if after is not None:
+            if after[1] > before[1]:
+                return "ssd"
+            if after[0] > before[0]:
+                return "ram"
+        return s.trace_src
+
     def begin(self, s):
         """prefix_begin: restores the deepest cached prefix (the engine's state is reset first)."""
         self.cur = None  # (prefix_begin drops whatever the engine held)
@@ -1297,6 +1329,7 @@ class Scheduler:
                 self.tiers.note_agent(s.agent, agents.owner_id(s.agent))
         tr = time.perf_counter()
         restored0 = self.restored_count()
+        split0 = self.trace_split() if self.trace is not None and s.cached is None else None
         try:
             cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
         finally:
@@ -1334,6 +1367,8 @@ class Scheduler:
                 _, old_after = self.text_around(list(old_ids), min(i, 16))
                 log(f"{s.rid}: diverges from its best earlier sequence at token {i} (prompt {len(s.prompt)}, history "
                     f"{len(div[1]) // 4}); before: {before!r}; history after: {old_after!r}; prompt after: {new_after!r}")
+            if self.trace is not None:
+                self.trace.request(s, self.trace_restored_from(s, split0))
             self.send("start", s.rid, {"cached": cached})
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
@@ -1647,6 +1682,8 @@ class Scheduler:
                 "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
                 "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id, "client": s.client}
         self.client_count(s, "finish", reason=reason, out=len(s.out))
+        if self.trace is not None:
+            self.trace.done(s, reason)
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))

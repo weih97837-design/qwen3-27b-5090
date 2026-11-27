@@ -1000,14 +1000,17 @@ function drawAgents() {
   const rows = state.tick?.agents, sec = $("agents-sec");
   if (!Array.isArray(rows) || !rows.length) { sec.hidden = true; return; }
   sec.hidden = false;
-  $("agents-sum").textContent = `${rows.length} 個 Agent`;
+  $("agents-sum").textContent = `${rows.filter((a) => !a.kind).length} 個 Agent`;
   const tb = $("agents"); tb.replaceChildren();
   tb.append(el("tr", {}, el("th", {}, "Agent"), el("th", { class: "r" }, "執行中"), el("th", { class: "r" }, "等待中"),
     el("th", { class: "r lo" }, "請求"), el("th", { class: "r lo" }, "輸入 token"), el("th", { class: "r" }, "快取命中"),
     el("th", { class: "r" }, "RAM"), el("th", { class: "r" }, "SSD")));
-  for (const a of rows) tb.append(el("tr", {}, el("td", { class: "ag-name", style: "font-family:ui-monospace,monospace", title: a.agent }, wbrText(a.agent)),
-    el("td", { class: "r g2", "data-l": "執行中" }, String(a.running)), el("td", { class: "r g2", "data-l": "等待中" }, String(a.waiting)), el("td", { class: "r lo" }, String(a.requests)),
-    el("td", { class: "r lo" }, fmtTok(a.prompt_tokens)), el("td", { class: "r g2", "data-l": "快取命中" }, `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
+  // owner 0 (kind "owner0") and the owners with tier bytes but no row in the stats table (kind "overflow", a.count of them) are
+  // not agents with names: label them apart instead of lumping them together
+  const agName = (a) => a.kind === "overflow" ? `其他 ${a.count || 0} 個 agent（超出統計表）` : a.agent;
+  for (const a of rows) tb.append(el("tr", {}, el("td", { class: "ag-name", style: "font-family:ui-monospace,monospace", title: agName(a) }, wbrText(agName(a))),
+    el("td", { class: "r g2", "data-l": "執行中" }, String(a.running)), el("td", { class: "r g2", "data-l": "等待中" }, String(a.waiting)), el("td", { class: "r lo" }, a.kind ? "–" : String(a.requests)),
+    el("td", { class: "r lo" }, a.kind ? "–" : fmtTok(a.prompt_tokens)), el("td", { class: "r g2", "data-l": "快取命中" }, a.kind ? "–" : `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
     el("td", { class: "r g3", "data-l": "RAM" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
     el("td", { class: "r g3", "data-l": "SSD" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
 }
