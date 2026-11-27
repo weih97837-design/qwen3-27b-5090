@@ -50,6 +50,25 @@ def block_chain(ids, prev=SEED, data=None):
     return out, prev
 
 
+def reusable_from(n, prompt, history, history_agents, agent):
+    """The `reusable_from` of a req event: "same" when one of the history entries that share the prompt's longest reusable prefix (n
+    tokens, Scheduler.best_history) belongs to the request's agent (Request.agent: the cache's owner, the part of the agent id before
+    "/"), "other" when only other agents' do, "none" when nothing is reusable (n == 0). None when it cannot be told (a history without
+    agents). history: int32 bytes per entry, history_agents: the parallel deque of agents."""
+    if not n:
+        return "none"
+    if history_agents is None or len(history_agents) != len(history):
+        return None
+    p = array.array("i", prompt[:n]).tobytes()
+    found = False
+    for h, a in zip(history, history_agents):
+        if h.startswith(p):
+            if a == agent:
+                return "same"
+            found = True
+    return "other" if found else None
+
+
 def hash_agent(agent):
     """A stable short hash of each "/" part of an agent id (REQUEST_TRACE_HASH_AGENTS=1)."""
     return "/".join(hashlib.blake2b(p.encode("utf-8", "replace"), digest_size=5).hexdigest() for p in str(agent).split("/"))
@@ -152,7 +171,8 @@ class Recorder:
             blocks, _ = block_chain(None, data=s.ids_bytes())  # (eng_ids: what prefix_begin keys on)
             self.emit({"t": "req", "ts": time.time(), "rid": s.rid, "agent": self.agent_name(s), "client": s.client,
                        "prompt_tokens": len(s.prompt), "media_tokens": (media_of(s.images) or {}).get("tokens", 0),
-                       "max_tokens": s.max_new, "cached": s.cached, "reusable": s.reusable, "diverged_at": s.diverged_at,
+                       "max_tokens": s.max_new, "cached": s.cached, "reusable": s.reusable,
+                       "reusable_from": getattr(s, "reusable_from", None), "diverged_at": s.diverged_at,
                        "restored_from": restored_from, "queued_s": round(s.begun - s.arrival, 4), "blocks": blocks})
         except Exception as e:  # noqa: BLE001
             self.disable(e)
@@ -199,7 +219,7 @@ def from_env(env, header_settings, log=print):
     if not target or target == "0":
         return None
     try:
-        settings = {k: v for k, v in sorted(env.items()) if k.startswith("SPILL_") and v is not None}
+        settings = {k: v for k, v in sorted(env.items()) if k.startswith(("SPILL_", "CACHE_")) and v is not None}
         settings.update({k: env.get(k) for k in SETTING_NAMES if env.get(k) is not None})
         settings.update(header_settings or {})
         try:

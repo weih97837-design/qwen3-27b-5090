@@ -47,6 +47,7 @@ import time
 import traceback
 
 import agent as agents  # (the frontend dir is on sys.path)
+import cache_policy
 import request_trace
 
 PREFILL, DECODE = "prefill", "decode"
@@ -213,6 +214,7 @@ class Seq:
         self.cached = None       # tokens restored by the first prefix_begin
         self.reusable = 0
         self.best = (0, None)    # (longest common prefix with a recent prompt + output, that history entry)
+        self.reusable_from = None  # "same" / "other" / "none": whose history entry that prefix comes from (request trace)
         self.diverged_at = None  # where the prompt left that entry although both go on (Scheduler.divergence)
         self.last_run = 0.0
         self.first_token = None
@@ -308,6 +310,7 @@ class Scheduler:
     last_active = 0.0
     backup_done = False
     trace = None      # request_trace.Recorder (REQUEST_TRACE; None: off)
+    history_agents = None  # the agent of each history entry (parallel to self.history; None: not kept, e.g. a test's bare Scheduler)
     pin_full = False  # the engine's pinned spill pool is full / off (SPILL_PINNED_GIB; poll)
     # Delay hits (SPILL_ASYNC_PROMOTE): off unless the engine was started with it and has the calls.
     async_promote = False
@@ -372,6 +375,7 @@ class Scheduler:
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.configure({"decode_share": cfg["decode_share"]})  # (live: /admin/concurrency)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
+        self.history_agents = collections.deque(maxlen=64)  # their agents (Request.agent), for the trace's reusable_from
         self.decoder = None      # threads that decode images (prefetch)
         # Loans of KV pool memory for decoding videos on NVDEC (Engine.kv_lend: the driver allocates the decoder's
         # surfaces outside the engine's pools), made and returned on this thread; a decoder thread queues its loan
@@ -544,6 +548,7 @@ class Scheduler:
         if s.agent_id is None:  # (no id from the client: the hash of the system prompt and first user message)
             s.agent_id = agents.auto_id(s.prompt, self.im_start)
             s.agent = s.agent_id
+        s.reusable_from = request_trace.reusable_from(s.best[0], s.prompt, self.history, self.history_agents, s.agent)
         self.note_checkpoints(s, s.prompt, s.at)
         s.est_cached = s.reusable
         if s.images:
@@ -1678,6 +1683,8 @@ class Scheduler:
             self.note_checkpoints(s, s.prompt + s.out, [len(s.prompt) + len(s.out)])
         if s.started or s.out:
             self.history.append(array.array("i", s.prompt + s.out).tobytes())
+            if self.history_agents is not None:
+                self.history_agents.append(s.agent)
         now = time.time()
         info = {"prompt_tokens": len(s.prompt), "completion_tokens": len(s.out), "cached_tokens": s.cached or 0,
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
@@ -1721,6 +1728,7 @@ class Scheduler:
                         "q27:tier_restore_failed": sp.get("restore_failed", 0), "q27:tier_ssd_bytes": ts["ssd_bytes"],
                         "q27:tier_ssd_budget_bytes": ts["ssd_budget_bytes"],
                         "q27:tier_expired": ts.get("expired", 0), "q27:tier_not_written": ts.get("not_written", 0)})
+            out.update(cache_policy.metrics(sp, ts))  # (CACHE_POLICY and, under smart, its counters per tier)
             for key in ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes"):
                 if key in sp:  # (RAM dedup: an older engine does not report them)
                     out[f"q27:tier_ram_{key}"] = sp[key]
