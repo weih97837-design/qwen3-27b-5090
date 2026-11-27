@@ -67,10 +67,14 @@ TI = {V: 0, R: 1, S: 2}
 
 
 class Node:
-    __slots__ = ("key", "blocks", "nb", "owner", "hits", "last_use", "tiers", "born", "parent", "children", "desc", "forks", "own")
+    __slots__ = ("key", "blocks", "nb", "owner", "hits", "last_use", "tiers", "born", "parent", "children", "desc", "forks", "own",
+                 "sid")
+    serial = 0
 
     def __init__(self, key, blocks, nb, owner):
         self.key, self.blocks, self.nb, self.owner = key, blocks, nb, owner
+        Node.serial += 1
+        self.sid = Node.serial  # (creation order: candidates are listed in it, so ties break the same way on every run)
         self.hits, self.last_use, self.tiers = 0, 0, 0
         self.born = [0.0, 0.0, 0.0]   # when it came to VRAM / RAM / SSD
         self.parent, self.children = None, set()
@@ -328,7 +332,7 @@ class Sim:
                 return
 
     def _evict_vram(self, for_slot):
-        cands = list(self.vram_nodes)
+        cands = sorted(self.vram_nodes, key=_sid)
         pol = self.policy
         if pol in ("legacy", "lru"):
             if pol == "legacy" and for_slot:
@@ -572,13 +576,13 @@ class Sim:
         return pool[i]
 
     def _pick_ram(self):
-        cands = list(self.ram_nodes)
+        cands = sorted(self.ram_nodes, key=_sid)
         if self.policy == "legacy":
             return self._legacy_pick(cands, R)
         return self._policy_pick(cands, R)
 
     def _pick_ssd(self):
-        cands = list(self.ssd_nodes)
+        cands = sorted(self.ssd_nodes, key=_sid)
         if self.policy == "legacy":
             return self._legacy_pick(cands, S)
         return self._policy_pick(cands, S)
@@ -737,6 +741,10 @@ class Sim:
             out["smart"] = {k: v for k, v in c.items() if k.startswith("smart_")}
             out["watermarks"] = {"vram": self.gd[V].L, "ram": self.gd[R].L, "ssd": self.gd[S].L}
         return out
+
+
+def _sid(n):
+    return n.sid
 
 
 def _neg(o):

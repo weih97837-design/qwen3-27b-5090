@@ -61,7 +61,7 @@ struct Options {
   // CACHE_POLICY=smart (retention.h "CACHE_POLICY=smart"; default false: legacy, every path as before): the RAM tier's victim
   // (spill_enforce_ram), the pool checkpoint evict_checkpoint takes, and a deeper copy no longer subsumes a shallower one.
   bool cache_smart = false;
-  SmartParams smart;  // CACHE_PREFILL_T0_US, CACHE_PREFILL_K_US, CACHE_SUPERSEDED_FACTOR, CACHE_JUNCTION_FACTOR, CACHE_MIN_RESIDENT_S
+  SmartParams smart;  // CACHE_PREFILL_T0_US / _K_US, CACHE_SUPERSEDED_FACTOR, CACHE_JUNCTION_FACTOR, CACHE_HIT_WEIGHT, CACHE_MIN_RESIDENT_S
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
