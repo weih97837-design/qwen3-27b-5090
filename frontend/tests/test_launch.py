@@ -261,9 +261,9 @@ def test_tier_policy_sees_the_defaults(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
     launch.set_engine_env(tmp_path)
     tiers = TierPolicy.from_env(object(), log=lambda *a: None)  # (the worker's read, after set_engine_env)
-    # the SSD tier is on by default: a 300 GiB cap and the folder of the compose volume; the per-agent step is on, warm-only and the TTL off
+    # the SSD tier is on by default: a 300 GiB cap and the folder of the compose volume; the per-agent step is off, warm-only and the TTL off
     assert tiers is not None and tiers.directory == pathlib.Path(launch.spill_dir_default()) and tiers.budget == 300 * (1 << 30)
-    assert tiers.fair_agents is True and tiers.ssd_warm_only is False and tiers.unused_ttl_s == 0
+    assert tiers.fair_agents is False and tiers.ssd_warm_only is False and tiers.unused_ttl_s == 0
     assert tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)
     monkeypatch.setenv("SPILL_SSD_GIB", "0")  # an explicit 0 turns the tier off
     off = TierPolicy.from_env(object(), log=lambda *a: None)
@@ -406,12 +406,12 @@ def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):
 
 
 def test_spill_fair_agents_setting(monkeypatch):
-    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", True, "flag")
+    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", False, "flag")
     assert launch.ENV_NAMES["spill_fair_agents"] == "SPILL_FAIR_AGENTS"
     monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
-    assert launch.env_settings()["spill_fair_agents"] is True  # (on by default)
-    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
-    assert launch.env_settings()["spill_fair_agents"] is False
+    assert launch.env_settings()["spill_fair_agents"] is False  # (off by default)
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "1")
+    assert launch.env_settings()["spill_fair_agents"] is True
     assert launch.tier_env_value("spill_fair_agents", False) == "0" and launch.tier_env_value("spill_fair_agents", True) == "1"
 
 

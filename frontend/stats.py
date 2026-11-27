@@ -398,7 +398,7 @@ def host_info(started, now=None, meminfo="/proc/meminfo"):
 
 # What an unset (or empty) variable means for the settings whose default is not "unset" (compose.yaml, launch.TIER_SETTINGS): the SSD tier is
 # on with 300 GiB, the per-agent step is on, warm-only and the never-hit TTL are off.
-DEPLOY_DEFAULTS = {"SPILL_SSD_GIB": "300", "SPILL_FAIR_AGENTS": "1", "SPILL_SSD_WARM_ONLY": "0", "SPILL_UNUSED_TTL_S": "0"}
+DEPLOY_DEFAULTS = {"SPILL_SSD_GIB": "300", "SPILL_FAIR_AGENTS": "0", "SPILL_SSD_WARM_ONLY": "0", "SPILL_UNUSED_TTL_S": "0"}
 
 
 def deploy_info(started, engine_state, environ=None):

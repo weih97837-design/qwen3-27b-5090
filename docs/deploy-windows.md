@@ -126,7 +126,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_PINNED_GIB` | `8` | pinned 記憶體（GiB）；`0` 關閉（v0.3.2 起預設 8） |
 | `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
 | `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
-| `SPILL_FAIR_AGENTS` | `1` | RAM／SSD 層滿時，先從用量最大的 agent 挑逐出對象。`0`：整層一起排序（一位使用者的工作負載上，`0` 的 RAM 重用率約 30%、`1` 約 6%，早期數字） |
+| `SPILL_FAIR_AGENTS` | `0` | 預設 `0`：RAM／SSD 層滿時整層一起排序（一位使用者的工作負載上，`0` 的 RAM 重用率約 30%、`1` 約 6%，早期數字）。`1`：先從用量最大的 agent 挑逐出對象（多個租戶共用同一個引擎時用） |
 | `SPILL_COLD_FIRST` | `1` | 冷 agent（在該層沒有命中、最新 entry 超過 `SPILL_COLD_AFTER_S`）的 entry 先被逐出；`0` 關閉 |
 | `SPILL_COLD_AFTER_S` | `600` | 冷 agent 的門檻（秒） |
 | `SPILL_UNUSED_TTL_S` | `0` | 設為正數：從未命中的 entry 超過這麼多秒就從 RAM／SSD 丟棄；`0`（預設）關閉，不會因為沒被命中而丟棄 |
