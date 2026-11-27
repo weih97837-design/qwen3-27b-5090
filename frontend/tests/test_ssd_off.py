@@ -1,6 +1,6 @@
-"""The SSD tier is OFF by default (SPILL_SSD_GIB=0, also when set explicitly) and the per-agent step (SPILL_FAIR_AGENTS) is off by
-default. With the SSD off the engine gets SPILL_DIR="" (it drops RAM victims instead of writing them) and TierPolicy has no
-directory: nothing is written, read, scanned or deleted in any SPILL_DIR. No GPU."""
+"""The SSD tier is ON by default (SPILL_SSD_GIB=300), the per-agent step (SPILL_FAIR_AGENTS) is on, SPILL_SSD_WARM_ONLY and
+SPILL_UNUSED_TTL_S are off. An explicit SPILL_SSD_GIB=0 turns the SSD tier off: the engine gets SPILL_DIR="" (it drops RAM victims
+instead of writing them) and TierPolicy has no directory: nothing is written, read, scanned or deleted in any SPILL_DIR. No GPU."""
 
 import pathlib
 import re
@@ -52,12 +52,15 @@ def default_settings():
 
 # ---------------------------------------------------------------- the environment of the engine
 
-def test_ssd_off_env_unset_empty_and_zero_all_mean_off():
-    for value in (None, "", "  ", "0", "0.0", " 0 "):
+def test_ssd_off_env_only_an_explicit_zero_means_off():
+    for value in ("0", "0.0", " 0 "):
+        env = {"SPILL_DIR": "/cache/kv", "SPILL_SSD_GIB": value}
+        assert tiercache.ssd_off_env(env) is True and env["SPILL_DIR"] == "", value
+    for value in (None, "", "  "):  # unset or empty: the default, 300 GiB, the tier is on
         env = {"SPILL_DIR": "/cache/kv"}
         if value is not None:
             env["SPILL_SSD_GIB"] = value
-        assert tiercache.ssd_off_env(env) is True and env["SPILL_DIR"] == "", value
+        assert tiercache.ssd_off_env(env) is False and env["SPILL_DIR"] == "/cache/kv", value
 
 
 def test_ssd_off_env_leaves_an_enabled_ssd_alone():
@@ -76,10 +79,11 @@ def test_tier_env_is_explicit_and_empties_spill_dir_when_the_ssd_is_off():
     s = default_settings()
     env = launch.tier_env(s)
     assert set(env) == launch.TIER_ENV  # every variable, so the engine's own defaults never decide
-    assert env["SPILL_SSD_GIB"] == "0" and env["SPILL_DIR"] == "" and env["SPILL_FAIR_AGENTS"] == "0"
-    assert launch.tier_env(dict(s, spill_ssd_gib=0))["SPILL_DIR"] == ""
-    on = launch.tier_env(dict(s, spill_ssd_gib=10, spill_fair_agents=True))
-    assert on["SPILL_SSD_GIB"] == "10" and on["SPILL_DIR"] == launch.spill_dir_default() and on["SPILL_FAIR_AGENTS"] == "1"
+    assert env["SPILL_SSD_GIB"] == "300" and env["SPILL_DIR"] == launch.spill_dir_default() and env["SPILL_FAIR_AGENTS"] == "1"
+    assert env["SPILL_SSD_WARM_ONLY"] == "0" and env["SPILL_UNUSED_TTL_S"] == "0"
+    assert launch.tier_env(dict(s, spill_ssd_gib=0))["SPILL_DIR"] == ""  # an explicit 0: the tier is off, the engine gets no folder
+    on = launch.tier_env(dict(s, spill_ssd_gib=10, spill_fair_agents=False))
+    assert on["SPILL_SSD_GIB"] == "10" and on["SPILL_DIR"] == launch.spill_dir_default() and on["SPILL_FAIR_AGENTS"] == "0"
     # the folder stays a setting (turning the SSD on again finds it); only the engine's variable is empty
     assert s["spill_dir"] == launch.spill_dir_default()
     assert launch.tier_env(dict(s, spill_dir="", spill_ssd_gib=10))["SPILL_DIR"] == ""
@@ -93,15 +97,42 @@ def test_the_engine_gets_the_environment_before_it_is_made():
 
 # ---------------------------------------------------------------- the defaults
 
-def test_defaults_are_ssd_off_and_fair_agents_off(monkeypatch):
-    assert launch.TIER_SETTINGS["spill_ssd_gib"][1] == 0 and launch.TIER_SETTINGS["spill_fair_agents"][1] is False
-    for name in ("SPILL_SSD_GIB", "SPILL_FAIR_AGENTS"):
+def test_defaults_are_ssd_300_fair_on_warm_only_and_ttl_off(monkeypatch):
+    ts = launch.TIER_SETTINGS
+    assert ts["spill_ssd_gib"][1] == 300 and ts["spill_fair_agents"][1] is True
+    assert ts["spill_ssd_warm_only"][1] is False and ts["spill_unused_ttl_s"][1] == 0
+    for name in ("SPILL_SSD_GIB", "SPILL_FAIR_AGENTS", "SPILL_SSD_WARM_ONLY", "SPILL_UNUSED_TTL_S"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SPILL_RAM_GIB", "4")
     monkeypatch.setenv("SPILL_DIR", "/cache/kv")
     t = TierPolicy.from_env(FakeEngine(), log=LOG)
-    assert t.directory is None and t.budget == 0 and t.fair_agents is False
-    assert TierPolicy(FakeEngine(), "/x").directory is None and TierPolicy(FakeEngine(), "/x").fair_agents is False
+    assert str(t.directory) == "/cache/kv" and t.budget == 300 * tiercache.GiB and t.fair_agents is True
+    assert t.ssd_warm_only is False and t.unused_ttl_s == 0
+    d = TierPolicy(FakeEngine(), "/x")  # (the constructor's own defaults are the same)
+    assert str(d.directory) == "/x" and d.budget == 300 * tiercache.GiB and d.fair_agents is True
+    assert d.ssd_warm_only is False and d.unused_ttl_s == 0
+    assert tiercache.DEFAULT_SSD_GIB == 300 and tiercache.ssd_gib_of_env({}) == 300 and tiercache.ssd_gib_of_env({"SPILL_SSD_GIB": ""}) == 300
+
+
+def test_empty_env_values_take_the_defaults(monkeypatch):
+    monkeypatch.setenv("SPILL_RAM_GIB", "4")
+    monkeypatch.setenv("SPILL_DIR", "/cache/kv")
+    for name in ("SPILL_SSD_GIB", "SPILL_FAIR_AGENTS", "SPILL_SSD_WARM_ONLY", "SPILL_UNUSED_TTL_S"):
+        monkeypatch.setenv(name, "")
+    t = TierPolicy.from_env(FakeEngine(), log=LOG)
+    assert t.directory is not None and t.budget == 300 * tiercache.GiB and t.fair_agents is True
+    assert t.ssd_warm_only is False and t.unused_ttl_s == 0
+
+
+def test_unused_ttl_zero_expires_nothing(tmp_path):
+    """SPILL_UNUSED_TTL_S=0 (the default) is off: a never-hit entry is not dropped however long it sits."""
+    eng = FakeEngine()
+    t = TierPolicy(eng, str(tmp_path / "kv"), ram_retention_s=10 ** 9, tick_s=0, log=LOG)
+    rid = eng.add_ram(400)
+    t.start()
+    t.tick(idle=True, now=10 ** 9)
+    t.tick(idle=True, now=10 ** 9 + 10 ** 7)
+    assert rid not in eng.drops and t.status()["expired"] == 0
 
 
 def test_explicit_zero_means_off_and_a_cap_turns_it_on(monkeypatch, tmp_path):
@@ -111,17 +142,30 @@ def test_explicit_zero_means_off_and_a_cap_turns_it_on(monkeypatch, tmp_path):
     assert TierPolicy.from_env(FakeEngine(), log=LOG).directory is None
     monkeypatch.setenv("SPILL_SSD_GIB", "100")
     assert TierPolicy.from_env(FakeEngine(), log=LOG).directory == tmp_path
-    monkeypatch.setenv("SPILL_FAIR_AGENTS", "1")
-    assert TierPolicy.from_env(FakeEngine(), log=LOG).fair_agents is True
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
+    assert TierPolicy.from_env(FakeEngine(), log=LOG).fair_agents is False
+
+
+def test_explicit_zero_in_the_settings_switches_the_ssd_off_for_the_engine():
+    """launch.tier_env: SPILL_SSD_GIB=0 from settings.ini or the environment gives the engine an empty SPILL_DIR."""
+    s = default_settings()
+    s["spill_ssd_gib"] = 0
+    env = launch.tier_env(s)
+    assert env["SPILL_SSD_GIB"] == "0" and env["SPILL_DIR"] == ""
 
 
 def test_the_defaults_in_compose_and_docs():
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
-    assert re.search(r"^\s+SPILL_SSD_GIB: \$\{SPILL_SSD_GIB:-0\}", compose, re.M)
-    assert re.search(r"^\s+SPILL_FAIR_AGENTS: \$\{SPILL_FAIR_AGENTS:-0\}", compose, re.M)
+    for name, value in (("SPILL_SSD_GIB", "300"), ("SPILL_FAIR_AGENTS", "1"), ("SPILL_SSD_WARM_ONLY", "0"), ("SPILL_UNUSED_TTL_S", "0")):
+        assert re.search(rf"^\s+{name}: \$\{{{name}:-{value}\}}", compose, re.M), name
     conf = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
-    assert re.search(r"^\| `SPILL_SSD_GIB` \| 0 \|", conf, re.M) and re.search(r"^\| `SPILL_FAIR_AGENTS` \| 0 \|", conf, re.M)
-    assert re.search(r"^\| `spill_ssd_gib` \|.*\(0: the SSD tier is off\) \|", conf, re.M) and re.search(r"^\| `spill_fair_agents` \|.*\(`false`\) \|", conf, re.M)
+    for name, value in (("SPILL_SSD_GIB", "300"), ("SPILL_FAIR_AGENTS", "1"), ("SPILL_SSD_WARM_ONLY", "0"), ("SPILL_UNUSED_TTL_S", "0")):
+        assert re.search(rf"^\| `{name}` \| {value} \|", conf, re.M), name
+    assert re.search(r"^\| `spill_ssd_gib` \|.*\(300; 0: the SSD tier is off\) \|", conf, re.M)
+    assert re.search(r"^\| `spill_fair_agents` \|.*\(`true`\) \|", conf, re.M) and re.search(r"^\| `spill_ssd_warm_only` \|.*\(`false`\) \|", conf, re.M)
+    assert re.search(r"^\| `spill_unused_ttl_s` \|.*\(0: off\) \|", conf, re.M)
+    ini = (ROOT / "scripts/windows/settings.example.ini").read_text(encoding="utf-8")
+    assert ";SPILL_SSD_GIB=300" in ini and ";SPILL_FAIR_AGENTS=1" in ini
 
 
 def test_start_package_adds_no_tier_default_the_server_passes_them_all(tmp_path):
@@ -130,7 +174,7 @@ def test_start_package_adds_no_tier_default_the_server_passes_them_all(tmp_path)
     import start_package
     env, _ = start_package.server_env({}, {}, tmp_path)
     assert not [k for k in env if k.startswith("SPILL_")]
-    assert launch.tier_env(default_settings())["SPILL_FAIR_AGENTS"] == "0"
+    assert launch.tier_env(default_settings())["SPILL_FAIR_AGENTS"] == "1"
 
 
 # ---------------------------------------------------------------- nothing touches the SSD
@@ -220,10 +264,12 @@ def test_tiers_block_of_an_off_ssd(tmp_path):
 
 def test_deploy_info_shows_the_new_defaults():
     out = stats.deploy_info(0.0, "ready", environ={})
-    assert out["settings"]["SPILL_SSD_GIB"] == "0" and out["settings"]["SPILL_FAIR_AGENTS"] == "0"
-    out = stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": "200", "SPILL_FAIR_AGENTS": "1"})
-    assert out["settings"]["SPILL_SSD_GIB"] == "200" and out["settings"]["SPILL_FAIR_AGENTS"] == "1"
-    assert stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": ""})["settings"]["SPILL_SSD_GIB"] == "0"
+    assert stats.DEPLOY_DEFAULTS == {"SPILL_SSD_GIB": "300", "SPILL_FAIR_AGENTS": "1", "SPILL_SSD_WARM_ONLY": "0", "SPILL_UNUSED_TTL_S": "0"}
+    assert [out["settings"][k] for k in stats.DEPLOY_DEFAULTS] == ["300", "1", "0", "0"]
+    out = stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": "200", "SPILL_FAIR_AGENTS": "0", "SPILL_UNUSED_TTL_S": "900"})
+    assert out["settings"]["SPILL_SSD_GIB"] == "200" and out["settings"]["SPILL_FAIR_AGENTS"] == "0" and out["settings"]["SPILL_UNUSED_TTL_S"] == "900"
+    assert stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": ""})["settings"]["SPILL_SSD_GIB"] == "300"
+    assert stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": "0"})["settings"]["SPILL_SSD_GIB"] == "0"  # an explicit 0 stays 0
 
 
 def test_ui_shows_the_off_text_and_guards_the_division():

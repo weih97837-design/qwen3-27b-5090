@@ -330,7 +330,7 @@ class Scheduler:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        # SSD tier off (SPILL_SSD_GIB=0, the default): the engine gets SPILL_DIR="" and drops the victims of a full RAM tier instead of
+        # SSD tier off (SPILL_SSD_GIB=0 set explicitly): the engine gets SPILL_DIR="" and drops the victims of a full RAM tier instead of
         # writing files the policy would delete (docs/tiered-cache.md). Before the engine is made: it reads SPILL_DIR then.
         ssd_off_env(os.environ)
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],

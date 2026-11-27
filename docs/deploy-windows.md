@@ -11,7 +11,7 @@
 
 - **NVIDIA RTX 5090**（32 GB VRAM）與支援 CUDA 13 的驅動程式。
 - 64 位元 Windows。不需要系統管理員權限。
-- **磁碟可用空間約 150 GB**：權重約 23 GB（第一次啟動時下載）；分層快取的 SSD 層**預設關閉**（`SPILL_SSD_GIB=0`），不佔磁碟；若開啟（例如 `SPILL_SSD_GIB=100`），上限即該值，並保留 10 GiB 可用空間（`SPILL_SSD_MIN_FREE_GIB`），磁碟空間要再加上這個上限；其餘是程式包與解壓縮所需的空間。
+- **磁碟可用空間約 350 GB**：權重約 23 GB（第一次啟動時下載）；分層快取的 SSD 層預設上限 300 GiB（`SPILL_SSD_GIB=300`），並保留 10 GiB 可用空間（`SPILL_SSD_MIN_FREE_GIB`）；其餘是程式包與解壓縮所需的空間。磁碟較小就把 `SPILL_SSD_GIB` 調小；設成 `0` 則關閉 SSD 層，不佔磁碟（代價：引擎重新啟動後 RAM／VRAM 快取是冷的）。
 - 主機 RAM：`docs/deploy-launcher.md` 建議至少 16 GB。RAM 層的 checkpoint 上限預設為 64 GiB（`SPILL_RAM_GIB`），那是上限而非必要用量。`bench.cmd` 預設使用 40 GiB（見第 7 節），**所需 RAM 未驗證**。
 - **不需要**：WSL、Docker、Python、CUDA Toolkit、Visual Studio、PyTorch。程式包內含嵌入式 Python 與所需套件，只需要 NVIDIA 驅動程式。
 
@@ -88,7 +88,7 @@ Get-Content .\qwen3-27b-5090-<版本>-windows-x64.zip.sha256
 | --- | --- |
 | 權重（預設 `WEIGHTS=gdnfp4`） | `huggingface\hub\models--juzbox--Qwen3.8-27B-NVFP4-GDN\` |
 | 草稿模型（DFlash2，`SPEC` 不是 `none` 時） | `huggingface\hub\models--incoai--Qwen3.8-27B-DFlash2\` |
-| 分層快取的 SSD 層（預設關閉；`SPILL_SSD_GIB` > 0 才使用） | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` |
+| 分層快取的 SSD 層（預設開啟；`SPILL_SSD_GIB=0` 時不使用） | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` |
 | 托盤程式的記錄 | `logs\server.log`（舊的為 `server.1.log`） |
 | 設定 | `settings.ini`（資料夾內，需要時才建立） |
 
@@ -113,7 +113,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `KV_POOL_TOKENS` | `0` | GPU 上的 KV 池（token 數）。`0` = 最大：VRAM 預算剩下的全部（預估約 60 萬 token 以上（實際大小以啟動 log 或監控頁為準））；明確設定的數字會覆蓋 |
 | `SPILL_RAM_GIB` | `64` | 被逐出的 checkpoint 放在主機 RAM 的上限（GiB）；`0` 關閉分層 |
 | `SPILL_DIR` | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` | SSD 層的資料夾（只在 `SPILL_SSD_GIB` > 0 時使用；SSD 層關閉時資料夾裡既有的檔案不會被讀取或刪除） |
-| `SPILL_SSD_GIB` | `0` | SSD 層的上限（GiB），超過時刪除最舊的檔案。**`0`（預設）：SSD 層關閉**，RAM 層滿時直接丟棄、不寫磁碟，引擎重新啟動後快取是冷的。要啟用請設成例如 `100`（`settings.ini` 或托盤的 **SSD cap (GiB)**）；已經明確設過的值（例如 `200`）照舊有效 |
+| `SPILL_SSD_GIB` | `300` | SSD 層的上限（GiB），超過時刪除最舊的檔案。預設 300。**`0`：SSD 層關閉**，RAM 層滿時直接丟棄、不寫磁碟，引擎重新啟動後快取是冷的（沒有東西留下來）。可在 `settings.ini` 或托盤的 **SSD cap (GiB)** 設定；明確設過的值（例如 `200` 或 `0`）照舊有效 |
 | `WEIGHTS` | `gdnfp4` | 權重版本 |
 | `HOST` / `PORT` | `127.0.0.1` / `46320` | 監聽位址與埠 |
 | `VIDEO_MAX_TOKENS` | `131072` | 一支影片最多的 token 數（檢查點自己的是 12288）。`IMAGE_TOKENS` 預設跟著它：每 token 10 KiB 的 pinned 主機記憶體，131072 時 1.25 GiB；編碼影片時另有每 token 6 KiB 的縮圖畫面（0.75 GiB）。RAM 32 GiB 以下建議改 `32768` |
@@ -126,12 +126,12 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_PINNED_GIB` | `8` | pinned 記憶體（GiB）；`0` 關閉（v0.3.2 起預設 8） |
 | `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
 | `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
-| `SPILL_FAIR_AGENTS` | `0` | `1`：RAM／SSD 層滿時，先從用量最大的 agent 挑逐出對象。預設關閉（實測 RAM 重用率約 30%，開啟時約 6%） |
+| `SPILL_FAIR_AGENTS` | `1` | RAM／SSD 層滿時，先從用量最大的 agent 挑逐出對象。`0`：整層一起排序（一位使用者的工作負載上，`0` 的 RAM 重用率約 30%、`1` 約 6%，早期數字） |
 | `SPILL_COLD_FIRST` | `1` | 冷 agent（在該層沒有命中、最新 entry 超過 `SPILL_COLD_AFTER_S`）的 entry 先被逐出；`0` 關閉 |
 | `SPILL_COLD_AFTER_S` | `600` | 冷 agent 的門檻（秒） |
-| `SPILL_UNUSED_TTL_S` | `1800` | 從未命中的 entry 超過這麼多秒就從 RAM／SSD 丟棄；`0` 關閉 |
-| `SPILL_SSD_WARM_ONLY` | `1` | 從未命中且其 agent 也沒有命中的 entry 不寫入 SSD（沒有 id 的 `auto:` agent 直接丟棄，有 id 的受 `SPILL_PROBATION_GIB` 限制）；`0` 全部寫入（只在 SSD 層開啟時有作用） |
-| `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟時有作用）這類「未證明」entry 在 SSD 上合計的容量上限（GiB） |
+| `SPILL_UNUSED_TTL_S` | `0` | 設為正數：從未命中的 entry 超過這麼多秒就從 RAM／SSD 丟棄；`0`（預設）關閉，不會因為沒被命中而丟棄 |
+| `SPILL_SSD_WARM_ONLY` | `0` | `1`：從未命中且其 agent 也沒有命中的 entry 不寫入 SSD（沒有 id 的 `auto:` agent 直接丟棄，有 id 的受 `SPILL_PROBATION_GIB` 限制）；`0`（預設）：全部照常寫入（只在 SSD 層開啟時有作用） |
+| `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟且 `SPILL_SSD_WARM_ONLY=1` 時有作用）這類「未證明」entry 在 SSD 上合計的容量上限（GiB） |
 
 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE` 自 v0.3.2 起預設開啟；pinned 記憶體在 Windows 上計入 GPU 共用記憶體，記憶體吃緊時可設 `SPILL_PINNED_GIB=0`（見 `docs/tiered-cache.md`）。
 `HOST=0.0.0.0` 會讓區網其他電腦連線；第一次啟動時 Windows 防火牆會詢問是否允許 Python，允許前請確認網路環境。
@@ -169,7 +169,7 @@ python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:808
 **情境 e（推測解碼）**：需要 DFlash2 草稿模型。`SPEC=none` 或草稿未下載時，該情境顯示 `SKIP`，這不是失敗。
 
 **`bench.cmd` 的注意事項**：
-- SSD 層預設關閉，但 bench 本來就要寫 SSD 檔案：腳本用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB`，設成 `0` 會直接失敗。`test.cmd` 同樣有 `--ssd-gib`（預設 10），SSD 情境（b、c、f、g、h、i、j、k、l）在 SSD 關閉時會直接失敗，不會默默通過。
+- bench 與測試腳本用 `--ssd-gib`（預設 10，只用 10 GiB 的磁碟，與伺服器的 300 無關）明確設定 `SPILL_SSD_GIB`，設成 `0`（SSD 層關閉）會直接失敗。`test.cmd` 同樣有 `--ssd-gib`（預設 10），SSD 情境（b、c、f、g、h、i、j、k、l）在 SSD 關閉時會直接失敗，不會默默通過。
 - SSD 檔案放在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache\bench`；腳本會刪除該資料夾內 `entries\`、`chunks\` 子資料夾的檔案，請不要把它指向其他資料。
 - 每個尺寸都會建立兩個引擎，執行時間以分鐘計。耗時的實際數字**未驗證**。
 - 預設 `SPILL_RAM_GIB=40`（測試為 2），所以 bench 在 RAM 中保留的 checkpoint 可達 40 GiB。
@@ -196,4 +196,4 @@ python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:808
 - 第 4 節的啟動流程與檔案位置（由程式碼推得，未在 Windows 上執行）。
 - 第 7 節的 `test.cmd` / `bench.cmd` 實際執行結果、耗時與所需 RAM。
 - 影片輸入在原生 Windows 的實際解碼（`nvcuvid.dll` 的載入、WDDM 下 KV 池借出給 NVDEC）、情境 l 與 `vision_api_test.py` 的執行結果：程式碼有 Windows 分支，CI 只驗證 MSVC 編譯與不需 GPU 的 MP4 探測。
-- 第 1 節的約 150 GB 與 16 GB RAM 建議（由設定預設值推算）。
+- 第 1 節的約 350 GB 與 16 GB RAM 建議（由設定預設值推算）。

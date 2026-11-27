@@ -97,18 +97,18 @@ services:
       SPILL_PINNED_SLAB_MIB: ${SPILL_PINNED_SLAB_MIB:-1024}  # size of each pinned slab, pinned one per idle step (an entry may span several; only used with SPILL_PINNED_GIB)
       SPILL_ASYNC_IO: ${SPILL_ASYNC_IO:-1}         # KV copies on their own stream, no stall of GPU work; frees the CPU only for pinned entries, so use with SPILL_PINNED_GIB (0: off)
       SPILL_ASYNC_PROMOTE: ${SPILL_ASYNC_PROMOTE:-1}  # a request that matches a spilled checkpoint waits for it to load in the background while others run (delay hit), instead of stalling the engine (0: off; use together with SPILL_PINNED_GIB and SPILL_ASYNC_IO)
-      SPILL_FAIR_AGENTS: ${SPILL_FAIR_AGENTS:-0}  # 0 (default): when a tier is full the victim is chosen over the whole tier (superseded, never-reused, oldest first; measured RAM reuse ~30%); 1: the victim comes from the agent using the most of the tier first (measured ~6%). docs/tiered-cache.md "Retention"
+      SPILL_FAIR_AGENTS: ${SPILL_FAIR_AGENTS:-1}  # 1 (default): when a tier is full the victim comes from the agent using the most of it first (then superseded, never-reused, oldest); 0: that order over the whole tier (one user measured RAM reuse ~30% instead of ~6% with 0, early numbers). docs/tiered-cache.md "Retention"
       SPILL_DEDUP: ${SPILL_DEDUP:-1}  # RAM tier: spilled entries that share a prefix share its 4096-token chunks in RAM (0: every entry keeps its whole KV; docs/tiered-cache.md)
-      SPILL_DIR: ${SPILL_DIR:-/cache/kv}           # where spilled checkpoints are written (the kvcache volume above); only used when SPILL_SSD_GIB > 0 (the server gives the engine an empty SPILL_DIR otherwise)
+      SPILL_DIR: ${SPILL_DIR:-/cache/kv}           # where spilled checkpoints are written (the kvcache volume above); only used when SPILL_SSD_GIB > 0 (the server gives the engine an empty SPILL_DIR when you set SPILL_SSD_GIB=0)
       SPILL_RAM_RETENTION_S: ${SPILL_RAM_RETENTION_S:-3600}  # [SSD tier on only] seconds a checkpoint stays in RAM before it is written to SSD (idle time)
-      SPILL_SSD_GIB: ${SPILL_SSD_GIB:-0}           # SSD tier cap, GiB; the oldest files are deleted first. 0 (default): no SSD tier, RAM victims are dropped and nothing is written to SPILL_DIR; e.g. 100 turns it on
+      SPILL_SSD_GIB: ${SPILL_SSD_GIB:-300}         # SSD tier cap, GiB; the oldest files are deleted first (SPILL_SSD_MIN_FREE_GIB protects the disk). 0: no SSD tier, RAM victims are dropped, nothing is written to SPILL_DIR and nothing survives an engine restart
       SPILL_SSD_MIN_FREE_GIB: ${SPILL_SSD_MIN_FREE_GIB:-10}  # [SSD tier on only] never fill the disk below this much free space
       SPILL_SSD_MIN_TOKENS: ${SPILL_SSD_MIN_TOKENS:-32768}  # [SSD tier on only] spilled checkpoints shorter than this many tokens are never written to SSD (dropped instead; 0: no minimum)
-      SPILL_UNUSED_TTL_S: ${SPILL_UNUSED_TTL_S:-1800}  # an entry never hit for this many seconds is dropped from RAM and SSD, whatever the free room (0: off; docs/tiered-cache.md "Retention")
+      SPILL_UNUSED_TTL_S: ${SPILL_UNUSED_TTL_S:-0}  # seconds after which an entry that was never hit is dropped from RAM and SSD, whatever the free room (0: off, the default; docs/tiered-cache.md "Retention")
       SPILL_COLD_AFTER_S: ${SPILL_COLD_AFTER_S:-600}  # an agent with no hit in a tier whose newest entry there is this old is "cold"
       SPILL_COLD_FIRST: ${SPILL_COLD_FIRST:-1}  # cold agents' entries are evicted first (0: off)
-      SPILL_SSD_WARM_ONLY: ${SPILL_SSD_WARM_ONLY:-1}  # [SSD tier on only] never-hit entries of agents without any hit are not written to the SSD (auto: agents: never; agents with an id: within SPILL_PROBATION_GIB); 0: write everything
-      SPILL_PROBATION_GIB: ${SPILL_PROBATION_GIB:-4}  # [SSD tier on only] SSD room of all such unproven entries together; the oldest goes first
+      SPILL_SSD_WARM_ONLY: ${SPILL_SSD_WARM_ONLY:-0}  # [SSD tier on only] 1: never-hit entries of agents without any hit are not written to the SSD (auto: agents: never; agents with an id: within SPILL_PROBATION_GIB); 0 (default): write everything
+      SPILL_PROBATION_GIB: ${SPILL_PROBATION_GIB:-4}  # [SSD tier on only, and only with SPILL_SSD_WARM_ONLY=1] SSD room of all such unproven entries together; the oldest goes first
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # [SSD tier on only] files not reused for this many days are deleted
       SPILL_TICK_S: ${SPILL_TICK_S:-30}            # seconds between the tier maintenance passes
       VRAM_BACKUP_IDLE_S: ${VRAM_BACKUP_IDLE_S:-60}  # idle seconds before VRAM checkpoints are copied to RAM, kept in VRAM (0: off)

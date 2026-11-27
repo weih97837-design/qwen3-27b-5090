@@ -20,12 +20,12 @@
 
 | 項目 | 白話說明 |
 | --- | --- |
-| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；**SSD 層預設關閉**，`SPILL_SSD_GIB` 設為正數才啟用），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；從未被重用過的先於重用過的被清（依 Agent 公平淘汰是選項，`SPILL_FAIR_AGENTS=1`，預設關閉）。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
+| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；SSD 層預設開啟，上限 300 GiB，`SPILL_SSD_GIB=0` 關閉），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；空間不足時依 Agent 公平淘汰（用量最大的先被清，`SPILL_FAIR_AGENTS`，預設開啟）；從未被重用過的先於重用過的被清。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
 | 多機器計數 | 多台電腦共用一台伺服器時，請求可帶 `X-Client-Id`（或伺服器設定 `CLIENT_NAMES` 對照 IP），監控頁看得到誰在用。**只計數，不限制**，排隊方式不變 |
 | Agent 識別 | 請求可帶 `X-Agent-Id`，監控頁與快取淘汰以此分辨不同的代理 |
 | 影片輸入整合 | 影片設定可調（預設一支影片最多 131,072 token、2,048 張畫面）；影片結尾存檔點，同一支影片換問題時不重算影片 |
 | 繁體中文監控頁 | `/ui`，有針對窄螢幕的版面（手機排版） |
-| 不同的預設值 | 同時 8 個 slot（`MAX_SEQS=8`）、KV 池自動取最大（`KV_POOL_TOKENS=0`）、VRAM 預留 1 GiB（`VRAM_RESERVE_GIB=1.0`）、RAM 層 64 GiB（上限）、SSD 層預設關閉（`SPILL_SSD_GIB=0`） |
+| 不同的預設值 | 同時 8 個 slot（`MAX_SEQS=8`）、KV 池自動取最大（`KV_POOL_TOKENS=0`）、VRAM 預留 1 GiB（`VRAM_RESERVE_GIB=1.0`）、RAM 層 64 GiB（上限）、SSD 層上限預設 300 GiB（`SPILL_SSD_GIB=300`） |
 | Windows 原生程式包 | 不需要 WSL 或 Docker；`start.cmd`、托盤程式與 `update.cmd` 更新 |
 | 托盤程式設定視窗 | 在 Windows 托盤選單的 **Settings...** 改設定，不必手動編輯檔案 |
 
@@ -45,8 +45,8 @@
 **磁碟**
 
 - 權重約 23 GB（預設的 gdnfp4 權重約 19.5 GB，加上草稿模型約 3.5–4.1 GB）。見 [README.md](README.md) 與 [docs/deploy-cli.md](docs/deploy-cli.md)。
-- SSD 快取**預設關閉**（`SPILL_SSD_GIB=0`，不佔磁碟；代價：引擎重新啟動後 RAM／VRAM 快取是冷的）。設成正數（例如 `100`）才啟用，並保留 10 GiB 以上的可用空間（`SPILL_SSD_MIN_FREE_GIB`）；資料夾在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`。已經明確設過 `SPILL_SSD_GIB` 的人不受影響。
-- [docs/deploy-windows.md](docs/deploy-windows.md) 估計 Windows 上約需 150 GB 可用空間（文件自己標示為由預設值推算）。SSD 層預設關閉，所以預設其實用不到那麼多；若開啟了又不想佔這麼多，把 `SPILL_SSD_GIB` 調小。
+- SSD 快取**預設開啟**，最多再用 300 GiB（`SPILL_SSD_GIB=300`），並保留 10 GiB 以上的可用空間（`SPILL_SSD_MIN_FREE_GIB`）；資料夾在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache`。設成 `0` 關閉 SSD 層（不佔磁碟；代價：引擎重新啟動後 RAM／VRAM 快取是冷的，沒有東西留下來）。`settings.ini` 裡明確設過的值（包含 `SPILL_SSD_GIB=0` 或 `100`）照舊有效。
+- [docs/deploy-windows.md](docs/deploy-windows.md) 估計 Windows 上約需 350 GB 可用空間（文件自己標示為由預設值推算；權重約 23 GB 加 SSD 層上限 300 GiB）。不想佔這麼多，把 `SPILL_SSD_GIB` 調小，或設成 `0` 關閉 SSD 層。
 - Windows 程式包約 35 MB（不含權重）。把它解壓到有寫入權限、路徑只有 ASCII 的資料夾（不要放 `Program Files`）。
 
 **RAM**
@@ -126,7 +126,7 @@ docker compose logs -f serve       # 等到出現 "engine ready"
 | `VRAM_RESERVE_GIB` | `1.0` | 至少留著不用的 VRAM（GiB）。若這張顯卡也接螢幕或有別的程式用 GPU，文件建議調到 1.5–2，避免 Windows 把 GPU 記憶體換到 RAM 而變慢 |
 | `SPEC` | `dspine` | 推測解碼：`dspine`、`dflash2` 或 `none`（見下） |
 | `SPILL_RAM_GIB` | `64` | RAM 層上限（GiB）；`0` 關閉分層快取 |
-| `SPILL_SSD_GIB` | `0` | SSD 層上限（GiB），超過時先刪最舊的。`0`（預設）：SSD 層關閉，不寫入也不刪除 `SPILL_DIR` 的檔案 |
+| `SPILL_SSD_GIB` | `300` | SSD 層上限（GiB），超過時先刪最舊的。`0`：SSD 層關閉，不寫入也不刪除 `SPILL_DIR` 的檔案 |
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | SSD 所在磁碟至少保留的可用空間（GiB） |
 | `VIDEO_MAX_TOKENS` | `131072` | 一支影片最多的 token 數（模型檢查點自己的值是 12,288） |
 | `VIDEO_MAX_FRAMES` | `2048` | 一支影片最多取幾張畫面（檢查點自己的值是 768） |

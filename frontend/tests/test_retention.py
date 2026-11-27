@@ -197,8 +197,8 @@ def test_status_reuse_split_and_agent_rows(tmp_path):
 def test_from_env_reads_spill_fair_agents(monkeypatch):
     monkeypatch.setenv("SPILL_RAM_GIB", "4")
     monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
-    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is False  # (off by default)
-    for text, want in (("1", True), ("0", False), ("false", False), ("", False), ("yes", True)):
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is True  # (on by default)
+    for text, want in (("1", True), ("0", False), ("false", False), ("", True), ("yes", True)):
         monkeypatch.setenv("SPILL_FAIR_AGENTS", text)
         assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is want, text
 
