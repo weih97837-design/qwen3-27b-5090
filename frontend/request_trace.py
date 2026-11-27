@@ -21,6 +21,17 @@ SNAP_S = 10.0          # s between "snap" events while requests are in flight
 FILE_MIB = 64          # a new file at this size
 MAX_MIB = 512          # REQUEST_TRACE_MAX_MIB default: the oldest files go beyond this total
 ENGINE_VERSION = "q27-phase6"  # (what GET /version reports)
+
+
+def package_version():
+    """The release tag of the Windows package (app\\VERSION, written by package.ps1 next to frontend/), or None in a checkout:
+    the header names the build so traces of two versions can be told apart."""
+    try:
+        return (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="ascii").strip() or None
+    except (OSError, ValueError):
+        return None
+
+
 SETTING_NAMES = ("STATE_HOST_CACHE", "CHECKPOINT_INTERVAL", "PREFILL_CHUNK", "MAX_SEQS", "KV_POOL_TOKENS", "KV_DTYPE", "MAX_TOKENS",
                  "SPEC", "WEIGHTS")
 
@@ -195,7 +206,7 @@ def from_env(env, header_settings, log=print):
             max_mib = float(env.get("REQUEST_TRACE_MAX_MIB") or MAX_MIB)
         except ValueError:
             max_mib = MAX_MIB
-        rec = Recorder(target, {"engine": ENGINE_VERSION, "settings": settings},
+        rec = Recorder(target, {"engine": ENGINE_VERSION, "build": package_version(), "settings": settings},
                        hash_agents=(env.get("REQUEST_TRACE_HASH_AGENTS") or "") not in ("", "0"), max_mib=max_mib, log=log)
         log(f"request trace: recording to {rec.path} (counts and hashes only; docs/request-trace.md)")
         return rec

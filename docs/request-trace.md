@@ -22,6 +22,7 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 | `t` | `"hdr"` |
 | `version` | 格式版本，目前 1 |
 | `engine` | 引擎版本字串（同 `GET /version`） |
+| `build` | Windows 程式包的版本（`app\VERSION`，例如 `v0.6.2.7-cache-tier`）；在原始碼 checkout 裡沒有這個檔案，值為 `null`。用來分辨不同版本的追蹤檔 |
 | `block_tokens` | 256 |
 | `ts` | 檔案開始時間（epoch 秒） |
 | `settings` | 與快取有關的設定：所有 `SPILL_*`、`STATE_HOST_CACHE`、`CHECKPOINT_INTERVAL`、`PREFILL_CHUNK`、`MAX_SEQS`、`KV_POOL_TOKENS`（有設定才有）、`kv_pool_pages`、`kv_pool_tokens`（引擎實際的 KV 池）等 |

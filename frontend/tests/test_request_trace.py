@@ -265,3 +265,16 @@ def test_unknown_row_is_split_into_owner_zero_and_overflow_owners():
     # no overflow owners, no overflow row; no owner 0, no unknown row
     rows = {r["agent"]: r for r in stats.agents_block([], totals, use[:1])}
     assert set(rows) == {"alpha"}
+
+
+def test_header_names_the_build(tmp_path, monkeypatch):
+    """The header carries the package's app\\VERSION (None in a checkout) so two versions' traces can be told apart."""
+    import request_trace
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "VERSION").write_text("v9.9.9-test", encoding="ascii")
+    fake = tmp_path / "frontend" / "request_trace.py"
+    fake.write_text("")
+    monkeypatch.setattr(request_trace, "__file__", str(fake))
+    assert request_trace.package_version() == "v9.9.9-test"
+    (tmp_path / "VERSION").unlink()
+    assert request_trace.package_version() is None
