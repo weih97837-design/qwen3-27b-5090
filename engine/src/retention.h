@@ -201,7 +201,8 @@ inline std::map<uint64_t, double> agent_use(const std::vector<UseEntry>& entries
 //
 //   gain(e)     = prefill seconds restoring e saves over restoring its parent:
 //                 T(dp, de) = t0 * (de - dp) + (k / 2000) * (de^2 - dp^2) us   [t0: us per token; k: us per token per 1K of depth]
-//   value(e)    = gain(e) / bytes_GiB(e) * (1 + hits(e)) * (junction(e) ? junction_factor : 1) * (superseded(e) ? superseded_factor : 1)
+//   value(e)    = gain(e) / bytes_GiB(e) * (1 + hit_weight * hits(e)) * (junction(e) ? junction_factor : 1)
+//                 * (superseded(e) ? superseded_factor : 1)
 //   priority(e) = stamp(e) + value(e)        stamp(e): the tier's watermark L at the entry's last use (GdTier::stamp_at)
 //   L           = max(L, priority of the victim) after each eviction (GreedyDual ageing; max: L never goes down)
 //   victim      = the minimum priority among the eligible LEAVES of the tier (no retained strict extender in the same tier); among
@@ -222,6 +223,10 @@ struct SmartParams {
   double k_us = 0.31;
   double superseded_factor = 0.25;  // CACHE_SUPERSEDED_FACTOR: value of an entry a deeper one of its chain stands in for
   double junction_factor = 2.0;     // CACHE_JUNCTION_FACTOR: value of a branch point / a prefix shared by >= 2 agents
+  // CACHE_HIT_WEIGHT: value x (1 + hit_weight * hits). 1 is the formula as specified. Note: an entry's hits count the reuses of its
+  // whole lineage (prefix_begin's match + 1, inherited by every deeper checkpoint the sequence saves: inherited_hits), so the tip of a
+  // long conversation carries the number of its turns and never decays; tools/cache_sim.py shows the effect (--smart-variant nohits).
+  double hit_weight = 1.0;
   double min_resident_s = 300;      // CACHE_MIN_RESIDENT_S: RAM / SSD entries younger than this are protected (VRAM: not used)
 };
 inline constexpr double kSmartMinBytes = 1 << 20;  // bytes floor of value() (an entry that frees nothing must not divide by 0)
@@ -251,6 +256,7 @@ inline SmartParams smart_params_from_env(Get&& get) {
   rd("CACHE_PREFILL_K_US", p.k_us);
   rd("CACHE_SUPERSEDED_FACTOR", p.superseded_factor);
   rd("CACHE_JUNCTION_FACTOR", p.junction_factor);
+  rd("CACHE_HIT_WEIGHT", p.hit_weight);
   rd("CACHE_MIN_RESIDENT_S", p.min_resident_s);
   return p;
 }
@@ -333,7 +339,7 @@ struct SmartCand {
 
 inline double smart_value(const SmartParams& p, const SmartCand& c) {
   const double gib = std::max(c.bytes, kSmartMinBytes) / double(1ull << 30);
-  double v = prefill_seconds(p, c.parent_depth, c.depth) / gib * (1.0 + double(c.hits));
+  double v = prefill_seconds(p, c.parent_depth, c.depth) / gib * (1.0 + p.hit_weight * double(c.hits));
   if (c.junction) v *= p.junction_factor;
   if (c.superseded) v *= p.superseded_factor;
   return v;
@@ -440,10 +446,12 @@ inline const std::vector<uint64_t>* cached_bh(const std::vector<int32_t>& ids, V
 // in RAM and not busy; idle backups (live) are class 0 and go first as in choose_victim (they lose nothing: their checkpoint is
 // still in the pool), unless the best backup frees only its state while the best sole copy frees >= 4x that. parent / junction come
 // from every visible node (pool + RAM + SSD), leaf from the RAM tier. freed(s): host bytes erasing s gives back (spill_freed);
-// superseded(id): Model::spill_superseded. Returns spill.end() when there is no candidate; *pick (if not null) gets the pick.
+// superseded(id): Model::spill_superseded. Returns spill.end() when there is no candidate; *pick (if not null) gets the pick. The
+// eviction of a sole copy is recorded in gd (now_clock: the latest use clock); an idle backup's is not (dropping it loses nothing: it
+// must not raise the watermark).
 template <class Map, class Ckpts, class Freed, class Sup>
-inline typename Map::iterator smart_ram_victim(Map& spill, const Ckpts& ckpts, const SmartParams& p, const GdTier& gd, double now_s,
-                                               Freed&& freed, Sup&& superseded, SmartPick* pick = nullptr) {
+inline typename Map::iterator smart_ram_victim(Map& spill, const Ckpts& ckpts, const SmartParams& p, GdTier& gd, double now_s,
+                                               uint64_t now_clock, Freed&& freed, Sup&& superseded, SmartPick* pick = nullptr) {
   std::vector<RetNode> nodes;
   std::vector<uint8_t> tiers;
   std::vector<typename Map::iterator> its;
@@ -488,16 +496,18 @@ inline typename Map::iterator smart_ram_victim(Map& spill, const Ckpts& ckpts, c
   if (cls < 0) return spill.end();
   const SmartPick& k = cls ? k1 : k0;
   if (pick) *pick = k;
+  if (cls == 1) gd.evicted(k, now_clock);
   return its[at[cls][size_t(k.idx)]];
 }
 
 // Smart victim among the pool's checkpoints (Model::evict_checkpoint): those neither loading nor held (the caller keeps the legacy
 // fallbacks for held / loading ones). parent / leaf / junction within the pool. bytes(c): what evicting it frees (pages only it
 // holds, or the state slot when a slot is wanted); protect(c): not a victim unless every candidate is protected (a sibling-share
-// checkpoint planned for a waiting request). No age protection in VRAM (its pages turn over in seconds): age_key is last_use.
+// checkpoint planned for a waiting request). No age protection in VRAM (its pages turn over in seconds): age_key is last_use. The
+// eviction is recorded in gd (now_clock: the latest use clock).
 template <class Ckpts, class Bytes, class Protect>
-inline typename Ckpts::iterator smart_vram_victim(Ckpts& ckpts, const SmartParams& p, const GdTier& gd, Bytes&& bytes, Protect&& protect,
-                                                  SmartPick* pick = nullptr) {
+inline typename Ckpts::iterator smart_vram_victim(Ckpts& ckpts, const SmartParams& p, GdTier& gd, uint64_t now_clock, Bytes&& bytes,
+                                                  Protect&& protect, SmartPick* pick = nullptr) {
   std::vector<RetNode> nodes;
   std::vector<uint8_t> tiers;
   std::vector<typename Ckpts::iterator> its;
@@ -524,6 +534,7 @@ inline typename Ckpts::iterator smart_vram_victim(Ckpts& ckpts, const SmartParam
   const SmartPick k = smart_pick(cand, p);
   if (k.idx < 0) return ckpts.end();
   if (pick) *pick = k;
+  gd.evicted(k, now_clock);
   return its[at[size_t(k.idx)]];
 }
 

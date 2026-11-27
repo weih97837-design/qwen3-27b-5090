@@ -6,7 +6,7 @@ frontend/tests/test_cache_policy.py runs this module and the C++ one (engine/tes
 No dependencies (the simulator imports it from tools/).
 
     gain(e)     = T(parent depth, depth): T(a, b) = 1e-6 * (t0 * (b - a) + (k / 2000) * (b^2 - a^2)) seconds
-    value(e)    = gain / GiB(bytes) * (1 + hits) * (junction_factor if junction) * (superseded_factor if superseded)
+    value(e)    = gain / GiB(bytes) * (1 + hit_weight * hits) * (junction_factor if junction) * (superseded_factor if superseded)
     priority(e) = stamp(e) + value(e)     stamp: the tier's watermark L at the entry's last use
     victim      = min priority among the non-young leaves; no leaf: among all non-young; all young: the oldest
     L           = max(L, victim priority)
@@ -30,6 +30,7 @@ PARAMS = (("CACHE_PREFILL_T0_US", "t0_us", 54.0),          # us per token at dep
           ("CACHE_PREFILL_K_US", "k_us", 0.31),            # us per token per 1,000 tokens of depth
           ("CACHE_SUPERSEDED_FACTOR", "superseded_factor", 0.25),
           ("CACHE_JUNCTION_FACTOR", "junction_factor", 2.0),
+          ("CACHE_HIT_WEIGHT", "hit_weight", 1.0),          # value x (1 + hit_weight * hits)
           ("CACHE_MIN_RESIDENT_S", "min_resident_s", 300.0))
 ENV_NAMES = ("CACHE_POLICY",) + tuple(p[0] for p in PARAMS)
 
@@ -91,7 +92,7 @@ class Cand:
 
 def smart_value(p, c):
     gib = max(c.bytes, MIN_BYTES) / GIB
-    v = prefill_seconds(p, c.parent_depth, c.depth) / gib * (1.0 + float(c.hits))
+    v = prefill_seconds(p, c.parent_depth, c.depth) / gib * (1.0 + p.hit_weight * float(c.hits))
     if c.junction:
         v *= p.junction_factor
     if c.superseded:

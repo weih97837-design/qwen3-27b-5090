@@ -929,6 +929,16 @@ function drawTiers() {
   const reuse = [...reuseRow("RAM 重用", "ram", "ram_reuse_rate", "ram_restored"), ...(ssdOff ? [] : reuseRow("SSD 重用", "disk", "ssd_reuse_rate", "ssd_restored"))];
   if (reuse.length) kids.push(el("div", { class: "kv", style: "margin-top:10px" }, ...reuse,
     kvRow("依 Agent 公平淘汰 SPILL_FAIR_AGENTS", t.fair_agents == null ? "–" : t.fair_agents ? "開" : "關")));
+  // CACHE_POLICY (docs/tiered-cache.md "CACHE_POLICY=smart"): the policy, and under smart its evictions per tier by reason (leaf / forced
+  // non-leaf / all young), the picks that passed over a young entry and the mean victim priority (to compare legacy and smart).
+  if (t.cache_policy) {
+    const sm = t.cache_smart || {}, TIER_ZH = { vram: "VRAM", ram: "RAM", ssd: "SSD" };
+    kids.push(el("div", { class: "kv", style: "margin-top:10px" }, kvRow("保留策略 CACHE_POLICY", t.cache_policy),
+      ...Object.entries(sm).map(([tier, c]) => kvRow(`${TIER_ZH[tier] || tier} 逐出`,
+        `葉 ${n(c.evictions_leaf)} · 非葉 ${n(c.evictions_non_leaf)} · 全為新進 ${n(c.evictions_young)} · 略過新進 ${n(c.young_skipped)}` +
+        ` · 平均優先權 ${c.victim_priority_mean == null ? "–" : c.victim_priority_mean.toFixed(2)} · 水位 L ${(c.watermark || 0).toFixed(2)}`)),
+      ...(t.cache_policy === "smart" && !ssdOff ? [kvRow("SSD 拒收（低於水位）", n(t.ssd_not_admitted || 0))] : [])));
+  }
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
     ...(ssdOff ? [] : [kvRow("RAM 停留時間 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–")]),
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 份`),
@@ -943,7 +953,8 @@ function drawTiers() {
 // Host and deployment: engine state, start time (local), uptime, CPU and load, host RAM bar, settings table.
 const SETTING_KEYS = ["KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB", "SPILL_DIR",
   "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS", "VRAM_BACKUP_IDLE_S", "SPILL_PINNED_GIB",
-  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "SPILL_UNUSED_TTL_S", "SPILL_COLD_AFTER_S", "SPILL_COLD_FIRST", "SPILL_SSD_WARM_ONLY", "SPILL_PROBATION_GIB", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"];
+  "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "SPILL_UNUSED_TTL_S", "SPILL_COLD_AFTER_S", "SPILL_COLD_FIRST", "SPILL_SSD_WARM_ONLY", "SPILL_PROBATION_GIB", "CACHE_POLICY", "CACHE_PREFILL_T0_US", "CACHE_PREFILL_K_US", "CACHE_SUPERSEDED_FACTOR",
+  "CACHE_JUNCTION_FACTOR", "CACHE_HIT_WEIGHT", "CACHE_MIN_RESIDENT_S", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"];
 function drawDeploy() {
   const h = snapHost(), d = snapDeploy(), sec = $("deploy-sec"), body = $("deploy-body");
   const hostOk = h && typeof h === "object", deployOk = d && typeof d === "object";
@@ -1119,6 +1130,7 @@ const TIER_OPTS = [
   { key: "spill_cold_first", label: "冷 Agent 先淘汰", note: "SPILL_COLD_FIRST", help: "RAM 或 SSD 已滿時，先淘汰冷 Agent 的項目（其中用量最多者先），再套用公平淘汰順序。", kind: "flag" },
   { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。預設關閉：照常寫入。只在 SSD 層開啟時有效。", kind: "flag" },
   { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。只在 SSD 層開啟且「SSD 只收已證明的」開啟時有效。", kind: "num", unit: "GiB", step: "1" },
+  { key: "cache_policy", label: "保留策略", note: "CACHE_POLICY", help: "legacy（預設）：上面的 SPILL_* 規則。smart：依價值淘汰（每 GiB 省下的 prefill 秒數、最近使用、分岔點保留；沒有依 Agent／冷 Agent 步驟，被取代的存檔點照樣寫到下一層）。先用 tools/cache_sim.py 在自己的軌跡上比較。docs/tiered-cache.md「CACHE_POLICY=smart」。", kind: "choice", choices: [["legacy", "legacy（預設）"], ["smart", "smart"]] },
   { key: "spill_dir", label: "SSD 資料夾", note: "SPILL_DIR", help: "擠出的存檔點寫入的位置（只在 SSD 上限大於 0 時使用）。留空：只用 RAM。", kind: "path" },
 ];
 // Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's
@@ -1194,8 +1206,8 @@ function mediaRow(o) {
 function tierRow(o) {
   const row = el("div", { class: "choices" }), v = L.form[o.key];
   if (v === undefined) return null;  // (a server without them)
-  if (o.kind === "flag") {
-    for (const [val, name] of [[false, "關閉"], [true, "開啟"]]) {
+  if (o.kind === "flag" || o.kind === "choice") {
+    for (const [val, name] of o.kind === "choice" ? o.choices : [[false, "關閉"], [true, "開啟"]]) {
       const b = el("button", { class: "opt", "aria-pressed": String(v === val), type: "button" }, el("b", {}, name));
       if (L.running && L.running[o.key] === val) b.append(el("i", { class: "run", title: "執行中的引擎" }));
       b.addEventListener("click", () => setTier(o.key, val));

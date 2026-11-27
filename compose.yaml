@@ -113,6 +113,7 @@ services:
       CACHE_PREFILL_K_US: ${CACHE_PREFILL_K_US:-0.31}  # [smart] more microseconds per token per 1,000 tokens of depth
       CACHE_SUPERSEDED_FACTOR: ${CACHE_SUPERSEDED_FACTOR:-0.25}  # [smart] value of a checkpoint a deeper one of its chain stands in for
       CACHE_JUNCTION_FACTOR: ${CACHE_JUNCTION_FACTOR:-2}  # [smart] value of a branch point / a prefix shared by >= 2 agents
+      CACHE_HIT_WEIGHT: ${CACHE_HIT_WEIGHT:-1}  # [smart] value x (1 + this x hits); hits count a conversation's turns (inherited), 0: ignore them
       CACHE_MIN_RESIDENT_S: ${CACHE_MIN_RESIDENT_S:-300}  # [smart] RAM / SSD entries younger than this are not victims unless all are
       SPILL_PROBATION_GIB: ${SPILL_PROBATION_GIB:-4}  # [SSD tier on only, and only with SPILL_SSD_WARM_ONLY=1] SSD room of all such unproven entries together; the oldest goes first
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # [SSD tier on only] files not reused for this many days are deleted

@@ -81,12 +81,13 @@ static void test_env_and_formula() {
   CHECK(cache_policy_of("smart") == 1 && cache_policy_of("SMART\n") == 1 && cache_policy_of("lru") == -1);
   std::map<std::string, std::string> env = {{"CACHE_PREFILL_T0_US", "60"}, {"CACHE_PREFILL_K_US", "x"},
                                             {"CACHE_SUPERSEDED_FACTOR", "-1"}, {"CACHE_MIN_RESIDENT_S", "0"},
-                                            {"CACHE_JUNCTION_FACTOR", "3.5"}};
+                                            {"CACHE_JUNCTION_FACTOR", "3.5"}, {"CACHE_HIT_WEIGHT", "0"}};
   const SmartParams p = smart_params_from_env([&](const char* n) -> const char* {
     auto it = env.find(n);
     return it == env.end() ? nullptr : it->second.c_str();
   });
   CHECK(p.t0_us == 60 && p.k_us == 0.31 && p.superseded_factor == 0.25 && p.min_resident_s == 0 && p.junction_factor == 3.5);
+  CHECK(p.hit_weight == 0 && SmartParams().hit_weight == 1.0);
   const SmartParams d;
   // The defaults give the measured speeds: 30K prompt ~17,000 tok/s, 125K ~13,600 tok/s.
   const double tps30 = 30000 / prefill_seconds(d, 0, 30000), tps125 = 125000 / prefill_seconds(d, 0, 125000);
@@ -236,9 +237,8 @@ static void test_ram_victims() {
   std::vector<uint64_t> order;
   SmartPick pk;
   auto pop = [&]() {
-    auto it = smart_ram_victim(spill, ckpts, p, gd, now, freed, sup, &pk);
+    auto it = smart_ram_victim(spill, ckpts, p, gd, now, 100, freed, sup, &pk);  // (records the eviction at clock 100)
     if (it == spill.end()) return uint64_t(0);
-    gd.evicted(pk, 100);
     const uint64_t id = it->first;
     spill.erase(it);
     return id;
@@ -290,8 +290,12 @@ static void test_ram_victims() {
   spill[32].busy = true;
   add(33, toks(13, 30000), 1, 0.1, 0, 1);
   spill[33].ram = false, spill[33].path = "x.q27m";
+  gd = GdTier();
+  const double L0 = gd.L();
   CHECK(pop() == 31);
+  CHECK(gd.L() == L0);  // dropping an idle backup loses nothing: the watermark does not move
   CHECK(pop() == 30);
+  CHECK(gd.L() > L0);
   CHECK(pop() == 0);  // (only busy / on-disk entries left)
 }
 
@@ -314,22 +318,23 @@ static void test_vram_victims() {
   auto bytes = [&](const FakeCkpt& c) { return double(sole_pages(c.pages, pool)) * page; };
   auto none = [](const FakeCkpt&) { return false; };
   SmartPick pk;
-  auto it = smart_vram_victim(ck, p, gd, bytes, none, &pk);
+  auto it = smart_vram_victim(ck, p, gd, 7, bytes, none, &pk);
+  CHECK(gd.L() == pk.priority && gd.stamp_at(8) == pk.priority);  // (recorded)
   // leaves: a2 and b1 (a1 is a2's prefix). a1 frees no page: never chosen while a leaf exists.
   const double va2 = prefill_seconds(p, 30000, 60000) / (469 * page / double(1ull << 30));
   const double vb1 = prefill_seconds(p, 0, 20000) / (157 * page / double(1ull << 30));
   CHECK(it != ck.end() && (it - ck.begin()) == (va2 < vb1 ? 1 : 2) && pk.reason == kSmartLeaf);
   // a sibling-share checkpoint is protected
   auto protect_b1 = [&](const FakeCkpt& c) { return &c == &ck[2]; };
-  it = smart_vram_victim(ck, p, gd, bytes, protect_b1, &pk);
+  it = smart_vram_victim(ck, p, gd, 7, bytes, protect_b1, &pk);
   CHECK((it - ck.begin()) == 1 && pk.young_skipped);
   // loading ones are invisible (not even an extender: a1 becomes a leaf when a2 loads)
   ck[1].loading = true;
   ck[2].held = true;
-  it = smart_vram_victim(ck, p, gd, bytes, none, &pk);
+  it = smart_vram_victim(ck, p, gd, 7, bytes, none, &pk);
   CHECK((it - ck.begin()) == 0 && pk.reason == kSmartLeaf);
   for (auto& c : ck) c.held = true;
-  CHECK(smart_vram_victim(ck, p, gd, bytes, none, &pk) == ck.end());
+  CHECK(smart_vram_victim(ck, p, gd, 7, bytes, none, &pk) == ck.end());
 }
 
 static void test_spill_chains() {

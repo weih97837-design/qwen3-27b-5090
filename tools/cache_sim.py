@@ -327,16 +327,6 @@ class Sim:
                 self.c["kv_overflow"] += 1
                 return
 
-    def _new_blocks(self, blocks, nb):
-        lo, hi = 0, nb  # blocks already resident form a prefix
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if blocks[mid] in self.vref:
-                lo = mid + 1
-            else:
-                hi = mid
-        return nb - lo
-
     def _evict_vram(self, for_slot):
         cands = list(self.vram_nodes)
         pol = self.policy
@@ -745,6 +735,7 @@ class Sim:
                "ram_bytes_end": self.ram_bytes(), "ssd_bytes_end": self.ssd_bytes()}
         if self.policy in ("smart", "ideal"):
             out["smart"] = {k: v for k, v in c.items() if k.startswith("smart_")}
+            out["watermarks"] = {"vram": self.gd[V].L, "ram": self.gd[R].L, "ssd": self.gd[S].L}
         return out
 
 

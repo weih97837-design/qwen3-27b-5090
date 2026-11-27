@@ -278,3 +278,30 @@ def test_header_names_the_build(tmp_path, monkeypatch):
     assert request_trace.package_version() == "v9.9.9-test"
     (tmp_path / "VERSION").unlink()
     assert request_trace.package_version() is None
+
+
+def test_reusable_from_same_other_none(tmp_path):
+    """req.reusable_from: whose history entry the reusable prefix comes from (the same agent, another one, none); the cache's lookup is
+    by content either way."""
+    s = sched(tmp_path)
+    s.history_agents = collections.deque(maxlen=64)
+
+    def run(rid, prompt, agent_id, out=()):
+        s.submit(rid, req(prompt, agent_id=agent_id))
+        r = s.by_id[rid]
+        s.waiting.remove(r)
+        s.alive.append(r)
+        s.begin(r)
+        r.out = list(out)
+        s.finish(r, "stop", save=False)
+        return [e for e in read(files(tmp_path)[0]) if e["t"] == "req"][-1]
+
+    a1 = ids(1200)
+    assert run("r1", a1, "alpha/t1", out=ids(50, seed=9))["reusable_from"] == "none"
+    assert run("r2", a1 + ids(50, seed=9) + ids(300, seed=2), "alpha/t2")["reusable_from"] == "same"  # (same agent, another session)
+    assert run("r3", a1[:900] + ids(400, seed=4), "beta")["reusable_from"] == "other"
+    assert run("r4", ids(800, seed=77), "beta")["reusable_from"] == "none"
+    assert s.history_agents[-1] == "beta" and len(s.history_agents) == len(s.history)
+    # a history without agents (a scheduler that does not keep them): unknown, not a guess
+    assert rt.reusable_from(5, [1, 2, 3, 4, 5, 6], collections.deque([b"x"]), None, "a") is None
+    assert rt.reusable_from(0, [1], collections.deque(), None, "a") == "none"

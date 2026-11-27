@@ -70,6 +70,18 @@ def summarize(reqs, dones=(), snaps=()):
         last[r["agent"]] = r["ts"]
     out["gap_s"] = {a: {"median": statistics.median(g), "p90": pct(g, 0.9), "n": len(g)} for a, g in gaps.items()}
     out["reusable_not_cached_tokens"] = sum(max(0, (r["reusable"] or 0) - (r["cached"] or 0)) for r in reqs)
+    # Cross-agent sharing (reusable_from: whose history entry the reusable prefix comes from; traces before it have none)
+    src = [r for r in reqs if r.get("reusable_from") is not None]
+    if src:
+        by = {}
+        for r in src:
+            k = r["reusable_from"]
+            b = by.setdefault(k, {"requests": 0, "reusable_tokens": 0})
+            b["requests"] += 1
+            b["reusable_tokens"] += r["reusable"] or 0
+        total = sum(b["reusable_tokens"] for b in by.values())
+        out["reusable_from"] = by
+        out["reusable_from_other_share"] = by.get("other", {}).get("reusable_tokens", 0) / total if total else None
     return out
 
 
@@ -90,6 +102,11 @@ def render(s):
     for a, g in s["gap_s"].items():
         L.append(f"  {a}: median {g['median']:.1f}  p90 {g['p90']:.1f}  (n {g['n']})")
     L.append(f"reusable but not cached: {s['reusable_not_cached_tokens']} tokens")
+    if "reusable_from" in s:
+        o = s["reusable_from_other_share"]
+        L.append("reusable prefix from (requests / reusable tokens): " + "  ".join(
+            f"{k} {v['requests']} / {v['reusable_tokens']}" for k, v in sorted(s["reusable_from"].items()))
+            + "  -> share of reusable tokens from other agents: " + ("-" if o is None else f"{100 * o:.1f}%"))
     return "\n".join(L)
 
 

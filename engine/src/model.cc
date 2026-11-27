@@ -670,9 +670,7 @@ bool Model::evict_checkpoint(bool for_slot) {
     auto cost = [&](const Checkpoint& c) {
       return for_slot ? double(ckpt_bytes_) : double(sole_pages(c.pages, pool_)) * double(kKvSlices) * double(kv_page_bytes_);
     };
-    SmartPick pk;
-    it = smart_vram_victim(ckpts_, opt_.smart, gd_vram_, cost, [&](const Checkpoint& c) { return c.share_until > use_clock_; }, &pk);
-    if (it != ckpts_.end()) gd_vram_.evicted(pk, use_clock_);
+    it = smart_vram_victim(ckpts_, opt_.smart, gd_vram_, use_clock_, cost, [&](const Checkpoint& c) { return c.share_until > use_clock_; });
   }
   if (it == ckpts_.end()) it = oldest(true);
   if (it == ckpts_.end()) {

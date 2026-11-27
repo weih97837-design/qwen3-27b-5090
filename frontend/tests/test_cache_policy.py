@@ -54,9 +54,10 @@ def test_pick_agrees_with_the_engine(cli):
     queries, expect = [], []
     for _ in range(600):
         p = cp.SmartParams(t0_us=rng.choice([54.0, 40.0]), k_us=rng.choice([0.31, 0.0, 1.2]),
-                           superseded_factor=rng.choice([0.25, 0.0, 1.0]), junction_factor=rng.choice([2.0, 1.0, 4.0]))
+                           superseded_factor=rng.choice([0.25, 0.0, 1.0]), junction_factor=rng.choice([2.0, 1.0, 4.0]),
+                           hit_weight=rng.choice([1.0, 0.0, 0.5]))
         cands = _rand_cands(rng, rng.randint(0, 9))
-        lines = [f"pick {p.t0_us!r} {p.k_us!r} {p.superseded_factor!r} {p.junction_factor!r} {len(cands)}"]
+        lines = [f"pick {p.t0_us!r} {p.k_us!r} {p.superseded_factor!r} {p.junction_factor!r} {p.hit_weight!r} {len(cands)}"]
         lines += [f"{c.depth!r} {c.parent_depth!r} {c.bytes!r} {c.hits} {int(c.junction)} {int(c.superseded)} {int(c.leaf)} "
                   f"{int(c.young)} {c.stamp!r} {c.age_key!r}" for c in cands]
         queries.append("\n".join(lines))

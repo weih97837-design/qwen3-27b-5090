@@ -1356,10 +1356,8 @@ void Model::spill_enforce_ram() {
     auto victim = spill_.end();
     bool victim_sup_durable = false;
     if (opt_.cache_smart) {  // CACHE_POLICY=smart (retention.h smart_ram_victim): a superseded victim is written like any other
-      SmartPick pk;
-      victim = smart_ram_victim(spill_, ckpts_, opt_.smart, gd_ram_, ret_now_s(), [&](const Spilled& s) { return spill_freed(s); },
-                                [&](uint64_t id) { return spill_superseded(id); }, &pk);
-      if (victim != spill_.end()) gd_ram_.evicted(pk, use_clock_);
+      victim = smart_ram_victim(spill_, ckpts_, opt_.smart, gd_ram_, ret_now_s(), use_clock_, [&](const Spilled& s) { return spill_freed(s); },
+                                [&](uint64_t id) { return spill_superseded(id); });
     } else {
       std::vector<VictimCand> cand[2];  // [0] the idle backups, [1] the sole copies
       std::vector<std::map<uint64_t, Spilled>::iterator> its[2];

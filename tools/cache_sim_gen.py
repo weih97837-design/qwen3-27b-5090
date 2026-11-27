@@ -12,6 +12,7 @@ exactly as the real chained hashes do. The workload (all knobs are options):
   * each request of an agent is a pure continuation of its conversation (prompt = the previous prompt + output + a new message), or with
     probability --diverge it leaves the conversation at a point 9-40K tokens in (a sub-task / a re-rendered history: the shared
     prefix, then new text) and that branch becomes the conversation (with probability --return it goes back to the old one next time);
+  * --churn: a request may start a new agent id in its agent's slot (the old id never returns: one-shot and dormant agents);
   * arrivals: each agent sends its next request --gap-s (median, log-normal) after its previous one ended; the request lasts its
     prefill (the t0 / k model) plus its output at --decode-tps.
 
@@ -43,6 +44,7 @@ class Gen:
         self.hist = collections.deque()
         self.hist_blocks = collections.Counter()
         self.n = 0
+        self.churned = 0
 
     def blocks(self, n):
         return [f"{self.rng.getrandbits(64):016x}" for _ in range(n)]
@@ -88,7 +90,12 @@ class Gen:
             div = None
             if ag["old"] is not None and rng.random() < a.ret:
                 conv, ag["old"] = ag["old"], None
-            if len(conv) + msg > ag["limit"]:  # a new conversation from the system prompt
+            if rng.random() < a.churn:  # agent churn: this slot is taken over by a new agent id (a new conversation)
+                self.churned += 1
+                ag["name"] = f"{'heavy' if ag['heavy'] else 'agent'}{i:03d}-{self.churned}"
+                ag["old"] = None
+                conv = list(ag["sys"]) or self.blocks(rng.randint(2, 8) * 4)
+            elif len(conv) + msg > ag["limit"]:  # a new conversation from the system prompt
                 conv = list(ag["sys"]) or self.blocks(rng.randint(2, 8) * 4)
             elif rng.random() < diverge and len(conv) * BLOCK > a.div_min + BLOCK:
                 k = rng.randint(a.div_min, min(a.div_max, len(conv) * BLOCK - BLOCK)) // BLOCK
@@ -139,6 +146,8 @@ def main(argv=None):
     ap.add_argument("--light-gap-factor", type=float, default=4.0)
     ap.add_argument("--decode-tps", type=float, default=60.0)
     ap.add_argument("--prefill-share", type=float, default=1.0)
+    ap.add_argument("--churn", type=float, default=0.0, help="chance that a request starts a new agent id in its slot (one-shot / "
+                    "dormant agents: the old id never comes back)")
     a = ap.parse_args(argv)
     if a.workload == "diverging":
         a.heavy, a.diverge = max(a.heavy, 0.6), max(a.diverge, 0.35)

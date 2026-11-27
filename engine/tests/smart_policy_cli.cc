@@ -1,6 +1,6 @@
 // A small driver of the CACHE_POLICY=smart functions of src/retention.h, for frontend/tests/test_cache_policy.py (the Python and C++
 // victim orders must agree). Built by that test with g++ (skipped without one). Input on stdin, one query per block:
-//   pick <t0_us> <k_us> <superseded_factor> <junction_factor> <n>
+//   pick <t0_us> <k_us> <superseded_factor> <junction_factor> <hit_weight> <n>
 //     n lines: depth parent_depth bytes hits junction superseded leaf young stamp age_key
 //   -> "pick <idx> <priority %.17g> <reason> <young_skipped>"
 //   chain <n>
@@ -47,7 +47,7 @@ int main() {
     if (cmd == "pick") {
       SmartParams p;
       size_t n = 0;
-      std::cin >> p.t0_us >> p.k_us >> p.superseded_factor >> p.junction_factor >> n;
+      std::cin >> p.t0_us >> p.k_us >> p.superseded_factor >> p.junction_factor >> p.hit_weight >> n;
       std::vector<SmartCand> v(n);
       for (auto& c : v) {
         int j, s, l, y;
@@ -94,7 +94,7 @@ int main() {
       }
       std::vector<Ck> ck;
       GdTier gd;
-      auto it = smart_ram_victim(spill, ck, p, gd, now, [](const Ent& e) { return e.freed; },
+      auto it = smart_ram_victim(spill, ck, p, gd, now, 0, [](const Ent& e) { return e.freed; },
                                  [&](uint64_t id) { return spill.at(id).sup; });
       std::printf("ram %lld\n", it == spill.end() ? -1LL : (long long)it->first);
     }
