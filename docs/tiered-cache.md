@@ -82,6 +82,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `SPILL_UNUSED_TTL_S` | `0` | 設為正數時：entry 從建立（進 RAM）或寫入 SSD 起，這麼多秒都沒有被命中，就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠（一次性 agent 不該佔著快取）。有命中過的 entry 照原規則；共用的短前綴（≤ 16,384 token）、閒置備份、還原中的 entry 不受影響。`0`（預設）：關閉，不會因為沒被命中而丟棄。計入計數器 `expired`（`q27:tier_expired`） |
 | `SPILL_SSD_WARM_ONLY` | `0` | `1`：（只在 SSD 層開啟時有作用）RAM → SSD 時，從未命中、且其 agent 也沒有任何命中的 entry（「未證明」）不寫入：沒有明確 id 的 `auto:` agent 直接丟棄，有明確 id 的只能在試用額度內寫入。`0`（預設）：全部照常寫入。計入 `not_written`（`q27:tier_not_written`） |
 | `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟且 `SPILL_SSD_WARM_ONLY=1` 時有作用）所有「未證明」entry 在 SSD 上合計最多佔用的容量（邏輯 GiB）；滿了先丟最舊的未證明 entry。warm agent 的 entry 不計入 |
+| `CACHE_POLICY` | `legacy` | 保留策略：`legacy`（預設，本表的 `SPILL_*` 規則）或 `smart`（價值導向；`CACHE_PREFILL_T0_US`、`CACHE_PREFILL_K_US`、`CACHE_SUPERSEDED_FACTOR`、`CACHE_JUNCTION_FACTOR`、`CACHE_HIT_WEIGHT`、`CACHE_MIN_RESIDENT_S` 為其常數）。見「CACHE_POLICY=smart」 |
 | `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
 | `VRAM_BACKUP_VICTIMS` | `8` | 閒置備份只複製「下一批會被逐出」的前 N 個 checkpoint（`0`：全部）。只能用環境變數設定 |
@@ -347,6 +348,8 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 
 ## 保留策略（價值導向逐出）
 
+（本節是 `CACHE_POLICY=legacy`，即預設的規則；另一個選項見下一節「CACHE_POLICY=smart」。）
+
 實測（v0.3.1，無去重）：RAM 層 64 GiB 全滿、175 筆；SSD 200 GiB 全滿、624 筆（平均約 320 MB，一半是約 150–190 MiB 的遞迴狀態）；962 筆溢出到 RAM、只有
 45 筆被還原（< 5%）。快取留住的大多是不會再用的 entry。因此 RAM 與 SSD 兩層用**同一條**逐出規則（實作：`engine/src/retention.h`、`chunk_store.h` 的
 `pick_victim` 給引擎的 RAM 層；`frontend/tiercache.py` 的 `_pick_victim` 給 SSD 層，兩者互相對照測試）。victim 是下列順序的最小值：
@@ -402,6 +405,148 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 **狀態／UI**：`/stats` 的 tiers 區塊每層有重用過／從未重用／被取代的筆數與位元組（`ram_reused_*`、`ram_never_*`、`ram_superseded_*`、`disk_*`），重用率
 `ram_reuse_rate` = 從 RAM 還原／溢出數、`ssd_reuse_rate` = 從 SSD 還原／寫出數（引擎計數器 `restored_ram`、`restored_disk`）；`agents` 區塊的 `ram_bytes`、`ssd_bytes`
 （及 `ram_entries`、`ssd_entries`）有值，/ui 的 Agents 表與分層快取面板顯示。
+
+## CACHE_POLICY=smart（價值導向保留，預設關閉）
+
+`CACHE_POLICY=legacy`（預設）時，上一節的規則完全不變（引擎與 frontend 的 legacy 程式路徑一行都沒有改動行為）。`CACHE_POLICY=smart` 改用一條以「還原能省下多少 prefill 秒數」為準的
+GreedyDual 順序（綜合 SGLang 的 StateCost、Marconi 的效用與 vLLM／TRT-LLM 的「尾端先」），套用在 **RAM 層**（引擎 `spill_enforce_ram`）、**SSD 層**（`frontend/tiercache.py`）與
+**VRAM 檢查點的淘汰**（`Model::evict_checkpoint`）。在引擎啟動時讀取（與 `SPILL_FAIR_AGENTS` 一樣，`capi.cc`），frontend 的 `TierPolicy.from_env` 也讀同一個變數。
+其他值（例如 `lru`）：引擎啟動失敗、frontend 拋 `ValueError`（設定錯誤要看得到）；設定頁與 `launch.py` 只接受 `legacy`／`smart`。
+
+**演算法**（`engine/src/retention.h` 的 `smart_pick`、`GdTier`、`chain_info`；`frontend/cache_policy.py` 是同一份的 Python 版，`frontend/tests/test_cache_policy.py` 用 g++ 編出
+`engine/tests/smart_policy_cli.cc`，在隨機輸入上比對兩邊挑出的 victim 與鏈結資訊）：
+
+- **鏈**：沿用既有的 256 token 串接雜湊（`block_hashes`）。e 的 **parent** = 所有看得到的 entry（VRAM 池 + RAM + SSD；VRAM 的淘汰只看池內）中，token 是 e 的嚴格前綴、且最深的那個；沒有則深度 0。
+  **葉**（leaf）= 在**同一層**裡沒有更深的同鏈 entry。**junction** = 分岔點（延伸它的 entry 不都在最深者那條鏈上）或延伸它的 entry 屬於別的 agent（≥ 2 個 agent 共用）。
+- **gain(e)** = 還原 e 而不是 parent 省下的 prefill 秒數：T(a, b) = t0·(b − a) + (k/2000)·(b² − a²) 微秒，a = parent 深度、b = e 的深度。
+- **value(e)** = gain / GiB(e) × (1 + `CACHE_HIT_WEIGHT`·hits) × (`CACHE_JUNCTION_FACTOR` 若為 junction) × (`CACHE_SUPERSEDED_FACTOR` 若被取代)。
+  GiB(e) = 該層淘汰 e 實際釋放的位元組：RAM 為 `spill_freed`（tail + 狀態 + 只有它引用的 chunk）；SSD 為 `unique_disk_bytes`（manifest + 只有它引用的 chunk 檔；舊引擎用檔案大小）；
+  VRAM 為只有它引用的頁（`pool_.refs(p) == 1`，正在執行的序列也持有的頁不算），要的是狀態槽時為一個槽的大小。下限 1 MiB（釋放 0 位元組者不會除以 0，也幾乎不會被選）。
+- **priority(e)** = stamp(e) + value(e)；stamp(e) = 該層水位 L 在 **e 最後一次使用時**的值（只有實際被命中／存下的那個 entry 更新，祖先不更新；以引擎的 `use_clock_`／`last_use` 為時鐘）。
+  每次淘汰後 L = max(L, victim 的 priority)（GreedyDual 老化；取 max 是因為 gain 可能因新 parent 出現而變小）。
+- **victim** = 非新進、且為葉的 entry 中 priority 最小者；沒有葉時才在非新進的非葉中選（計為 non_leaf）；全部都是新進時取最舊的（計為 young）。同值時較舊者先。
+  **每次挑選都重算**（淘汰淺的 entry 會讓延伸它的 entry 的 parent 變淺、gain 變大）：引擎與 frontend 都在每個 victim 之前重建候選。
+- **新進保護**：在該層不到 `CACHE_MIN_RESIDENT_S`（預設 300 秒）的 entry 不當 victim（RAM：`Spilled::born`；SSD：寫入時間），避免剛降級的大 entry 立刻又成為下一個 victim。
+  VRAM 不用（頁在幾秒內就輪替）；VRAM 改為保護 sibling-share 檢查點（為等待中的請求規劃的那個）。
+- **被取代（superseded）不再丟棄**：延續中的對話的舊 tip 保留 `CACHE_SUPERSEDED_FACTOR`（0.25）的價值，像其他 entry 一樣**溢出到下一層**。
+  具體：`spill_subsumed` 與 `spill_checkpoint` 在 smart 下只把「完全相同」的副本當成可省略（legacy 會把被更深者涵蓋、> 16K 的 checkpoint 直接丟掉不溢出，並在溢出深的時刪掉淺的）；
+  RAM→SSD（引擎與 tick）不再因 `superseded_durable` 而丟棄；`flush()` 也照寫。
+- **沒有**依 agent 的步驟、冷 agent 步驟、「用量最多者先」（`SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_COLD_AFTER_S` 在 smart 下不作用）。
+- **SSD 准入**取代 `SPILL_SSD_WARM_ONLY`／`SPILL_PROBATION_GIB`（smart 下不作用）：entry 只有在它在 SSD 的 priority（stamp 取 SSD 水位在它最後使用時的值、位元組取它寫入時新增的
+  `new_disk_bytes`）**高於 SSD 目前的水位 L** 時才寫入（低於 L 就會是下一個 victim）；SSD 還沒淘汰過（L = 0）時一律寫入。tick 在寫入前檢查；引擎在 RAM 滿時自己寫出的 entry，
+  在 tick 第一次看到它在 SSD 時檢查，不合格就刪除。計數器 `ssd_not_admitted`。`SPILL_SSD_MIN_TOKENS` 與規則 A（`SPILL_UNUSED_TTL_S`）照舊。
+- 閒置備份（VRAM 還有原件）仍然先於唯一副本被丟（與 `choose_victim` 相同的類別規則，含「4 倍」例外）；丟備份不移動 RAM 水位（沒有損失）。
+
+**常數**（都可用環境變數調整；`compose.yaml`、`scripts/windows/settings.example.ini`、`docs/configuration.md` 有列出）：
+
+| 變數 | 預設 | 意義 |
+|---|---|---|
+| `CACHE_PREFILL_T0_US` | 54 | 深度 0 時每 token 的 prefill 微秒數 |
+| `CACHE_PREFILL_K_US` | 0.31 | 每 1,000 token 深度、每 token 增加的微秒數（注意單位：**每 1,000 token 深度**；「每 token 深度 0.31 µs」會差 1000 倍） |
+| `CACHE_SUPERSEDED_FACTOR` | 0.25 | 被取代者的價值倍數 |
+| `CACHE_JUNCTION_FACTOR` | 2 | 分岔點／跨 agent 共用前綴的價值倍數 |
+| `CACHE_HIT_WEIGHT` | 1 | value × (1 + 此值 × hits)；1 即原始公式 |
+| `CACHE_MIN_RESIDENT_S` | 300 | RAM／SSD 的新進保護秒數 |
+
+t0、k 取自實機 log（RTX 5090、DFlash2、NVFP4 KV）：30K prompt（平均深度 15K）約 17,000 tok/s = 58.7 µs/token，125K prompt（平均深度 62.5K）約 13,600 tok/s = 73.4 µs/token
+⇒ k = 14.7 µs / 47.5K = 0.31 µs 每 1K、t0 = 54 µs。排程器已在量 prefill 速度（`worker.py` 的 `measure_prefill`）；**自動擬合尚未接上**（`retention.h` `SmartParams` 有 TODO，只需填這兩個欄位）。
+
+**hits 的注意事項**：引擎的 hits 是「這條對話鏈」被重用的次數（`prefix_begin` 的命中 +1，之後存下的每個更深 checkpoint 都繼承，> 16K 時），不會衰減。所以長對話的 tip 帶著它的回合數，
+(1 + hits) 讓它在結束很久之後仍幾乎不會被淘汰，並推高水位 L（進而讓 SSD 准入拒收更多）。模擬器上 `CACHE_HIT_WEIGHT=0` 明顯較好（見下表）；預設仍是原始公式（1），請先在自己的軌跡上比較。
+
+**計數器**（狀態頁的分層快取面板、`/stats` tiers 區塊的 `cache_policy`、`cache_smart`、`ssd_not_admitted`，以及 `/metrics`）：
+`q27:cache_policy{policy="legacy|smart"} 1`；smart 時每層（`ram`、`vram` 由引擎 `spill_stats` 的第 28–40 個值提供，`ssd` 由 tiercache）
+`q27:cache_evictions_total{tier,reason="leaf|non_leaf|young"}`、`q27:cache_young_skipped_total{tier}`（有新進 entry 被略過的挑選次數）、`q27:cache_victim_priority_mean{tier}`、
+`q27:cache_watermark{tier}`，以及 `q27:cache_ssd_not_admitted_total`。
+
+**與 legacy 的差別與原因**（實測問題：27 小時 91% 命中，但只供應理想值的 95%；miss 集中在 50–126K 的長 prompt：純延續卻 cached=0，以及與先前共用 9–40K 前綴後分岔的請求）：
+
+1. legacy 的 RAM／SSD victim 先從「用量最大的 agent」選，正好是長上下文的重 agent（實機把 `SPILL_FAIR_AGENTS=0` 後 RAM 重用率從 6% 升到約 30%）。smart 不看 agent。
+2. legacy 先淘汰「被取代」的淺 checkpoint，在 VRAM 還**不溢出直接丟**；這與 vLLM／SGLang／TRT-LLM 的尾端先相反，請求在鏈中間分岔時就沒得用。smart 保留它（價值打折）並溢出。
+3. legacy 依 agent 位元組挑 RAM victim，可能把剛溢出的 entry 立刻趕走；smart 有新進保護。
+4. legacy 的 warm agent 旗標是黏著的；smart 用准入規則取代。
+5. legacy 的 VRAM 檢查點頁是純 LRU；smart 依同一個 priority，且只在「只有它持有」的頁上計價（正在執行序列的頁不會被動到：淘汰檢查點只是減引用）。
+
+**模擬（翻轉預設前的驗證方式）**：`tools/cache_sim.py`（說明與近似寫在檔案開頭；`docs/request-trace.md`「模擬器」）重播 `REQUEST_TRACE` 軌跡，比較
+`legacy`（含 `legacy-nofair`）、`smart`、`lru`、`sglang_statecost`、`marconi_utility`（依公式重寫，未複製 Marconi 的 CC BY-NC 程式碼）與 `ideal`：
+
+```
+python tools/cache_sim.py D:\q27-trace\trace-*.jsonl --policy legacy,legacy-nofair,smart,lru,sglang_statecost,marconi_utility,ideal
+set CACHE_HIT_WEIGHT=0 & python tools/cache_sim.py D:\q27-trace\trace-*.jsonl --policy smart      (Windows；Linux：CACHE_HIT_WEIGHT=0 python ...)
+python tools/cache_sim_gen.py synth.jsonl --workload diverging --churn 0.08                        (合成軌跡)
+```
+
+報告的欄位：missed =（reusable − cached）/ reusable、recomputed（重算的 token）、> 16K prompt 完全沒命中的比例、RAM／SSD 還原數、溢出數、SSD 寫入數、每請求 VRAM 淘汰數、
+重用率、浪費的 prefill 秒數（同一個 t0／k 模型）。`--smart-admit`、`--smart-variant`（nohits、nobytes、nojunction、nosup、noleaf）只在模擬器裡，用來拆解各項的貢獻。
+注意 reusable 只看最近 64 段歷史，所以 cached 可以超過 reusable（命中更舊的內容）；**recomputed 才是總量**，missed 是相對於 reusable 的指標，兩者要一起看。
+
+**合成軌跡上的結果**（`tools/cache_sim_gen.py`；預設容量 RAM 64 GiB、SSD 200 GiB、VRAM 8,207 頁、43 槽；legacy = 今日預設 `SPILL_FAIR_AGENTS=1`、`SPILL_COLD_FIRST=1`）：
+
+*mixed（9,000 請求、60 agent、75% 重 agent、13% 分岔、22 小時）*
+
+| 策略 | missed | recomputed（M token） | >16K 零命中 | RAM 還原 | SSD 還原 | 溢出／請求 | VRAM 淘汰／請求 | SSD 拒收 | 浪費的 prefill 秒 |
+|---|---|---|---|---|---|---|---|---|---|
+| legacy | 5.83% | 39.8 | 0.1% | 4828 | 1932 | 1.36 | 3.77 | 0 | 978 |
+| legacy-nofair | 8.83% | 52.1 | 0.1% | 3544 | 2908 | 1.51 | 4.06 | 0 | 1,480 |
+| smart | 3.23% | 42.5 | 0.1% | 5103 | 2197 | 3.88 | 3.88 | 19601 | 541 |
+| smart w=0 | 1.06% | 24.6 | 0.1% | 4606 | 3489 | 3.55 | 3.55 | 10841 | 177 |
+| lru | 1.58% | 27.1 | 0.3% | 4963 | 2627 | 3.51 | 3.51 | 0 | 258 |
+| sglang_statecost | 0.89% | 29.4 | 0.1% | 2954 | 5292 | 3.68 | 3.68 | 0 | 149 |
+| marconi_utility | 1.03% | 27.7 | 0.1% | 3353 | 4449 | 3.55 | 3.55 | 0 | 171 |
+| ideal | 0.30% | 20.3 | 0.1% | 0 | 0 | 0.00 | 0.00 | 0 | 50 |
+
+*mixed + agent churn（--churn 0.08：一次性／休眠 agent）*
+
+| 策略 | missed | recomputed（M token） | >16K 零命中 | RAM 還原 | SSD 還原 | 溢出／請求 | VRAM 淘汰／請求 | SSD 拒收 | 浪費的 prefill 秒 |
+|---|---|---|---|---|---|---|---|---|---|
+| legacy | 9.16% | 54.2 | 0.2% | 3321 | 1851 | 1.11 | 3.74 | 0 | 1,637 |
+| legacy-nofair | 6.69% | 40.8 | 0.2% | 3417 | 1872 | 1.14 | 3.70 | 0 | 1,151 |
+| smart | 1.68% | 30.4 | 0.2% | 5182 | 2020 | 3.56 | 3.56 | 13515 | 287 |
+| smart w=0 | 0.60% | 21.7 | 0.1% | 4666 | 2994 | 3.41 | 3.41 | 9741 | 104 |
+| lru | 1.01% | 23.4 | 0.3% | 5282 | 2126 | 3.41 | 3.41 | 0 | 169 |
+| sglang_statecost | 0.42% | 24.4 | 0.1% | 2774 | 4822 | 3.46 | 3.46 | 0 | 73 |
+| marconi_utility | 0.67% | 26.7 | 0.1% | 2569 | 4756 | 3.49 | 3.49 | 0 | 117 |
+| ideal | 0.25% | 19.8 | 0.1% | 0 | 0 | 0.00 | 0.00 | 0 | 42 |
+
+*純延續（3,000 請求、30 agent，預設容量）*
+
+| 策略 | missed | recomputed（M token） | >16K 零命中 | RAM 還原 | SSD 還原 | 溢出／請求 | VRAM 淘汰／請求 | SSD 拒收 | 浪費的 prefill 秒 |
+|---|---|---|---|---|---|---|---|---|---|
+| legacy | 0.21% | 7.9 | 0.8% | 606 | 436 | 1.17 | 2.86 | 0 | 11 |
+| legacy-nofair | 0.95% | 9.0 | 2.0% | 401 | 593 | 1.24 | 2.92 | 0 | 52 |
+| smart | 0.81% | 10.1 | 2.6% | 1656 | 423 | 3.39 | 3.39 | 4808 | 45 |
+| smart w=0 | 0.03% | 7.7 | 0.7% | 1669 | 476 | 3.21 | 3.21 | 3529 | 2 |
+| lru | 0.00% | 7.6 | 0.7% | 1196 | 119 | 2.91 | 2.91 | 0 | 0 |
+| sglang_statecost | 0.07% | 8.2 | 1.1% | 1319 | 971 | 3.32 | 3.32 | 0 | 4 |
+| marconi_utility | 0.00% | 7.9 | 0.9% | 1104 | 685 | 3.09 | 3.09 | 0 | 0 |
+| ideal | 0.00% | 7.6 | 0.6% | 0 | 0 | 0.00 | 0.00 | 0 | 0 |
+
+*純延續、高壓力（RAM 8 GiB、SSD 20 GiB、VRAM 3,000 頁）*
+
+| 策略 | missed | recomputed（M token） | >16K 零命中 | RAM 還原 | SSD 還原 | 溢出／請求 | VRAM 淘汰／請求 | SSD 拒收 | 浪費的 prefill 秒 |
+|---|---|---|---|---|---|---|---|---|---|
+| legacy | 52.40% | 61.0 | 31.5% | 706 | 837 | 2.29 | 4.64 | 0 | 3,269 |
+| legacy-nofair | 11.90% | 22.7 | 20.0% | 468 | 1148 | 2.54 | 4.16 | 0 | 656 |
+| smart | 12.87% | 25.5 | 21.9% | 666 | 1022 | 4.04 | 4.04 | 5300 | 752 |
+| smart w=0 | 11.23% | 24.0 | 19.4% | 697 | 1080 | 3.98 | 3.98 | 5124 | 661 |
+| lru | 16.63% | 29.1 | 26.3% | 651 | 922 | 3.98 | 3.98 | 0 | 980 |
+| sglang_statecost | 16.93% | 28.9 | 21.8% | 330 | 1377 | 4.84 | 4.84 | 0 | 1,003 |
+| marconi_utility | 13.47% | 26.0 | 22.0% | 493 | 1172 | 4.10 | 4.10 | 0 | 793 |
+| ideal | 0.00% | 7.6 | 0.6% | 0 | 0 | 0.00 | 0.00 | 0 | 0 |
+
+解讀：
+
+- 有分岔與重 agent 的負載：smart 的 missed 與浪費的 prefill 秒數都低於今日預設的 legacy（5.83% → 3.23%；有 churn 時 9.16% → 1.68%）。但沒有 churn 時，smart（`CACHE_HIT_WEIGHT=1`）的 **recomputed** 反而比 legacy 多（42.5M 對 39.8M）：它多命中 reusable 之內的部分，卻失去比最近 64 段歷史更舊的命中。
+- `CACHE_HIT_WEIGHT=0` 在四組資料都最好或接近最好（mixed：24.6M，ideal 20.3M 以外最低）。拆解（`--smart-variant`，mixed，recomputed）：原式 42.5M、nohits 24.6M、noleaf 32.6M、nohits+noleaf 23.6M、nobytes 37.2M、nojunction 42.0M、nosup 49.0M。hits 項是最大的損失，葉優先是第二大；被取代因子與 junction 有幫助。SSD 准入拒收（19,601 筆）大多是 hits 推高水位的副作用（w=0 時 10,841 筆，且整體不比「一律寫入」差）。
+- 純延續、沒有任何淘汰時，各策略完全相同（`tools/tests/test_cache_sim.py`）。預設容量（有 VRAM 壓力）下 legacy 0.21% 優於 smart w=1 的 0.81%，w=0 為 0.03%。高壓力時今日預設的 legacy 很差（52%），`legacy-nofair` 與 smart 相近。
+- 模擬器的 legacy 只有在加了 churn（一次性／休眠 agent）後，fair 開／關的方向才與實機一致（實機：關掉後 RAM 重用率 6% → 30%）；RAM 重用率（30–40%）仍高於實機的 6%。
+
+**模擬器沒有計入的**：smart 溢出的次數約是 legacy 的 2.5–3 倍（legacy 把被取代者直接丟掉），每次溢出都要 D2H 複製並佔用一個約 190 MiB 的狀態；模擬器不計複製時間與頻寬，
+也不模擬閒置備份、RAM 保留時間的 tick、TTL、重啟、還原的頻寬與 worth-loading 判斷。合成軌跡的 legacy 也沒有對準實機（RAM 重用率 30–40%，實機 6%），所以表中 smart 與 legacy 的差距
+只能當方向參考，**要在實機的軌跡上重跑**再決定是否翻轉預設。
+
+**實機測試**：`test.cmd --scenarios k`（或 `python scripts/tiered_cache_test.py --scenarios k`）在環境裡有 `CACHE_POLICY=smart` 時跑 smart 版的情境 k
+（driver 會為 k 設 `CACHE_MIN_RESIDENT_S=0`，否則情境裡的 entry 都只有幾秒、全部算新進）；預設的 `test.cmd` 仍是 legacy。Windows：`set CACHE_POLICY=smart` 後執行 `test.cmd --scenarios k`。
 
 ## WSL2 注意事項
 
@@ -476,7 +621,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 | h RAM 去重 | 4 段共用 6 個 chunk（24576 token）前綴的對話，全部溢出到 RAM | 實體 < 0.6 × 邏輯、`chunk_hits > 0`；還原後 token 與參考相同 |
 | i RAM 去重＋pinned＋async | 同 h，加 `SPILL_PINNED_GIB`、`SPILL_ASYNC_IO`、`SPILL_ASYNC_PROMOTE`，全部經 `spill_match` / `spill_restore_*` 還原 | 同 h |
 | j SSD 去重 | 4 段共用前綴的對話全部 `spill_export` 到 `SPILL_DIR`（兩個行程）：第一個行程寫出，第二個行程（新的 Engine、同一個目錄）`spill_import`、`spill_sweep`，丟棄一筆後從檔案還原其他筆（兩筆走 `prefix_begin` 的同步 promote，一筆走 `spill_restore_begin`） | `spill_disk_usage` 實體 < 0.6 × 邏輯、`.kvc` 檔數少於 chunk 參照數；重啟後仍然成立；丟棄釋放的位元組恰為 `unique_disk_bytes` 且共用的 `.kvc` 仍在；還原的 token 與參考相同；最後一筆還原後沒有殘留檔案 |
-| k 保留策略 | 兩個 agent（`set_owner`）：一個有很多大的 entry（含被取代與從未重用者），一個只有幾個；RAM 層壓力（小的 `SPILL_RAM_GIB`）下 | 小 agent 的 entry 全數留在 RAM、大 agent 被逐出的是被取代／從未重用的；`spill_meta` 的 owner／hits／superseded 與 `spill_agents` 位元組一致；還原後 token 與參考相同 |
+| k 保留策略 | 兩個 agent（`set_owner`）：一個有很多大的 entry（含被取代與從未重用者），一個只有幾個；RAM 層壓力（小的 `SPILL_RAM_GIB`）下 | 小 agent 的 entry 全數留在 RAM、大 agent 被逐出的是被取代／從未重用的；`spill_meta` 的 owner／hits／superseded 與 `spill_agents` 位元組一致；還原後 token 與參考相同。環境有 `CACHE_POLICY=smart` 時改查 smart 的規則（見「CACHE_POLICY=smart」最後一段） |
 | l 影片輸入 | 文字前綴＋`bench/vision/colors.mp4`（循環取樣到約 9,000 token）＋問題，共約 12K token：A 問題一，prefill 存下 `Scheduler.checkpoints` 規劃的影片結尾檢查點與問題前最後一個 4096 倍數處的檢查點；B 同一支影片、問題二，從影片結尾檢查點續起（`cached` 不小於影片結尾向下對齊 64 的位置，影片不再解碼與編碼，最多重算最後一對）；C 的 prefill 把兩者逐出到 RAM；A 的續談從 RAM 還原（整支影片在快取前綴內）；RAM 的 entry 寫到 `SPILL_DIR`，B 的續談從檔案還原。需要視覺塔與 NVDEC，否則跳過；與其他情境一樣使用預設的 DSpine 草稿模型 | B 的 `cached` 不小於影片結尾（向下對齊 64）、`cache_stats.hits` 增加；`spilled`、`restored` 增加（RAM 與檔案各一次）；所有輸出 token 與關閉快取的參考完全相同（參考每次都重新解碼並編碼影片）。檢查用的檢查點計畫不留下 ≤ 64 token 的 chunk（`plan_final_chunk_ok`：生成提示詞起點的檢查點在此會讓最後一個 chunk 剛好 64 token，故被略過）；另有只供參考的 `ctl` 對照（見下）。分三個行程階段：參考（A 跑兩次）、tiered `ctl`（無計畫的 A、完整計畫的 A 與 B）、tiered `full`（實際檢查） |
 
 每個情境還會檢查續談是否從上一回合結束的位置開始（`cached` 等於 `pos`）。
