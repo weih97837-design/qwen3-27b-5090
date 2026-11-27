@@ -552,13 +552,23 @@ class Engine:
         return [ln.split("\t") for ln in buf.value.decode("utf-8", "replace").split("\n") if ln]
 
     def spill_meta(self):
-        """{entry id: {"owner", "hits", "superseded", "superseded_durable"}} of the spilled entries, or None with a library without retention."""
+        """{entry id: {"owner", "hits", "superseded", "superseded_durable"}} of the spilled entries, or None with a library without retention.
+        An engine started with CACHE_POLICY=smart adds "parent_pos" (tokens of the deepest retained strict prefix, 0: none), "desc_tiers"
+        (bits 1 VRAM, 2 RAM, 4 SSD: the tiers holding a deeper entry of its chain) and "junction" (a branch point or a prefix shared by
+        two agents): what frontend/tiercache.py's smart SSD priority needs (engine/src/retention.h ChainInfo)."""
         if not self.has_retention:
             return None
-        return {int(f[0]): {"owner": int(f[1]), "hits": int(f[2]), "superseded": f[3] == "1",
-                    # (an older library reports no durable flag: the plain one is then the best there is)
-                    "superseded_durable": (f[4] == "1") if len(f) >= 5 else f[3] == "1"}
-                for f in self._text(lib().q27_spill_meta, "q27_spill_meta") if len(f) >= 4}
+        out = {}
+        for f in self._text(lib().q27_spill_meta, "q27_spill_meta"):
+            if len(f) < 4:
+                continue
+            m = {"owner": int(f[1]), "hits": int(f[2]), "superseded": f[3] == "1",
+                 # (an older library reports no durable flag: the plain one is then the best there is)
+                 "superseded_durable": (f[4] == "1") if len(f) >= 5 else f[3] == "1"}
+            if len(f) >= 8:
+                m.update(parent_pos=int(f[5]), desc_tiers=int(f[6]), junction=f[7] == "1")
+            out[int(f[0])] = m
+        return out
 
     def spill_agents(self):
         """[{"owner", "ram_bytes", "ssd_bytes", "ram_entries", "ssd_entries"}] per agent with entries in a tier (bytes attributed
@@ -622,7 +632,7 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 28)(*([-1] * 28))  # (an older engine writes the first 20 and leaves the rest -1)
+        out = (ctypes.c_int64 * 41)(*([-1] * 41))  # (an older engine writes the first 20 / 28 and leaves the rest -1)
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
@@ -632,7 +642,13 @@ class Engine:
                 # is the same number), shared chunks resident, chunk hits / misses of spilled entries, logical - physical
                 "logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes",
                 # retention: restores of entries that were in memory / only on the SSD (the reuse rate of a tier)
-                "restored_ram", "restored_disk")
+                "restored_ram", "restored_disk",
+                # CACHE_POLICY (1 smart, 0 legacy) and the smart policy's counters of the RAM tier and the VRAM checkpoints (retention.h
+                # GdTier::stats: evictions of a leaf / a non-leaf / a young entry, picks that passed over a young one, mean victim priority
+                # and watermark x1000)
+                "cache_smart", *(f"{t}_smart_{k}" for t in ("ram", "vram") for k in (
+                    "evictions_leaf", "evictions_non_leaf", "evictions_young", "young_skipped", "victim_priority_mean_milli",
+                    "watermark_milli")))
         # An engine built before RAM dedup never writes the last six: absent, not a misleading 0 (callers use .get()).
         return {k: v for k, v in zip(keys, out) if v != -1}
 

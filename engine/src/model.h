@@ -58,6 +58,10 @@ struct Options {
   // this) are evicted before anything else (retention.h cold_agents). The frontend reads the same variables for the SSD.
   bool spill_cold_first = true;
   double spill_cold_after_s = 600;
+  // CACHE_POLICY=smart (retention.h "CACHE_POLICY=smart"; default false: legacy, every path as before): the RAM tier's victim
+  // (spill_enforce_ram), the pool checkpoint evict_checkpoint takes, and a deeper copy no longer subsumes a shallower one.
+  bool cache_smart = false;
+  SmartParams smart;  // CACHE_PREFILL_T0_US, CACHE_PREFILL_K_US, CACHE_SUPERSEDED_FACTOR, CACHE_JUNCTION_FACTOR, CACHE_MIN_RESIDENT_S
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
   // 3 FP8 weights on the device (VisionMode). Images of up to image_max_pixels; the image embeddings of a
   // request (up to image_tokens rows) live in pinned host memory.
@@ -212,7 +216,9 @@ class Model {
   void spill_export(uint64_t id, const std::string& path);
   void spill_drop(uint64_t id);
   uint64_t spill_import(const std::string& path);
-  static constexpr int kSpillStats = 28;
+  // out[28..40] (appended): CACHE_POLICY (0 legacy, 1 smart), then GdTier::stats of the RAM tier and of the VRAM checkpoints (6 each:
+  // evictions of a leaf / a non-leaf / a young entry, picks that passed over a young entry, mean victim priority x1000, watermark x1000).
+  static constexpr int kSpillStats = 41;
   void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
@@ -346,6 +352,7 @@ class Model {
   mutable uint64_t sup_key_ = ~uint64_t(0);
   uint64_t owner_next_ = 0, seq_owner_ = 0;  // set_owner; the running sequence's owner
   uint32_t seq_hits_ = 0;                    // reuse count inherited from the checkpoint it resumed from (retention.h inherited_hits)
+  GdTier gd_ram_, gd_vram_;                  // CACHE_POLICY=smart: the watermarks / stamps / counters of the RAM tier and the pool
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
   bool ckpt_covered(const Checkpoint& c) const;  // a deeper, usable checkpoint of the same chain is in the pool and c is long

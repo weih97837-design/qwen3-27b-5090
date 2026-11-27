@@ -510,14 +510,15 @@ int Model::spill_grow_pinned(int chunks) {
 // Keeps only the deepest checkpoint of a conversation: the checkpoints of one long prompt share most of their
 // pages, and spilling each would store those pages several times. Short checkpoints (up to kKeepShort tokens)
 // are only subsumed by an equal one, since a new conversation often starts from them.
+// CACHE_POLICY=smart: only an equal copy subsumes (a deeper one leaves the shallow one its own, reduced, value: retention.h).
 bool Model::spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const {
   for (const auto& o : ckpts_)
-    if (&o != &c && o.ids.size() > c.ids.size() && c.pos() > kKeepShort && covers(o.ids, o.ring, c.ids, c.ring))
+    if (!opt_.cache_smart && &o != &c && o.ids.size() > c.ids.size() && c.pos() > kKeepShort && covers(o.ids, o.ring, c.ids, c.ring))
       return true;
   for (const auto& kv : spill_) {
     const Spilled& s = kv.second;
     if (kv.first != ignore_id && covers(s.ids, s.ring, c.ids, c.ring) &&
-        (c.pos() > kKeepShort || s.ids.size() == c.ids.size()))
+        ((!opt_.cache_smart && c.pos() > kKeepShort) || s.ids.size() == c.ids.size()))
       return true;
   }
   return false;
@@ -552,7 +553,7 @@ void Model::spill_checkpoint(const Checkpoint& c) {
   for (auto it = spill_.begin(); it != spill_.end();) {
     auto next = std::next(it);
     const Spilled& e = it->second;
-    if (!e.busy && covers(c.ids, c.ring, e.ids, e.ring) && (e.pos() > kKeepShort || e.ids.size() == c.ids.size())) {
+    if (!e.busy && covers(c.ids, c.ring, e.ids, e.ring) && ((!opt_.cache_smart && e.pos() > kKeepShort) || e.ids.size() == c.ids.size())) {
       spill_erase(it, true);
       sstats_.subsumed++;
     }
@@ -1300,10 +1301,17 @@ std::map<uint64_t, double> Model::spill_use(bool ssd) const {
 
 std::string Model::spill_meta() const {
   spill_retention_refresh();
+  // CACHE_POLICY=smart: three more columns, parent_pos, desc_tiers, junction (retention.h ChainInfo), for the SSD tier's priority.
+  const std::vector<ChainInfo> smart_ci = opt_.cache_smart ? smart_spill_chains(spill_, ckpts_) : std::vector<ChainInfo>();
   std::ostringstream out;
+  size_t i = 0;
   for (const auto& kv : spill_) {
     out << kv.first << '\t' << kv.second.owner << '\t' << kv.second.hits << '\t' << (spill_superseded(kv.first) ? 1 : 0) << '\t'
-        << (spill_superseded(kv.first, true) ? 1 : 0) << '\n';
+        << (spill_superseded(kv.first, true) ? 1 : 0);
+    if (i < smart_ci.size())
+      out << '\t' << smart_ci[i].parent_depth << '\t' << int(smart_ci[i].desc_tiers) << '\t' << (smart_ci[i].junction() ? 1 : 0);
+    out << '\n';
+    i++;
   }
   return out.str();
 }
@@ -1347,7 +1355,12 @@ void Model::spill_enforce_ram() {
     // then superseded entries, never-hit before hit ones, and the old "frees the most / least recently used".
     auto victim = spill_.end();
     bool victim_sup_durable = false;
-    {
+    if (opt_.cache_smart) {  // CACHE_POLICY=smart (retention.h smart_ram_victim): a superseded victim is written like any other
+      SmartPick pk;
+      victim = smart_ram_victim(spill_, ckpts_, opt_.smart, gd_ram_, ret_now_s(), [&](const Spilled& s) { return spill_freed(s); },
+                                [&](uint64_t id) { return spill_superseded(id); }, &pk);
+      if (victim != spill_.end()) gd_ram_.evicted(pk, use_clock_);
+    } else {
       std::vector<VictimCand> cand[2];  // [0] the idle backups, [1] the sole copies
       std::vector<std::map<uint64_t, Spilled>::iterator> its[2];
       const std::map<uint64_t, double> use = opt_.spill_fair_agents ? spill_use(false) : std::map<uint64_t, double>();
@@ -1683,6 +1696,8 @@ void Model::spill_stats(int64_t* out, int n) const {
   out[20] = logical, out[21] = phys, out[22] = int64_t(spill_chunks_.size());
   out[23] = sstats_.chunk_hits, out[24] = sstats_.chunk_misses, out[25] = std::max<int64_t>(0, logical - phys);
   out[26] = sstats_.restored_ram, out[27] = sstats_.restored_disk;
+  out[28] = opt_.cache_smart ? 1 : 0;
+  gd_ram_.stats(out + 29), gd_vram_.stats(out + 35);
   for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 

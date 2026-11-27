@@ -661,7 +661,19 @@ bool Model::evict_checkpoint(bool for_slot) {
     }
     return it;
   };
-  auto it = oldest(false);
+  // CACHE_POLICY=smart (retention.h smart_vram_victim): among the same candidates (neither loading nor held) the minimum priority, the
+  // cost being the pages only it holds (the state slot when a slot is wanted); a sibling-share checkpoint is protected. Else legacy LRU.
+  auto it = ckpts_.end();
+  if (!opt_.cache_smart) {
+    it = oldest(false);
+  } else {
+    auto cost = [&](const Checkpoint& c) {
+      return for_slot ? double(ckpt_bytes_) : double(sole_pages(c.pages, pool_)) * double(kKvSlices) * double(kv_page_bytes_);
+    };
+    SmartPick pk;
+    it = smart_vram_victim(ckpts_, opt_.smart, gd_vram_, cost, [&](const Checkpoint& c) { return c.share_until > use_clock_; }, &pk);
+    if (it != ckpts_.end()) gd_vram_.evicted(pk, use_clock_);
+  }
   if (it == ckpts_.end()) it = oldest(true);
   if (it == ckpts_.end()) {
     for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c)
