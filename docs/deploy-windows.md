@@ -169,7 +169,7 @@ python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:808
 **情境 e（推測解碼）**：需要 DFlash2 草稿模型。`SPEC=none` 或草稿未下載時，該情境顯示 `SKIP`，這不是失敗。
 
 **`bench.cmd` 的注意事項**：
-- SSD 層預設關閉，但 bench 本來就要寫 SSD 檔案：腳本用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB`，設成 `0` 會直接失敗。`test.cmd` 同樣有 `--ssd-gib`（預設 10），SSD 情境（b、c、f、g、h、j、k、l）在 SSD 關閉時會直接失敗，不會默默通過。
+- SSD 層預設關閉，但 bench 本來就要寫 SSD 檔案：腳本用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB`，設成 `0` 會直接失敗。`test.cmd` 同樣有 `--ssd-gib`（預設 10），SSD 情境（b、c、f、g、h、i、j、k、l）在 SSD 關閉時會直接失敗，不會默默通過。
 - SSD 檔案放在 `%LOCALAPPDATA%\qwen3-27b-5090\kvcache\bench`；腳本會刪除該資料夾內 `entries\`、`chunks\` 子資料夾的檔案，請不要把它指向其他資料。
 - 每個尺寸都會建立兩個引擎，執行時間以分鐘計。耗時的實際數字**未驗證**。
 - 預設 `SPILL_RAM_GIB=40`（測試為 2），所以 bench 在 RAM 中保留的 checkpoint 可達 40 GiB。

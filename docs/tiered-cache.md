@@ -460,7 +460,7 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
 ```
 
-`tiered_cache_test.py` 有十二個情境（a–l），各自在獨立的行程中執行（環境變數在引擎建立時讀取）。SSD 情境（b、c、f、g、h、j、k、l）需要 SSD 層開啟：測試用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB` 與 `SPILL_DIR`；若設成 `0`，這些情境會直接失敗（不會在 SSD 關閉的情況下默默通過）。`tiered_cache_bench.py` 同樣有 `--ssd-gib`（預設 10）。下表是各情境：
+`tiered_cache_test.py` 有十二個情境（a–l），各自在獨立的行程中執行（環境變數在引擎建立時讀取）。SSD 情境（b、c、f、g、h、i、j、k、l）需要 SSD 層開啟：測試用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB` 與 `SPILL_DIR`；若設成 `0`，這些情境會直接失敗（不會在 SSD 關閉的情況下默默通過）。`tiered_cache_bench.py` 同樣有 `--ssd-gib`（預設 10）。下表是各情境：
 
 | 情境 | 強制走的路徑 | 檢查的計數器 |
 | --- | --- | --- |

@@ -81,7 +81,7 @@ conversations exceed the usable pool, so B's prefill evicts A's checkpoint. It p
     STATE_HOST_CACHE=1 docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py
     python scripts/tiered_cache_test.py --scenarios a,c --keep-dir /cache/kv/test
 
-The SSD tier is off by default in the server (SPILL_SSD_GIB=0). The scenarios that use it (b, c, f, g, h, j, k, l) are run with
+The SSD tier is off by default in the server (SPILL_SSD_GIB=0). The scenarios that use it (b, c, f, g, h, i, j, k, l) are run with
 SPILL_SSD_GIB=--ssd-gib (default 10) and SPILL_DIR set, and exit with FAIL when --ssd-gib is 0: they never pass with the SSD off.
 
 Native Windows package (no Docker, no torch): test.cmd runs this with the package's Python; the weights are where
@@ -166,7 +166,10 @@ L_VIDEO_TOKENS = 9000  # the video's tokens in the prompt at least (two chunks o
 L_MIN_PROMPT = 12288   # tokens of a prompt of scenario l at least (the video, the text before it and the question)
 L_QUESTIONS = ("What colors appear in the video, and in which order?", "At about which second does the color change first?")
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
-SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
+# k tests the per-agent step of the eviction order: SPILL_FAIR_AGENTS is off by default now, so it is asked for here, not left
+# to the engine's C++ default
+SCEN_ENV = {"k": {"SPILL_FAIR_AGENTS": "1"},
+            "f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
             "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"},
             "j": {"SPILL_ASYNC_PROMOTE": "1"},  # (prefix_begin still promotes synchronously; the delay-hit API is used for one entry)
             "i": {"SPILL_PINNED_GIB": "1", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1",
@@ -190,7 +193,7 @@ H_N = 4  # conversations that share the prefix
 # The scenarios that write to, read from or restart-import from the SSD tier (SPILL_DIR). The SSD tier is OFF by default
 # (SPILL_SSD_GIB=0: the server starts the engine with an empty SPILL_DIR), so these runs set SPILL_SSD_GIB (--ssd-gib, default 10) and
 # SPILL_DIR explicitly, and refuse to run when either is missing: a run with the SSD off would otherwise "pass" without touching the SSD.
-SSD_SCENARIOS = frozenset("bcfghjkl")
+SSD_SCENARIOS = frozenset("bcfghijkl")
 DEFAULT_SSD_GIB = 10.0
 
 
@@ -1351,7 +1354,7 @@ def main():
                     help="tokens per conversation (raised to the smallest length that evicts, unless --pool-tokens)")
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
     ap.add_argument("--ssd-gib", type=float, default=DEFAULT_SSD_GIB,
-                    help="SPILL_SSD_GIB of the tiered runs (default 10). The scenarios b, c, f, g, h, j, k, l use the SSD tier and fail "
+                    help="SPILL_SSD_GIB of the tiered runs (default 10). The scenarios b, c, f, g, h, i, j, k, l use the SSD tier and fail "
                          "when this is 0 (the server's own default is 0 = SSD off)")
     ap.add_argument("--pool-tokens", type=int,
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")

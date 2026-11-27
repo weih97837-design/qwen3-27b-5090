@@ -878,9 +878,9 @@ function drawSlots() {
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["擠出 spilled", "spilled"], ["載回 restored", "restored"], ["寫入 SSD written", "written"],
   ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["過期丟棄 expired", "expired"], ["未寫入 SSD not_written", "not_written"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
-// The SSD tier is off (SPILL_SSD_GIB=0, the default; or no SPILL_DIR): the tiers block says ssd_enabled false, or a cap of 0. An absent cap
-// (an older server) is not "off": the bar shows "X / –".
-const ssdOffOf = (t) => !!t && typeof t === "object" && (t.ssd_enabled === false || t.ssd_cap_bytes === 0);
+// The SSD tier is off (SPILL_SSD_GIB=0, the default; or no SPILL_DIR): the tiers block says ssd_enabled false, or (an older server without
+// that key) the cap is 0 or absent. No bar then, so nothing divides by a zero or missing cap.
+const ssdOffOf = (t) => !!t && typeof t === "object" && !t.error && (t.ssd_enabled === false || (t.ssd_enabled == null && !t.ssd_cap_bytes));
 const ssdOffText = (t) => `SSD 層：已關閉（${t && t.ssd_off_reason === "dir" ? "SPILL_DIR 為空" : "SPILL_SSD_GIB=0"}）`;
 const SSD_ONLY_COUNTERS = new Set(["written", "not_written"]);
 function tierCol(title, used, cap, note) {
@@ -1104,7 +1104,7 @@ const OPTS = [
 // apply with a restart; they change no plan of the pools. kind: num (0 or more), flag, path.
 const TIER_OPTS = [
   { key: "spill_ram_gib", label: "RAM 層", note: "SPILL_RAM_GIB", help: "存放 KV 池擠出的存檔點所用的主機 RAM。0 表示關閉分層快取。", kind: "num", unit: "GiB", step: "1" },
-  { key: "spill_ram_retention_s", label: "RAM 停留時間", note: "SPILL_RAM_RETENTION_S", help: "RAM 中的存檔點閒置多少秒後寫入 SSD（SSD 層關閉時：丟棄）。", kind: "num", unit: "s", step: "60" },
+  { key: "spill_ram_retention_s", label: "RAM 停留時間", note: "SPILL_RAM_RETENTION_S", help: "RAM 中的存檔點閒置多少秒後寫入 SSD（SSD 層關閉時不使用）。", kind: "num", unit: "s", step: "60" },
   { key: "spill_ssd_gib", label: "SSD 上限", note: "SPILL_SSD_GIB", help: "SSD 層最多存放的容量；最舊的檔案先刪除。0（預設）：SSD 層關閉，RAM 層滿時直接丟棄，不寫入磁碟；引擎重新啟動後 RAM／VRAM 快取是冷的。", kind: "num", unit: "GiB", step: "10" },
   { key: "spill_ssd_min_free_gib", label: "SSD 最小可用空間", note: "SPILL_SSD_MIN_FREE_GIB", help: "寫入後磁碟的可用空間不會低於此值。 只在 SSD 層開啟時有效。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_ssd_min_tokens", label: "SSD 最小 token 數", note: "SPILL_SSD_MIN_TOKENS", help: "短於此長度的存檔點會被丟棄，不寫入 SSD（重新計算和讀取一樣快）。0 表示全部寫入。 只在 SSD 層開啟時有效。", kind: "num", unit: "token", step: "1024" },

@@ -67,7 +67,8 @@ def test_require_ssd_fails_loudly_with_the_ssd_off():
 
 
 def test_the_ssd_scenarios_are_the_ones_that_use_spill_dir():
-    assert t.SSD_SCENARIOS == set("bcfghjkl") and not t.SSD_SCENARIOS & set("aeid")
+    assert t.SSD_SCENARIOS == set("bcfghijkl") and not t.SSD_SCENARIOS & set("ae") and "d" not in t.SSD_SCENARIOS  # (i runs scen_h: export_ram too)
+    assert t.SCEN_ENV["k"]["SPILL_FAIR_AGENTS"] == "1"
     assert t.SSD_SCENARIOS <= set(t.SCENARIOS) and t.DEFAULT_SSD_GIB == 10
 
 
