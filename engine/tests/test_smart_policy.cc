@@ -87,7 +87,7 @@ static void test_env_and_formula() {
     return it == env.end() ? nullptr : it->second.c_str();
   });
   CHECK(p.t0_us == 60 && p.k_us == 0.31 && p.superseded_factor == 0.25 && p.min_resident_s == 0 && p.junction_factor == 3.5);
-  CHECK(p.hit_weight == 0 && SmartParams().hit_weight == 1.0);
+  CHECK(p.hit_weight == 0 && SmartParams().hit_weight == 0.0);
   const SmartParams d;
   // The defaults give the measured speeds: 30K prompt ~17,000 tok/s, 125K ~13,600 tok/s.
   const double tps30 = 30000 / prefill_seconds(d, 0, 30000), tps125 = 125000 / prefill_seconds(d, 0, 125000);
@@ -137,7 +137,8 @@ static SmartCand cand(double depth, double parent, double gib, uint32_t hits = 0
 }
 
 static void test_value_and_pick() {
-  const SmartParams p;
+  SmartParams p;
+  p.hit_weight = 1.0;  // (the default is 0: hits ignored)
   // value: gain / GiB * (1 + hits) * junction * superseded
   SmartCand c = cand(60000, 30000, 1.0);
   const double base = smart_value(p, c);

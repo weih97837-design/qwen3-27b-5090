@@ -1124,7 +1124,7 @@ const TIER_OPTS = [
   { key: "spill_pinned_gib", label: "固定 RAM", note: "SPILL_PINNED_GIB", help: "固定的主機記憶體，複製更快；在 Windows 上會計入共用 GPU 記憶體。0 表示關閉。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_async_io", label: "非同步複製", note: "SPILL_ASYNC_IO", help: "KV 複製使用獨立的 stream；請搭配固定 RAM 使用。請先用 scripts/tiered_cache_test.py 測試。", kind: "flag" },
   { key: "spill_async_promote", label: "延遲命中", note: "SPILL_ASYNC_PROMOTE", help: "命中已擠出存檔點的請求會等它載回，其他請求照常執行。", kind: "flag" },
-  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。預設開啟。關閉：對全部項目套用該順序（一位使用者的工作負載上，關閉時 RAM 重用率約 30%，開啟時約 6%，早期數字）。", kind: "flag" },
+  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。預設關閉：對全部項目套用該順序（一位使用者的工作負載上，關閉時 RAM 重用率約 30%，開啟時約 6%，早期數字）。開啟：適合多個租戶共用同一個引擎、要避免某個 Agent 擠掉其他 Agent 的情況。", kind: "flag" },
   { key: "spill_unused_ttl_s", label: "從未命中保留時間", note: "SPILL_UNUSED_TTL_S", help: "一份存檔點從存入起這麼多秒都沒有被命中，就從 RAM 與 SSD 丟棄（不論還有沒有空間）。曾命中的不受影響。預設 0：關閉（不會因為沒被命中而丟棄）。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_after_s", label: "冷 Agent 門檻", note: "SPILL_COLD_AFTER_S", help: "某 Agent 在該層沒有任何命中、且最新的存檔點已超過這麼多秒，就算「冷」；剛開始的對話不算。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_first", label: "冷 Agent 先淘汰", note: "SPILL_COLD_FIRST", help: "RAM 或 SSD 已滿時，先淘汰冷 Agent 的項目（其中用量最多者先），再套用公平淘汰順序。", kind: "flag" },

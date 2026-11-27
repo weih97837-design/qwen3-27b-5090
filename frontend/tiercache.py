@@ -25,7 +25,7 @@ such an engine deletes the flat *.q27kv files an older build wrote (it is only a
 flat layout (one SUFFIX file per entry, sizes from the files).
 
 Retention (value-based, engine/src/retention.h; docs/tiered-cache.md "Retention"). ONE victim order per tier, used here for the SSD
-(make_room, _pick_victim) and by the engine for RAM (spill_enforce_ram): the agent using the most bytes of the tier (SPILL_FAIR_AGENTS;
+(make_room, _pick_victim) and by the engine for RAM (spill_enforce_ram): the agent using the most bytes of the tier (only with SPILL_FAIR_AGENTS=1, off by default;
 elastic, no guaranteed share), then within it superseded entries (a deeper checkpoint of the same conversation exists), never-hit before
 hit entries, and the older / bigger (the pre-retention rule) last. Superseded entries are never written to the SSD: past the RAM
 retention they are dropped. The engine reports per entry "owner" (the agent's id, 0 unknown), "hits", "superseded" and "superseded_durable" (spill_list; the latter counts only deeper entries already on the SSD and is what
@@ -174,7 +174,7 @@ def _cold_owners(entries, times, now, after):
 class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=300, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
-                 backup_victims=8, ssd_min_tokens=32768, fair_agents=True, unused_ttl_s=0, cold_after_s=600,
+                 backup_victims=8, ssd_min_tokens=32768, fair_agents=False, unused_ttl_s=0, cold_after_s=600,
                  cold_first=True, ssd_warm_only=False, probation_gib=4, cache_policy=cp.LEGACY, smart_params=None):
         self.engine = engine
         self.cache_policy = cp.policy_of(cache_policy)  # CACHE_POLICY: legacy (the rules above) or smart (cache_policy.py)
@@ -196,7 +196,7 @@ class TierPolicy:
         # Spilled entries shorter than this many tokens (the engine's "pos") are never written to the SSD: every entry
         # carries the same ~190 MiB recurrent state, and a short prefix recomputes in about the time a read takes (0: off).
         self.ssd_min_tokens = max(0, int(ssd_min_tokens))
-        self.fair_agents = bool(fair_agents)           # SPILL_FAIR_AGENTS: the SSD victim comes from the agent using the most SSD
+        self.fair_agents = bool(fair_agents)           # SPILL_FAIR_AGENTS (default off): with it on the SSD victim comes from the agent using the most SSD
         self.unused_ttl_s = max(0.0, float(unused_ttl_s))   # SPILL_UNUSED_TTL_S: never-hit entries older than this are dropped (0: off)
         self.cold_after_s = max(0.0, float(cold_after_s))   # SPILL_COLD_AFTER_S: an agent without hits whose newest entry is this old is cold
         self.cold_first = bool(cold_first)                  # SPILL_COLD_FIRST: cold agents' entries are the SSD victims first
@@ -243,7 +243,7 @@ class TierPolicy:
                                   ("SPILL_PROBATION_GIB", "probation_gib", 4)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
-        for env, key, default in (("SPILL_FAIR_AGENTS", "fair_agents", True), ("SPILL_COLD_FIRST", "cold_first", True),
+        for env, key, default in (("SPILL_FAIR_AGENTS", "fair_agents", False), ("SPILL_COLD_FIRST", "cold_first", True),
                                   ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", False)):  # (flags: 1 / 0; unset or empty: the default)
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
@@ -666,8 +666,8 @@ class TierPolicy:
 
     def _pick_victim(self, disk, need, tier=None):
         """The entry to delete next, among the SSD entries that can be dropped (a small function, so the policy can be swapped).
-        The retention order (the engine applies the same to RAM): the agent using the most SSD bytes (self.ssd_use; with
-        fair_agents), then in it superseded entries, never-hit before hit ones, then the old rule: an entry that is mostly
+        The retention order (the engine applies the same to RAM): the agent using the most SSD bytes (self.ssd_use; only with
+        fair_agents, off by default), then in it superseded entries, never-hit before hit ones, then the old rule: an entry that is mostly
         shared (little of it would be freed, MOSTLY_SHARED) only after the ones that free real bytes, and among those the oldest
         written. `need`: bytes still to free.
         Before the agent step (B): entries of COLD agents (self.cold_first): the agent has no hit in any entry of the tier (`tier`: all

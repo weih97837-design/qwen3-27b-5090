@@ -55,7 +55,7 @@ TIER_SETTINGS = {
     "spill_pinned_gib": ("SPILL_PINNED_GIB", 8, "num"),
     "spill_async_io": ("SPILL_ASYNC_IO", True, "flag"),
     "spill_async_promote": ("SPILL_ASYNC_PROMOTE", True, "flag"),
-    "spill_fair_agents": ("SPILL_FAIR_AGENTS", True, "flag"),  # on: a tier's victim comes from the agent using the most of it (off: one user measured RAM reuse ~30% instead of ~6%, early numbers)
+    "spill_fair_agents": ("SPILL_FAIR_AGENTS", False, "flag"),  # off (default): the victim order runs over the whole tier; on: a tier's victim comes from the agent using the most of it first (one user measured RAM reuse ~30% with it off instead of ~6% with it on, early numbers)
     # never-hit entries and cold agents (docs/tiered-cache.md "Retention"): dropped after this many seconds without a hit (0: off) / an
     # agent without hits whose newest entry is this old is evicted first / that step off / no unproven entry on the SSD but the quota
     "spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 0, "num"),
@@ -146,7 +146,7 @@ def tier_env_value(key, value):
 
 def tier_env(s):
     """The tiered cache variables the engine process starts with for settings s: every one of TIER_SETTINGS, explicitly (so the engine's
-    own defaults, e.g. spill_fair_agents on in C++, never decide). With no SSD tier (spill_ssd_gib 0, set explicitly) SPILL_DIR is empty:
+    own defaults, e.g. spill_fair_agents on in C++ while the server default is off, never decide). With no SSD tier (spill_ssd_gib 0, set explicitly) SPILL_DIR is empty:
     the engine then drops the victims of a full RAM tier instead of writing files the policy would delete. The setting itself keeps
     the folder, for when the cap is raised. (worker.Scheduler makes the same SPILL_DIR for an engine started by any other path.)"""
     env = {TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS}

@@ -223,10 +223,10 @@ struct SmartParams {
   double k_us = 0.31;
   double superseded_factor = 0.25;  // CACHE_SUPERSEDED_FACTOR: value of an entry a deeper one of its chain stands in for
   double junction_factor = 2.0;     // CACHE_JUNCTION_FACTOR: value of a branch point / a prefix shared by >= 2 agents
-  // CACHE_HIT_WEIGHT: value x (1 + hit_weight * hits). 1 is the formula as specified. Note: an entry's hits count the reuses of its
+  // CACHE_HIT_WEIGHT: value x (1 + hit_weight * hits). Default 0 (hits ignored; 1 is the formula as first specified). Note: an entry's hits count the reuses of its
   // whole lineage (prefix_begin's match + 1, inherited by every deeper checkpoint the sequence saves: inherited_hits), so the tip of a
   // long conversation carries the number of its turns and never decays; tools/cache_sim.py shows the effect (--smart-variant nohits).
-  double hit_weight = 1.0;
+  double hit_weight = 0.0;
   double min_resident_s = 300;      // CACHE_MIN_RESIDENT_S: RAM / SSD entries younger than this are protected (VRAM: not used)
 };
 inline constexpr double kSmartMinBytes = 1 << 20;  // bytes floor of value() (an entry that frees nothing must not divide by 0)

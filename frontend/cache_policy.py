@@ -30,7 +30,7 @@ PARAMS = (("CACHE_PREFILL_T0_US", "t0_us", 54.0),          # us per token at dep
           ("CACHE_PREFILL_K_US", "k_us", 0.31),            # us per token per 1,000 tokens of depth
           ("CACHE_SUPERSEDED_FACTOR", "superseded_factor", 0.25),
           ("CACHE_JUNCTION_FACTOR", "junction_factor", 2.0),
-          ("CACHE_HIT_WEIGHT", "hit_weight", 1.0),          # value x (1 + hit_weight * hits)
+          ("CACHE_HIT_WEIGHT", "hit_weight", 0.0),          # value x (1 + hit_weight * hits)
           ("CACHE_MIN_RESIDENT_S", "min_resident_s", 300.0))
 ENV_NAMES = ("CACHE_POLICY",) + tuple(p[0] for p in PARAMS)
 
