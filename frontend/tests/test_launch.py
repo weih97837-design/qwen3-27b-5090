@@ -261,11 +261,13 @@ def test_tier_policy_sees_the_defaults(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
     launch.set_engine_env(tmp_path)
     tiers = TierPolicy.from_env(object(), log=lambda *a: None)  # (the worker's read, after set_engine_env)
-    # the SSD tier is off by default: no cap, no directory (the folder default is still the compose volume, for when it is turned on)
-    assert tiers is not None and tiers.directory is None and tiers.budget == 0 and tiers.fair_agents is False
+    # the SSD tier is on by default: a 300 GiB cap and the folder of the compose volume; the per-agent step is on, warm-only and the TTL off
+    assert tiers is not None and tiers.directory == pathlib.Path(launch.spill_dir_default()) and tiers.budget == 300 * (1 << 30)
+    assert tiers.fair_agents is True and tiers.ssd_warm_only is False and tiers.unused_ttl_s == 0
     assert tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)
-    monkeypatch.setenv("SPILL_SSD_GIB", "10")
-    assert TierPolicy.from_env(object(), log=lambda *a: None).directory == pathlib.Path(launch.spill_dir_default())
+    monkeypatch.setenv("SPILL_SSD_GIB", "0")  # an explicit 0 turns the tier off
+    off = TierPolicy.from_env(object(), log=lambda *a: None)
+    assert off.directory is None and off.budget == 0
 
 
 # ---------------------------------------------------------------- the tiered cache settings
@@ -404,12 +406,12 @@ def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):
 
 
 def test_spill_fair_agents_setting(monkeypatch):
-    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", False, "flag")
+    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", True, "flag")
     assert launch.ENV_NAMES["spill_fair_agents"] == "SPILL_FAIR_AGENTS"
     monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
-    assert launch.env_settings()["spill_fair_agents"] is False  # (off by default)
-    monkeypatch.setenv("SPILL_FAIR_AGENTS", "1")
-    assert launch.env_settings()["spill_fair_agents"] is True
+    assert launch.env_settings()["spill_fair_agents"] is True  # (on by default)
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
+    assert launch.env_settings()["spill_fair_agents"] is False
     assert launch.tier_env_value("spill_fair_agents", False) == "0" and launch.tier_env_value("spill_fair_agents", True) == "1"
 
 
@@ -549,14 +551,16 @@ def test_max_seqs_and_pool_defaults_are_the_compose_ones(monkeypatch):
 
 
 def test_cold_agent_and_probation_settings(monkeypatch):
-    want = {"spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 1800, "num"), "spill_cold_after_s": ("SPILL_COLD_AFTER_S", 600, "num"),
-            "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"), "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", True, "flag"),
+    want = {"spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 0, "num"), "spill_cold_after_s": ("SPILL_COLD_AFTER_S", 600, "num"),
+            "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"), "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", False, "flag"),
             "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num")}
     for key, spec in want.items():
         assert launch.TIER_SETTINGS[key] == spec and launch.ENV_NAMES[key] == spec[0]
         monkeypatch.delenv(spec[0], raising=False)
     assert launch.env_settings()["spill_cold_first"] is True
-    monkeypatch.setenv("SPILL_SSD_WARM_ONLY", "0")
-    monkeypatch.setenv("SPILL_UNUSED_TTL_S", "0")
+    assert launch.env_settings()["spill_ssd_warm_only"] is False and launch.env_settings()["spill_unused_ttl_s"] == 0  # (the defaults)
+    assert launch.TIER_SETTINGS["spill_ssd_gib"][:3] == ("SPILL_SSD_GIB", 300, "num")
+    monkeypatch.setenv("SPILL_SSD_WARM_ONLY", "1")
+    monkeypatch.setenv("SPILL_UNUSED_TTL_S", "1800")
     s = launch.env_settings()
-    assert s["spill_ssd_warm_only"] is False and s["spill_unused_ttl_s"] == 0
+    assert s["spill_ssd_warm_only"] is True and s["spill_unused_ttl_s"] == 1800

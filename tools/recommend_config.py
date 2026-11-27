@@ -88,7 +88,7 @@ SPILL_DIR_DEFAULT = "/cache/kv"
 DEFAULT_KV_POOL_TOKENS = 0  # 0: what the VRAM budget leaves
 DEFAULT_MAX_TOKENS = 262144
 DEFAULT_SPILL_RAM_GIB = 64
-DEFAULT_SPILL_SSD_GIB = 0  # compose.yaml's SPILL_SSD_GIB: the SSD tier is off by default (a detected disk gets a size below: the tool is opt-in)
+DEFAULT_SPILL_SSD_GIB = 100  # fallback when the disk cannot be read: a cautious size, not compose.yaml's 300 (that suits a big disk; SPILL_SSD_MIN_FREE_GIB=10 still protects any disk)
 
 # nvidia-smi memory.used above this means something (usually the engine itself) already holds VRAM.
 VRAM_USED_WARN_GIB = 4.0
@@ -212,7 +212,7 @@ def detect_disk(path: Path, notes: list[str]) -> float | None:
     try:
         free = shutil.disk_usage(probe).free / GiB
     except OSError:
-        notes.append(f"磁碟未偵測：無法讀取 {probe} 的可用空間。SPILL_SSD_GIB 使用 compose.yaml 預設值。")
+        notes.append(f"磁碟未偵測：無法讀取 {probe} 的可用空間。SPILL_SSD_GIB 使用保守的 100。")
         return None
     return free
 
@@ -407,7 +407,7 @@ def recommend(detected: dict[str, Any]) -> dict[str, Any]:
     cache = detected.get("cache_used_gib") or 0.0
     if free is None:
         env["SPILL_SSD_GIB"] = str(DEFAULT_SPILL_SSD_GIB)
-        reasons["SPILL_SSD_GIB"] = "磁碟未偵測，使用 compose.yaml 預設值。"
+        reasons["SPILL_SSD_GIB"] = "磁碟未偵測，使用保守的 100（compose.yaml 預設 300 不一定適合這顆磁碟；SPILL_SSD_MIN_FREE_GIB=10 仍保護磁碟）。"
     else:
         ssd = min(SSD_CAP_GIB, max(0, math.floor((free + cache - SSD_MIN_FREE_GIB) * SSD_FRACTION)))
         env["SPILL_SSD_GIB"] = str(ssd)

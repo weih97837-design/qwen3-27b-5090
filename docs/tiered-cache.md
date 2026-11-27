@@ -4,10 +4,11 @@
 引擎會把被逐出的 checkpoint 存到主機 RAM（以及，若開啟 SSD 層，SSD），而不是直接丟棄。之後同一段對話再來時，從較深的 checkpoint 還原，
 不必重算整段前綴。
 
-> **SSD 層預設關閉**（`SPILL_SSD_GIB=0`，明確設成 `0` 也一樣）：RAM 層滿時，被擠出的 checkpoint 直接丟棄，不寫入磁碟；`SPILL_DIR` 不會被寫入、讀取、掃描或刪除
-> （伺服器把引擎的 `SPILL_DIR` 設成空字串，`TierPolicy` 沒有目錄）。要啟用請把 `SPILL_SSD_GIB` 設成正數，例如 `100`。
-> 代價：引擎重新啟動後 RAM／VRAM 快取是冷的，因為沒有東西留在磁碟上。以下提到 SSD 的段落、`SPILL_SSD_MIN_TOKENS`、warm-only 與試用額度（probation）都只在 SSD 層開啟時才有作用。
-> 升級說明見 [configuration.md](configuration.md#upgrading-the-ssd-tier-is-off-by-default)。
+> **SSD 層預設開啟**（`SPILL_SSD_GIB=300`）。明確設成 `SPILL_SSD_GIB=0` 才會關閉：RAM 層滿時，被擠出的 checkpoint 直接丟棄，不寫入磁碟；`SPILL_DIR` 不會被寫入、讀取、掃描或刪除
+> （伺服器把引擎的 `SPILL_DIR` 設成空字串，`TierPolicy` 沒有目錄）。
+> 關閉的代價：引擎重新啟動後 RAM／VRAM 快取是冷的，因為沒有東西留在磁碟上。`settings.ini`、`.env` 等明確設過的值照舊有效（設過 `SPILL_SSD_GIB=0` 的人 SSD 層仍是關的）。
+> 其他預設：`SPILL_FAIR_AGENTS=1`、`SPILL_SSD_WARM_ONLY=0`（不限制寫入 SSD 的 entry；`SPILL_PROBATION_GIB` 只在 `SPILL_SSD_WARM_ONLY=1` 時有作用）、`SPILL_UNUSED_TTL_S=0`（不因為沒被命中而丟棄）。
+> 說明見 [configuration.md](configuration.md#the-ssd-tier-on-by-default-how-to-turn-it-off)。
 
 ## 概要
 
@@ -15,8 +16,8 @@
 
 1. **VRAM**：活躍的 KV 池。池滿時，最久未用的 checkpoint 被逐出。
 2. **RAM**：引擎把被逐出的 checkpoint 存進主機 RAM（`SPILL_RAM_GIB`，預設 64 GiB），而不是丟棄。
-3. **SSD**（可選，`SPILL_SSD_GIB` > 0 才有，預設關閉）：`frontend/tiercache.py` 在閒置時，把存在 RAM 超過 `SPILL_RAM_RETENTION_S`（預設 3600 秒）的項目寫到
-   `SPILL_DIR`（預設 `/cache/kv`，即 Docker 具名磁碟區 `kvcache`）。SSD 層關閉時沒有這一步，也沒有停止時的寫出與啟動時的匯入；磁碟上既有的檔案不會被動到（也不會被刪除）。忙碌時則在超過兩倍保留時間後寫出。
+3. **SSD**（預設開啟，`SPILL_SSD_GIB=300`；`SPILL_SSD_GIB=0` 關閉）：`frontend/tiercache.py` 在閒置時，把存在 RAM 超過 `SPILL_RAM_RETENTION_S`（預設 3600 秒）的項目寫到
+   `SPILL_DIR`（預設 `/cache/kv`，即 Docker 具名磁碟區 `kvcache`）。`SPILL_SSD_GIB=0`（SSD 層關閉）時沒有這一步，也沒有停止時的寫出與啟動時的匯入；磁碟上既有的檔案不會被動到（也不會被刪除）。忙碌時則在超過兩倍保留時間後寫出。
    檔案分成「manifest ＋ 共用的 chunk 檔」（見下方「SSD 層去重」），共用同一段前綴的 entry 只存一份 chunk。
    同一個程式也會執行 SSD 容量上限（`SPILL_SSD_GIB`，以**實體**位元組計，每個 chunk 檔只算一次；從寫入最久的 entry 開始刪，
    優先刪除真的能釋放空間的 entry）。此上限一律執行，即使磁碟已被其他檔案佔滿。
@@ -69,18 +70,18 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `KV_POOL_TOKENS` | `0`（最大） | GPU 上的 KV 池大小（tokens）。`0`（預設）表示使用 VRAM 預算剩下的全部空間（RTX 5090、`MAX_SEQS=8`、DSpine 預估約 60 萬 token 以上（實際大小以啟動 log 或監控頁為準））；填數字（例如 `524288` = 512K）則固定大小，並覆蓋預設 |
 | `MAX_SEQS` | `8` | 同時執行的請求數上限（引擎最大值）。7 個停放區各約 190 MiB，未使用時借給 KV 快取；`STATE_HOST_CACHE` 的 8 GiB 檢查點槽不變；`target_seqs` 預設等於它（每個請求變慢、總吞吐量上升，要較少請在 /ui 設定） |
 | `SPILL_RAM_GIB` | `64` | 主機 RAM 中保存被逐出 checkpoint 的容量（GiB）。`0` 表示關閉分層 |
-| `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache`；只在 `SPILL_SSD_GIB` > 0 時使用（SSD 層關閉時引擎拿到空的 `SPILL_DIR`）。底下有 `entries/`（manifest）與 `chunks/`（共用的 chunk 檔） |
+| `SPILL_DIR` | `/cache/kv` | checkpoint 寫入的目錄（容器內），對應具名磁碟區 `kvcache`；只在 `SPILL_SSD_GIB` > 0 時使用（`SPILL_SSD_GIB=0` 時引擎拿到空的 `SPILL_DIR`）。底下有 `entries/`（manifest）與 `chunks/`（共用的 chunk 檔） |
 | `SPILL_RAM_RETENTION_S` | `3600` | checkpoint 在 RAM 中保留的秒數，之後才寫入 SSD（只在 SSD 層開啟時有作用） |
-| `SPILL_SSD_GIB` | `0` | SSD 層容量上限（GiB），最舊的檔案先刪除。**`0`（預設）：SSD 層關閉**，不寫入、不讀取、不刪除 `SPILL_DIR` 的任何檔案；RAM 層滿時直接丟棄。要啟用設成正數（例如 `100`） |
+| `SPILL_SSD_GIB` | `300` | SSD 層容量上限（GiB），最舊的檔案先刪除；`SPILL_SSD_MIN_FREE_GIB`（10）仍保證磁碟留有可用空間，所以 300 是上限不是預留。**`0`：SSD 層關閉**，不寫入、不讀取、不刪除 `SPILL_DIR` 的任何檔案；RAM 層滿時直接丟棄，引擎重新啟動後沒有東西留下來 |
 | `SPILL_SSD_MIN_FREE_GIB` | `10` | 磁碟可用空間目標。只在能靠刪除本層自己的檔案達成時才追求，不會刪除其他檔案（只在 SSD 層開啟時有作用） |
 | `SPILL_SSD_MIN_TOKENS` | `32768` | 短於此 token 數的 checkpoint 不會寫入 SSD：超過 RAM 保留時間後直接從 RAM 丟棄。每個 checkpoint 都帶約 190 MiB 的遞迴狀態，與長度無關；短前綴重算只需約 0.2–0.4 秒，與讀回時間相近，寫入只會浪費 SSD 空間與寫入壽命。`0`：不設下限（舊行為）。已在磁碟上的檔案不受影響；`/metrics` 的 `ssd_skipped_short` 計算被丟棄的筆數。只在 SSD 層開啟時有作用 |
 | `SPILL_TTL_DAYS` | `7` | 自寫入 SSD 起算（重用後會重新計時），超過此天數的檔案會被刪除（只在 SSD 層開啟時有作用） |
-| `SPILL_FAIR_AGENTS` | `0` | `0`（預設）：整層直接用「被取代 → 從未重用 → 最久未用」的順序，沒有 agent 這一步；實測 RAM 重用率約 30%（開啟時約 6%，因為它先淘汰用量最大的 agent，而那正是最常被再用的）。`1`：RAM 層或 SSD 層要騰出空間時，從**目前在該層用量最大的 agent** 挑逐出對象（共用 chunk 的位元組平分給引用它的各 agent），再依同一個順序。VRAM 仍是單純 LRU。見「保留策略」 |
+| `SPILL_FAIR_AGENTS` | `1` | `1`（預設）：RAM 層或 SSD 層要騰出空間時，從**目前在該層用量最大的 agent** 挑逐出對象（共用 chunk 的位元組平分給引用它的各 agent），再依同一個順序。`0`：整層直接用「被取代 → 從未重用 → 最久未用」的順序，沒有 agent 這一步；在一位使用者的工作負載上，`0` 的 RAM 重用率約 30%，`1` 約 6%（`1` 先淘汰用量最大的 agent，而那正是最常被再用的），這是單一工作負載的早期數字，請在你的負載上比較。VRAM 仍是單純 LRU。見「保留策略」 |
 | `SPILL_COLD_FIRST` | `1` | `1`：要騰出空間時，**冷 agent** 的 entry 比一切都先逐出（見「保留策略」步驟 0）。`0`：沒有這一步 |
 | `SPILL_COLD_AFTER_S` | `600` | 某 agent 在該層沒有任何 entry 被命中過、且它在該層最新的 entry 已超過這麼多秒，就是冷的；剛建立的對話還不算冷 |
-| `SPILL_UNUSED_TTL_S` | `1800` | entry 從建立（進 RAM）或寫入 SSD 起，這麼多秒都沒有被命中，就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠（一次性 agent 不該佔著快取）。有命中過的 entry 照原規則；共用的短前綴（≤ 16,384 token）、閒置備份、還原中的 entry 不受影響。`0`：關閉。計入計數器 `expired`（`q27:tier_expired`） |
-| `SPILL_SSD_WARM_ONLY` | `1` | `1`：（只在 SSD 層開啟時有作用）RAM → SSD 時，從未命中、且其 agent 也沒有任何命中的 entry（「未證明」）不寫入：沒有明確 id 的 `auto:` agent 直接丟棄，有明確 id 的只能在試用額度內寫入。`0`：全部照舊寫入。計入 `not_written`（`q27:tier_not_written`） |
-| `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟時有作用）所有「未證明」entry 在 SSD 上合計最多佔用的容量（邏輯 GiB）；滿了先丟最舊的未證明 entry。warm agent 的 entry 不計入 |
+| `SPILL_UNUSED_TTL_S` | `0` | 設為正數時：entry 從建立（進 RAM）或寫入 SSD 起，這麼多秒都沒有被命中，就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠（一次性 agent 不該佔著快取）。有命中過的 entry 照原規則；共用的短前綴（≤ 16,384 token）、閒置備份、還原中的 entry 不受影響。`0`（預設）：關閉，不會因為沒被命中而丟棄。計入計數器 `expired`（`q27:tier_expired`） |
+| `SPILL_SSD_WARM_ONLY` | `0` | `1`：（只在 SSD 層開啟時有作用）RAM → SSD 時，從未命中、且其 agent 也沒有任何命中的 entry（「未證明」）不寫入：沒有明確 id 的 `auto:` agent 直接丟棄，有明確 id 的只能在試用額度內寫入。`0`（預設）：全部照常寫入。計入 `not_written`（`q27:tier_not_written`） |
+| `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟且 `SPILL_SSD_WARM_ONLY=1` 時有作用）所有「未證明」entry 在 SSD 上合計最多佔用的容量（邏輯 GiB）；滿了先丟最舊的未證明 entry。warm agent 的 entry 不計入 |
 | `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
 | `VRAM_BACKUP_VICTIMS` | `8` | 閒置備份只複製「下一批會被逐出」的前 N 個 checkpoint（`0`：全部）。只能用環境變數設定 |
@@ -94,7 +95,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 - 每個 token 的 NVFP4 KV 約 18 KiB。
 - 一個 256K tokens 的代理：KV 約 4.5 GiB + 狀態約 0.19 GiB，合計約 4.7 GiB。
 - 32 GiB RAM 約可保存 6 個代理。
-- 100 GiB SSD 約可保存 21 個代理（SSD 層預設關閉；`SPILL_SSD_GIB=100` 才有）。
+- 100 GiB SSD 約可保存 21 個代理（預設上限 300 GiB 約 63 個）。
 - 預估約 60 萬 token 以上的 KV 池（預設，實際以啟動 log 或監控頁為準）約佔 10 GiB VRAM（512K 約 9 GiB；每 1 GiB 約 58K tokens）。
 
 ## RAM 層去重（預設開啟，`SPILL_DEDUP=0` 關閉）
@@ -354,7 +355,7 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
    `SPILL_COLD_AFTER_S`（預設 600 秒；剛建立的對話還不算冷；未知 agent 0 不是 agent，永遠不冷）。只要候選裡有冷 agent 的 entry，victim 就只從它們選；
    多個冷 agent 時由下一步挑**用量最多的**（同量 id 小的先；沒有時間排序，因為引擎與 Python 的時鐘不同）。再依步驟 2–4 選 entry。
    「在該層」是看整層（包含還原中的 entry）而不只是候選。
-1. **用量最大的 agent**（`SPILL_FAIR_AGENTS=1`；**預設關閉**，關閉時略過這一步，整層直接依步驟 2–4：實測 RAM 重用率約 30%，開啟時約 6%；若有步驟 0 則只在冷 agent 之間）：該層裡 agent 的位元組 = 它自己 entry 的 tail／狀態／manifest，加上共用 chunk 的位元組除以「引用該 chunk 的
+1. **用量最大的 agent**（`SPILL_FAIR_AGENTS=1`，預設；設為 `0` 則略過這一步，整層直接依步驟 2–4：一位使用者的工作負載上實測 RAM 重用率 `0` 約 30%、`1` 約 6%，早期數字；若有步驟 0 則只在冷 agent 之間）：該層裡 agent 的位元組 = 它自己 entry 的 tail／狀態／manifest，加上共用 chunk 的位元組除以「引用該 chunk 的
    不同 agent 數」。完全彈性，沒有保證的最小份額；未知 agent 自成一桶（`unknown`）。同量時 id 小的先。
 2. 在該 agent 內，**被取代（superseded）**的 entry 先走。
 3. **從未重用（hits = 0）**先於重用過的。`hits` = 該 entry（或它由來的 VRAM checkpoint）被還原或被 `prefix_begin` 選為命中的次數；隨 entry 在 VRAM／RAM／SSD 間移動，
@@ -363,19 +364,19 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 
 引擎的 RAM 層仍分兩類：閒置備份（VRAM 還有原件）永遠先於唯一副本，上面的順序在各類內套用。
 
-**一次性 agent 的三條規則**（沒有再回來的 agent id，含沒有 `X-Agent-Id`、每次得到新 `auto:xxxxxxxx` 的請求；它們不該佔著 RAM／SSD）：
+**一次性 agent 的三條規則**（A、C 預設關閉，B 預設開啟；沒有再回來的 agent id，含沒有 `X-Agent-Id`、每次得到新 `auto:xxxxxxxx` 的請求；它們不該佔著 RAM／SSD）：
 
-- **A. 從未命中的存活期限**（`SPILL_UNUSED_TTL_S`，預設 1800 秒，`0` 關閉）：entry 從進 RAM（frontend 第一次在 tick 看到它的時間）或寫入 SSD（檔案時間）起，這麼久都沒有命中（hits = 0），
+- **A. 從未命中的存活期限**（`SPILL_UNUSED_TTL_S`，預設 `0`：關閉；設成正數才啟用）：entry 從進 RAM（frontend 第一次在 tick 看到它的時間）或寫入 SSD（檔案時間）起，這麼久都沒有命中（hits = 0），
   就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠；計入計數器 `expired`。hits > 0 的 entry 照既有規則（`SPILL_TTL_DAYS` 等）。**不會丟**：共用的短前綴（≤ 16384 token，與「被取代」同一個豁免）、
-  閒置備份（VRAM 還有原件）、還原中的 entry、以及引擎沒有回報 `hits` 的 entry（舊引擎）。預設 1800 < `SPILL_RAM_RETENTION_S`（3600），所以從未命中的 entry 在 RAM 就會過期，通常到不了 SSD 寫入。
+  閒置備份（VRAM 還有原件）、還原中的 entry、以及引擎沒有回報 `hits` 的 entry（舊引擎）。若設的值小於 `SPILL_RAM_RETENTION_S`（預設 3600），從未命中的 entry 在 RAM 就會過期，通常到不了 SSD 寫入。
 - **B. 冷 agent 先逐出**：上面的步驟 0。RAM 層由引擎判斷（`Spilled::born` = entry 進 RAM 的時間；`retention.h` 的 `cold_agents`），SSD 層由 frontend 判斷（寫入時間）；
   各層只由一邊決定，所以兩邊時鐘不同也不會互相矛盾。
-- **C. 沒證明價值的 agent 不佔 SSD**（`SPILL_SSD_WARM_ONLY=1`，預設）：「未證明」= entry 沒有命中，且其 agent 在引擎回報的**任何** entry 都沒有命中（agent 0 與 ≤ 16384 token 的共用前綴除外）。
+- **C. 沒證明價值的 agent 不佔 SSD**（`SPILL_SSD_WARM_ONLY=1`；預設 `0`：關閉，所有 entry 照常寫入 SSD）：「未證明」= entry 沒有命中，且其 agent 在引擎回報的**任何** entry 都沒有命中（agent 0 與 ≤ 16384 token 的共用前綴除外）。
   未證明的 entry 要從 RAM 寫入 SSD 時：沒有明確 id 的 `auto:` agent 直接丟棄（`not_written`）；有明確 id 的 agent 可以寫，但所有未證明 entry 合計最多佔 `SPILL_PROBATION_GIB`（預設 4 GiB，邏輯大小）的 SSD，
   滿了就先丟最舊的未證明 entry（也計入 `not_written`）。agent 一旦有命中就是 warm，它的 entry 走一般規則、不計入額度。`flush()`（停止時寫出）套用同一個閘門；每次 tick 也會清掉因其他路徑
-  （引擎在 RAM 吃緊時自己寫出）而進了 SSD 的未證明 entry。`SPILL_SSD_WARM_ONLY=0`：全部照舊寫入（額度不使用）。
+  （引擎在 RAM 吃緊時自己寫出）而進了 SSD 的未證明 entry。`SPILL_SSD_WARM_ONLY=0`（預設）：全部照常寫入（額度不使用）。
 
-**取捨**：全新 agent id 的第一段對話，在該 agent 有第一次命中之前，不會（`auto:`）或只在 4 GiB 試用額度內（有 id）留在 SSD；而且未證明的 entry 仍受規則 A 約束，所以一個新 agent 若隔了比
+**取捨**（只在開啟規則 A、C 時）：全新 agent id 的第一段對話，在該 agent 有第一次命中之前，不會（`auto:`）或只在 4 GiB 試用額度內（有 id）留在 SSD；而且未證明的 entry 仍受規則 A 約束，所以一個新 agent 若隔了比
 `SPILL_UNUSED_TTL_S` 更久才回來，會重算一次（那一次的命中之後它就是 warm 了）。`auto:` agent 是否為 `auto:` 由 worker 告知 TierPolicy（owner id 是雜湊，無法反推），重啟後這份記憶消失：重啟後它們被當成有 id 的 agent（走試用額度，不會立刻被丟）。
 **已知限制**：hits 不會衰減，所以只要有過一次命中，agent 就永遠 warm／不冷；agent 的有命中 entry 若已被還原到 VRAM（離開該層）或被逐出，其餘留在該層的 never-hit entry 會讓 agent 在該層看起來是冷的（以「該層」為準，這是設計）。
 
@@ -406,7 +407,7 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 
 - **RAM 層計入 WSL VM 的記憶體。** 預設的 WSL2 記憶體上限不足以容納 32 GiB 的 RAM 層。請在 `%UserProfile%\.wslconfig`
   設定 `memory=`，例如在 96 GB 的機器上，扣掉系統保留 16 GB 後設為 `memory=80GB`（建議配置工具會依主機 RAM 算出這個值），之後執行 `wsl --shutdown` 重新啟動。
-- **刪除檔案不會縮小 vhdx。** WSL2 的虛擬硬碟在檔案刪除後不會自動縮小，因此 SSD 上限不會把主機磁碟空間還給系統。（SSD 層預設關閉，不寫入就不會佔用。）
+- **刪除檔案不會縮小 vhdx。** WSL2 的虛擬硬碟在檔案刪除後不會自動縮小，因此 SSD 上限不會把主機磁碟空間還給系統。（`SPILL_SSD_GIB=0`、SSD 層關閉時不寫入，就不會佔用。）
 - **使用具名磁碟區。** `kvcache` 位於 WSL2 的 ext4 磁碟上。不要改用 `/mnt/c` 的 bind mount，drvfs 讀寫很慢。
 - **權限修正前建立的磁碟區要刪除一次。** 較舊的建置建立的 `kvcache` 磁碟區可能屬於 root，容器無法寫入 SSD 層（`q27:tier_failed` 會增加）。請執行一次 `docker compose down`，再 `docker volume rm qwen3-27b-5090_kvcache`（會刪除 SSD 層的全部快取），然後重新啟動。
 
@@ -417,7 +418,7 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 - 從 RAM 或 SSD 還原 4.5 GiB 的 KV 約需 0.5–3 秒，仍遠快於重算 256K tokens。
 - 快取檔案與模型和 KV 型別綁定。若兩者改變，檔案會被丟棄。
 - 尚未在實機上測試。
-- SSD 層預設關閉：引擎重新啟動（停止、改設定、閒置卸載、更新）後 RAM／VRAM 快取是冷的；要讓快取撐過重新啟動，請設定 `SPILL_SSD_GIB`。
+- 設了 `SPILL_SSD_GIB=0`（SSD 層關閉）時：引擎重新啟動（停止、改設定、閒置卸載、更新）後 RAM／VRAM 快取是冷的；要讓快取撐過重新啟動，保留預設的 SSD 層。
 
 ## 建議配置工具
 

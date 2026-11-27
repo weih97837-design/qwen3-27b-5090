@@ -878,7 +878,7 @@ function drawSlots() {
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["擠出 spilled", "spilled"], ["載回 restored", "restored"], ["寫入 SSD written", "written"],
   ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["過期丟棄 expired", "expired"], ["未寫入 SSD not_written", "not_written"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
-// The SSD tier is off (SPILL_SSD_GIB=0, the default; or no SPILL_DIR): the tiers block says ssd_enabled false, or (an older server without
+// The SSD tier is off (SPILL_SSD_GIB=0 set explicitly; or no SPILL_DIR): the tiers block says ssd_enabled false, or (an older server without
 // that key) the cap is 0 or absent. No bar then, so nothing divides by a zero or missing cap.
 const ssdOffOf = (t) => !!t && typeof t === "object" && !t.error && (t.ssd_enabled === false || (t.ssd_enabled == null && !t.ssd_cap_bytes));
 const ssdOffText = (t) => `SSD 層：已關閉（${t && t.ssd_off_reason === "dir" ? "SPILL_DIR 為空" : "SPILL_SSD_GIB=0"}）`;
@@ -1105,7 +1105,7 @@ const OPTS = [
 const TIER_OPTS = [
   { key: "spill_ram_gib", label: "RAM 層", note: "SPILL_RAM_GIB", help: "存放 KV 池擠出的存檔點所用的主機 RAM。0 表示關閉分層快取。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_ram_retention_s", label: "RAM 停留時間", note: "SPILL_RAM_RETENTION_S", help: "RAM 中的存檔點閒置多少秒後寫入 SSD（SSD 層關閉時不使用）。", kind: "num", unit: "s", step: "60" },
-  { key: "spill_ssd_gib", label: "SSD 上限", note: "SPILL_SSD_GIB", help: "SSD 層最多存放的容量；最舊的檔案先刪除。0（預設）：SSD 層關閉，RAM 層滿時直接丟棄，不寫入磁碟；引擎重新啟動後 RAM／VRAM 快取是冷的。", kind: "num", unit: "GiB", step: "10" },
+  { key: "spill_ssd_gib", label: "SSD 上限", note: "SPILL_SSD_GIB", help: "SSD 層最多存放的容量；最舊的檔案先刪除。預設 300。0：SSD 層關閉，RAM 層滿時直接丟棄，不寫入磁碟；引擎重新啟動後 RAM／VRAM 快取是冷的（沒有東西留下來）。", kind: "num", unit: "GiB", step: "10" },
   { key: "spill_ssd_min_free_gib", label: "SSD 最小可用空間", note: "SPILL_SSD_MIN_FREE_GIB", help: "寫入後磁碟的可用空間不會低於此值。 只在 SSD 層開啟時有效。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_ssd_min_tokens", label: "SSD 最小 token 數", note: "SPILL_SSD_MIN_TOKENS", help: "短於此長度的存檔點會被丟棄，不寫入 SSD（重新計算和讀取一樣快）。0 表示全部寫入。 只在 SSD 層開啟時有效。", kind: "num", unit: "token", step: "1024" },
   { key: "spill_ttl_days", label: "檔案 TTL", note: "SPILL_TTL_DAYS", help: "超過這麼多天沒有被重用的檔案會被刪除。 只在 SSD 層開啟時有效。", kind: "num", unit: "天", step: "1" },
@@ -1113,12 +1113,12 @@ const TIER_OPTS = [
   { key: "spill_pinned_gib", label: "固定 RAM", note: "SPILL_PINNED_GIB", help: "固定的主機記憶體，複製更快；在 Windows 上會計入共用 GPU 記憶體。0 表示關閉。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_async_io", label: "非同步複製", note: "SPILL_ASYNC_IO", help: "KV 複製使用獨立的 stream；請搭配固定 RAM 使用。請先用 scripts/tiered_cache_test.py 測試。", kind: "flag" },
   { key: "spill_async_promote", label: "延遲命中", note: "SPILL_ASYNC_PROMOTE", help: "命中已擠出存檔點的請求會等它載回，其他請求照常執行。", kind: "flag" },
-  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。預設關閉：對全部項目套用該順序（實測 RAM 重用率約 30%，開啟時約 6%）。", kind: "flag" },
-  { key: "spill_unused_ttl_s", label: "從未命中保留時間", note: "SPILL_UNUSED_TTL_S", help: "一份存檔點從存入起這麼多秒都沒有被命中，就從 RAM 與 SSD 丟棄（不論還有沒有空間）。曾命中的不受影響。0 表示關閉。", kind: "num", unit: "s", step: "60" },
+  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。預設開啟。關閉：對全部項目套用該順序（一位使用者的工作負載上，關閉時 RAM 重用率約 30%，開啟時約 6%，早期數字）。", kind: "flag" },
+  { key: "spill_unused_ttl_s", label: "從未命中保留時間", note: "SPILL_UNUSED_TTL_S", help: "一份存檔點從存入起這麼多秒都沒有被命中，就從 RAM 與 SSD 丟棄（不論還有沒有空間）。曾命中的不受影響。預設 0：關閉（不會因為沒被命中而丟棄）。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_after_s", label: "冷 Agent 門檻", note: "SPILL_COLD_AFTER_S", help: "某 Agent 在該層沒有任何命中、且最新的存檔點已超過這麼多秒，就算「冷」；剛開始的對話不算。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_first", label: "冷 Agent 先淘汰", note: "SPILL_COLD_FIRST", help: "RAM 或 SSD 已滿時，先淘汰冷 Agent 的項目（其中用量最多者先），再套用公平淘汰順序。", kind: "flag" },
-  { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。 只在 SSD 層開啟時有效。", kind: "flag" },
-  { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。 只在 SSD 層開啟時有效。", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。預設關閉：照常寫入。只在 SSD 層開啟時有效。", kind: "flag" },
+  { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。只在 SSD 層開啟且「SSD 只收已證明的」開啟時有效。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_dir", label: "SSD 資料夾", note: "SPILL_DIR", help: "擠出的存檔點寫入的位置（只在 SSD 上限大於 0 時使用）。留空：只用 RAM。", kind: "path" },
 ];
 // Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's

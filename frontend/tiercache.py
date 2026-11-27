@@ -6,7 +6,7 @@ busy) is written to a file in the directory (engine.spill_export). Files stay wi
 written first) and a free-space reserve, and are deleted after ttl_days. A file an earlier run wrote is indexed at
 start() (engine.spill_import). A checkpoint that is reused leaves the engine's list by itself.
 
-The SSD tier is OFF by default (SPILL_SSD_GIB=0, and SPILL_SSD_GIB=0 set explicitly means the same): TierPolicy then has no
+The SSD tier is ON by default (SPILL_SSD_GIB=300). SPILL_SSD_GIB=0 (explicit) turns it off: TierPolicy then has no
 directory, and the engine is started with SPILL_DIR empty (ssd_off_env, called by worker.Scheduler before the engine is made;
 launch.py does the same in the engine's settings), so the engine DROPS the victims of a full RAM tier instead of writing them.
 Nothing is written to, read from, scanned or deleted in any SPILL_DIR then (no write at a stop, no import at a start, no sweep): a
@@ -35,10 +35,10 @@ superseded) and the order is the old "oldest written first".
 
 Three more rules for entries and agents that never prove their value (docs/tiered-cache.md "Retention"; they only act on entries the
 engine reports "hits" for, so an engine without the retention fields keeps the old behaviour):
-  A. SPILL_UNUSED_TTL_S (1800; 0: off): an entry with no hit for that long since it came to RAM / was written is dropped from RAM and
+  A. SPILL_UNUSED_TTL_S (0: off, the default): an entry with no hit for that long since it came to RAM / was written is dropped from RAM and
      the SSD by tick(), whatever the free capacity (not: hit entries, entries of <= KEEP_SHORT_TOKENS tokens, backups, busy ones). "expired".
   B. cold agents (SPILL_COLD_FIRST, SPILL_COLD_AFTER_S): see _pick_victim. The engine's retention.h cold_agents is the same rule.
-  C. SPILL_SSD_WARM_ONLY (1): an entry is written to the SSD only when it was hit or its agent has a hit in some reported entry
+  C. SPILL_SSD_WARM_ONLY (0: off, the default): an entry is written to the SSD only when it was hit or its agent has a hit in some reported entry
      ("warm"). An unproven entry of an agent with an explicit id (not `auto:`) is written within the PROBATION quota
      (SPILL_PROBATION_GIB, 4: all unproven entries on the SSD together; the oldest unproven one goes first); one of an `auto:` agent
      (no X-Agent-Id: a new id per prompt) is dropped instead. "not_written".
@@ -55,6 +55,7 @@ from pathlib import Path
 
 GiB = 1 << 30
 DAY = 86400.0
+DEFAULT_SSD_GIB = 300.0   # SPILL_SSD_GIB when unset or empty (compose.yaml, launch.TIER_SETTINGS); an explicit 0 turns the SSD tier off
 SUFFIX = ".q27kv"                  # the flat layout (older engine); in the dedup layout: a legacy file, deleted at start
 TMP_SUFFIX = ".q27kv.tmp"
 SUFFIX_MANIFEST = ".q27m"          # SSD dedup layout: SPILL_DIR/entries/<id>.q27m (+ the engine's SPILL_DIR/chunks/*.kvc)
@@ -80,14 +81,14 @@ def _float(name, raw):
 
 
 def ssd_gib_of_env(environ=None):
-    """SPILL_SSD_GIB as a number of GiB: unset or empty is 0 (the SSD tier is off by default). Raises ValueError for a bad value."""
+    """SPILL_SSD_GIB as a number of GiB: unset or empty is 300 (the default; an explicit 0 means the SSD tier is off). Raises ValueError for a bad value."""
     env = os.environ if environ is None else environ
     text = env.get("SPILL_SSD_GIB")
-    return 0.0 if text is None or not text.strip() else _float("SPILL_SSD_GIB", text)
+    return DEFAULT_SSD_GIB if text is None or not text.strip() else _float("SPILL_SSD_GIB", text)
 
 
 def ssd_off_env(environ=None):
-    """Makes an environment the engine will read say "no SSD tier" when the SSD cap is 0 (the default): SPILL_DIR is set to the empty
+    """Makes an environment the engine will read say "no SSD tier" when the SSD cap is 0 (SPILL_SSD_GIB=0 set explicitly): SPILL_DIR is set to the empty
     string, which is what makes the engine drop the victims of a full RAM tier instead of writing them to a folder (the policy would
     delete them again). Returns True when the SSD tier is off. An unreadable SPILL_SSD_GIB changes nothing (TierPolicy.from_env raises)."""
     env = os.environ if environ is None else environ
@@ -160,13 +161,13 @@ def _cold_owners(entries, times, now, after):
 
 
 class TierPolicy:
-    def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=0, ssd_min_free_gib=10, ttl_days=7,
+    def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=300, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
-                 backup_victims=8, ssd_min_tokens=32768, fair_agents=False, unused_ttl_s=1800, cold_after_s=600,
-                 cold_first=True, ssd_warm_only=True, probation_gib=4):
+                 backup_victims=8, ssd_min_tokens=32768, fair_agents=True, unused_ttl_s=0, cold_after_s=600,
+                 cold_first=True, ssd_warm_only=False, probation_gib=4):
         self.engine = engine
         self.budget = float(ssd_gib) * GiB
-        # None: no SSD tier. Also when the cap is 0 (the default): "0 GiB" means off, not "a zero budget that deletes what the engine writes".
+        # None: no SSD tier. Also when the cap is 0 (set explicitly): "0 GiB" means off, not "a zero budget that deletes what the engine writes".
         self.directory = Path(directory) if directory and self.budget > 0 else None
         self.ram_retention_s = float(ram_retention_s)
         self.reserve = float(ssd_min_free_gib) * GiB
@@ -212,7 +213,7 @@ class TierPolicy:
             return None
         opts = {}
         for env, key, default in (("SPILL_RAM_RETENTION_S", "ram_retention_s", 3600),
-                                  ("SPILL_SSD_GIB", "ssd_gib", 0),
+                                  ("SPILL_SSD_GIB", "ssd_gib", DEFAULT_SSD_GIB),
                                   ("SPILL_SSD_MIN_FREE_GIB", "ssd_min_free_gib", 10),
                                   ("SPILL_TTL_DAYS", "ttl_days", 7),
                                   ("SPILL_TICK_S", "tick_s", 30),
@@ -220,13 +221,13 @@ class TierPolicy:
                                   ("SPILL_FLUSH_ON_STOP_S", "flush_on_stop_s", 8),
                                   ("VRAM_BACKUP_VICTIMS", "backup_victims", 8),
                                   ("SPILL_SSD_MIN_TOKENS", "ssd_min_tokens", 32768),
-                                  ("SPILL_UNUSED_TTL_S", "unused_ttl_s", 1800),
+                                  ("SPILL_UNUSED_TTL_S", "unused_ttl_s", 0),
                                   ("SPILL_COLD_AFTER_S", "cold_after_s", 600),
                                   ("SPILL_PROBATION_GIB", "probation_gib", 4)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
-        for env, key, default in (("SPILL_FAIR_AGENTS", "fair_agents", False), ("SPILL_COLD_FIRST", "cold_first", True),
-                                  ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", True)):  # (flags: 1 / 0; unset or empty: the default)
+        for env, key, default in (("SPILL_FAIR_AGENTS", "fair_agents", True), ("SPILL_COLD_FIRST", "cold_first", True),
+                                  ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", False)):  # (flags: 1 / 0; unset or empty: the default)
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:

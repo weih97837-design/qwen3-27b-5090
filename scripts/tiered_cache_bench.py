@@ -187,8 +187,8 @@ def run_size(size, docs, spill_dir, weights, kv_dtype, rows, info, spec):
 def run_once(args):
     """All sizes in this process; returns {"env": ..., "rows": [...], "info": [...]}."""
     from tiered_cache_test import load_docs, require_ssd
-    # The bench writes to and reads from the SSD (export_ssd, import_ssd, promote_ssd): the SSD tier is off by default in the server
-    # (SPILL_SSD_GIB=0), so it is on here explicitly (--ssd-gib, default 10), and a bench with it off exits instead of timing nothing.
+    # The bench writes to and reads from the SSD (export_ssd, import_ssd, promote_ssd): the SSD tier is on in the server by default
+    # (SPILL_SSD_GIB=300; 0 turns it off), and here it is set explicitly (--ssd-gib, default 10): a bench with it off exits instead of timing nothing.
     require_ssd(args.ssd_gib, "the bench (export_ssd, import_ssd, promote_ssd)")
     os.environ["SPILL_SSD_GIB"] = f"{float(args.ssd_gib):g}"
     docs = load_docs(1)
@@ -250,7 +250,7 @@ def main():
     ap.add_argument("--sizes", default="32768,131072,262144", help="checkpoint sizes in tokens, comma-separated")
     ap.add_argument("--spill-dir", help="where the SSD files go (default: a temp dir; use the kvcache volume to measure it)")
     ap.add_argument("--ssd-gib", type=float, default=10.0,
-                    help="SPILL_SSD_GIB (default 10). The bench measures the SSD tier, which is off by default (0) in the server: "
+                    help="SPILL_SSD_GIB (default 10). The bench measures the SSD tier (the server's default cap is 300; 0 turns it off): "
                          "0 makes the bench exit with an error. A variant of --compare may set SPILL_SSD_GIB itself")
     ap.add_argument("--json", help="also write the results here")
     ap.add_argument("--compare", nargs="+", metavar="ENV",

@@ -51,7 +51,7 @@ def test_first_diff():
     assert t.diff_text([1], [1]).startswith("equal")
 
 
-# ---- the SSD tier is off by default in the server: the SSD scenarios and the bench must turn it on, or fail loudly
+# ---- the server's SSD tier is on by default (300 GiB), 0 turns it off: the SSD scenarios and the bench must turn it on, or fail loudly
 
 def test_require_ssd_fails_loudly_with_the_ssd_off():
     import pytest

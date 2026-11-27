@@ -12,8 +12,8 @@ Guidance for AI agents working in this repository. / 給在此 repo 工作的 AI
   設定覆寫寫在 `.env`（已被 gitignore）。不要為了覆寫而改 `compose.yaml` 的預設值。
 - Native Windows package, no WSL/Docker (`test.cmd`, `bench.cmd`): `docs/deploy-windows.md`.
   原生 Windows 程式包，不用 WSL/Docker（`test.cmd`、`bench.cmd`）：`docs/deploy-windows.md`。
-- Tiered KV cache (RAM and SSD spill) settings: `docs/tiered-cache.md`. The SSD tier is off by default (`SPILL_SSD_GIB=0`); with it on, the volume `kvcache` holds the spilled checkpoints.
-  分層 KV 快取（RAM 與 SSD）的設定見 `docs/tiered-cache.md`。SSD 層預設關閉（`SPILL_SSD_GIB=0`）；開啟時用具名磁碟區 `kvcache`。
+- Tiered KV cache (RAM and SSD spill) settings: `docs/tiered-cache.md`. The SSD tier is on by default (`SPILL_SSD_GIB=300`; `SPILL_SSD_GIB=0` turns it off); the volume `kvcache` holds the spilled checkpoints.
+  分層 KV 快取（RAM 與 SSD）的設定見 `docs/tiered-cache.md`。SSD 層預設開啟（`SPILL_SSD_GIB=300`；設為 `0` 關閉）；用具名磁碟區 `kvcache`。
 - Frontend tests: `cd frontend && python -m pytest tests -q`.
   前端測試：`cd frontend && python -m pytest tests -q`。
 - Tools tests: `python -m pytest tools/tests -q`.
