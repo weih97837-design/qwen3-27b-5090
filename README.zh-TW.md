@@ -20,7 +20,7 @@
 
 | 項目 | 白話說明 |
 | --- | --- |
-| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；SSD 層預設開啟，上限 300 GiB，`SPILL_SSD_GIB=0` 關閉），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；空間不足時依 Agent 公平淘汰（用量最大的先被清，`SPILL_FAIR_AGENTS`，預設開啟）；從未被重用過的先於重用過的被清。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
+| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；SSD 層預設開啟，上限 300 GiB，`SPILL_SSD_GIB=0` 關閉），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；空間不足時可依 Agent 公平淘汰（用量最大的先被清，`SPILL_FAIR_AGENTS=1`，預設關閉）；從未被重用過的先於重用過的被清。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
 | 多機器計數 | 多台電腦共用一台伺服器時，請求可帶 `X-Client-Id`（或伺服器設定 `CLIENT_NAMES` 對照 IP），監控頁看得到誰在用。**只計數，不限制**，排隊方式不變 |
 | Agent 識別 | 請求可帶 `X-Agent-Id`，監控頁與快取淘汰以此分辨不同的代理 |
 | 影片輸入整合 | 影片設定可調（預設一支影片最多 131,072 token、2,048 張畫面）；影片結尾存檔點，同一支影片換問題時不重算影片 |
@@ -175,7 +175,7 @@ curl -s http://127.0.0.1:46320/v1/chat/completions -H 'Content-Type: application
 
 | 標頭 | 用途 |
 | --- | --- |
-| `X-Agent-Id: <名稱>` | 代理的身分。監控頁的 Agents 表依它分組，RAM／SSD 快取滿時依它公平淘汰。名稱要固定；子任務寫成 `名稱/子id`（以第一個 `/` 之前為代理） |
+| `X-Agent-Id: <名稱>` | 代理的身分。監控頁的 Agents 表依它分組，RAM／SSD 快取滿時，開啟 `SPILL_FAIR_AGENTS=1` 才會依它公平淘汰。名稱要固定；子任務寫成 `名稱/子id`（以第一個 `/` 之前為代理） |
 | `X-Client-Id: <機器名稱>` | 機器名稱，監控頁的「機器」表依它計數。最長 64 字元，建議用英數字。沒帶時用來源 IP（或 `CLIENT_NAMES` 對照的名稱） |
 
 伺服器沒有 API key，也不限制並行或速率，多的請求只是排隊。限制並行是各用戶端自己的責任。詳見 [docs/agent-client-guide.md](docs/agent-client-guide.md)（繁體中文）。

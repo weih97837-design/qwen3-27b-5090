@@ -1060,7 +1060,7 @@ std::vector<Row> make_rows() {
         {L"Pinned RAM (GiB)", L"SPILL_PINNED_GIB", "spill_pinned_gib", K::edit, T::engine, L"0: off. Faster copies"},
         {L"Asynchronous copies", L"SPILL_ASYNC_IO", "spill_async_io", K::choice, T::engine, nullptr},
         {L"Delay hits (async restore)", L"SPILL_ASYNC_PROMOTE", "spill_async_promote", K::choice, T::engine, nullptr},
-        {L"Fair agents (evict from the biggest)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
+        {L"Fair agents (evict from the biggest; default off)", L"SPILL_FAIR_AGENTS", "spill_fair_agents", K::choice, T::engine, nullptr},
         {L"Never-hit entry lifetime (seconds)", L"SPILL_UNUSED_TTL_S", "spill_unused_ttl_s", K::edit, T::engine, L"Dropped from RAM and SSD. 0: off"},
         {L"Cold agent after (seconds)", L"SPILL_COLD_AFTER_S", "spill_cold_after_s", K::edit, T::engine, L"No hits and nothing newer than this: evicted first"},
         {L"Evict cold agents first", L"SPILL_COLD_FIRST", "spill_cold_first", K::choice, T::engine, nullptr},

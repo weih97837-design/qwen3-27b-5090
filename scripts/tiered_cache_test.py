@@ -166,7 +166,7 @@ L_VIDEO_TOKENS = 9000  # the video's tokens in the prompt at least (two chunks o
 L_MIN_PROMPT = 12288   # tokens of a prompt of scenario l at least (the video, the text before it and the question)
 L_QUESTIONS = ("What colors appear in the video, and in which order?", "At about which second does the color change first?")
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
-# k tests the per-agent step of the eviction order: SPILL_FAIR_AGENTS is asked for here explicitly (it is also the server's default), not left
+# k tests the per-agent step of the eviction order: SPILL_FAIR_AGENTS is asked for here explicitly (the server default is off), not left
 # to the engine's C++ default
 SCEN_ENV = {"k": {"SPILL_FAIR_AGENTS": "1"},
             "f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
