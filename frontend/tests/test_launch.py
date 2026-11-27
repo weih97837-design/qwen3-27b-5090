@@ -261,8 +261,11 @@ def test_tier_policy_sees_the_defaults(monkeypatch, tmp_path):
     _clean_engine_env(monkeypatch)
     launch.set_engine_env(tmp_path)
     tiers = TierPolicy.from_env(object(), log=lambda *a: None)  # (the worker's read, after set_engine_env)
-    assert tiers is not None and tiers.directory == pathlib.Path(launch.spill_dir_default())
-    assert tiers.budget == 100 * (1 << 30) and tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)
+    # the SSD tier is off by default: no cap, no directory (the folder default is still the compose volume, for when it is turned on)
+    assert tiers is not None and tiers.directory is None and tiers.budget == 0 and tiers.fair_agents is False
+    assert tiers.ttl_s == 7 * 86400.0  # (the other SPILL_* keep their defaults)
+    monkeypatch.setenv("SPILL_SSD_GIB", "10")
+    assert TierPolicy.from_env(object(), log=lambda *a: None).directory == pathlib.Path(launch.spill_dir_default())
 
 
 # ---------------------------------------------------------------- the tiered cache settings
@@ -401,12 +404,12 @@ def test_the_stats_page_settings_follow_the_applied_ones(monkeypatch):
 
 
 def test_spill_fair_agents_setting(monkeypatch):
-    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", True, "flag")
+    assert launch.TIER_SETTINGS["spill_fair_agents"][:3] == ("SPILL_FAIR_AGENTS", False, "flag")
     assert launch.ENV_NAMES["spill_fair_agents"] == "SPILL_FAIR_AGENTS"
     monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
+    assert launch.env_settings()["spill_fair_agents"] is False  # (off by default)
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "1")
     assert launch.env_settings()["spill_fair_agents"] is True
-    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
-    assert launch.env_settings()["spill_fair_agents"] is False
     assert launch.tier_env_value("spill_fair_agents", False) == "0" and launch.tier_env_value("spill_fair_agents", True) == "1"
 
 

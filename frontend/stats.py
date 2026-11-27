@@ -345,6 +345,8 @@ def tiers_block(engine, tiers, environ=None):
                 "ssd_logical_bytes": ts.get("ssd_logical_bytes"), "ssd_physical_bytes": ts.get("ssd_physical_bytes"),
                 "ssd_dedup_ratio": ts.get("ssd_dedup_ratio"),
                 "ssd_cap_bytes": ts.get("ssd_budget_bytes"), "disk_free_bytes": disk_free,
+                # the SSD tier is off (the default; SPILL_SSD_GIB=0 or no SPILL_DIR): no bar, no SSD counters in the UI
+                "ssd_enabled": ts.get("ssd_enabled"), "ssd_off_reason": ts.get("ssd_off_reason"),
                 "spilled": sp["spilled"], "restored": sp["restored"], "written": sp["written"],
                 "dropped": sp["dropped"], "subsumed": sp["subsumed"], "failed": sp["failed"],
                 "backed_up": sp.get("backed_up", 0), "restoring": sp.get("restoring", 0),
@@ -394,11 +396,16 @@ def host_info(started, now=None, meminfo="/proc/meminfo"):
             "ram_avail_bytes": avail, "uptime_s": now - started}
 
 
+# What an unset (or empty) variable means for the settings whose default is not "unset": the SSD tier and the per-agent step are off.
+DEPLOY_DEFAULTS = {"SPILL_SSD_GIB": "0", "SPILL_FAIR_AGENTS": "0"}
+
+
 def deploy_info(started, engine_state, environ=None):
     """How the server was started: the engine's state and the settings from the environment (None if unset)."""
     env = os.environ if environ is None else environ
     return {"started_at": started, "engine_state": engine_state,
-            "settings": {k: env.get(k) for k in DEPLOY_SETTINGS}}
+            "settings": {k: env.get(k) if env.get(k) not in (None, "") or k not in DEPLOY_DEFAULTS else DEPLOY_DEFAULTS[k]
+                         for k in DEPLOY_SETTINGS}}
 
 
 ENGINE_TIME_WINDOW_S = 60.0   # the recent window of the engine time split (引擎時間分配)

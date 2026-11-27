@@ -1052,7 +1052,7 @@ std::vector<Row> make_rows() {
         // The tiered cache (docs/tiered-cache.md): the engine process reads these when it loads, so they reload the engine.
         {L"RAM tier (GiB)", L"SPILL_RAM_GIB", "spill_ram_gib", K::edit, T::engine, L"0: tiered cache off"},
         {L"RAM retention (seconds)", L"SPILL_RAM_RETENTION_S", "spill_ram_retention_s", K::edit, T::engine, L"Idle time before it goes to SSD"},
-        {L"SSD cap (GiB)", L"SPILL_SSD_GIB", "spill_ssd_gib", K::edit, T::engine, L"Oldest files go first"},
+        {L"SSD cap (GiB)", L"SPILL_SSD_GIB", "spill_ssd_gib", K::edit, T::engine, L"0: SSD tier off (default). Oldest files go first"},
         {L"SSD minimum free (GiB)", L"SPILL_SSD_MIN_FREE_GIB", "spill_ssd_min_free_gib", K::edit, T::engine, L"Never fill the disk below this"},
         {L"SSD minimum entry (tokens)", L"SPILL_SSD_MIN_TOKENS", "spill_ssd_min_tokens", K::edit, T::engine, L"Shorter ones are not written. 0: all"},
         {L"File lifetime (days)", L"SPILL_TTL_DAYS", "spill_ttl_days", K::edit, T::engine, L"Files not reused are deleted"},

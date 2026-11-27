@@ -118,7 +118,7 @@ def test_unknown_gpu_ram_disk_fall_back_to_compose_defaults_without_crashing():
     assert rec["env"]["MAX_SEQS"] == "8"
     assert rec["env"]["MAX_TOKENS"] == "262144"
     assert rec["env"]["SPILL_RAM_GIB"] == "64"
-    assert rec["env"]["SPILL_SSD_GIB"] == "100"
+    assert rec["env"]["SPILL_SSD_GIB"] == "0"  # (compose.yaml's default: the SSD tier is off)
     assert rec["hints"] == []
     assert "GPU 未偵測" in rec["notes"]
     assert rec["reasons"]["SPILL_RAM_GIB"].startswith("RAM 未偵測")

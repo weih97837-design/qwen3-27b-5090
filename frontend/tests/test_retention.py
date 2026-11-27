@@ -197,8 +197,8 @@ def test_status_reuse_split_and_agent_rows(tmp_path):
 def test_from_env_reads_spill_fair_agents(monkeypatch):
     monkeypatch.setenv("SPILL_RAM_GIB", "4")
     monkeypatch.delenv("SPILL_FAIR_AGENTS", raising=False)
-    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is True
-    for text, want in (("1", True), ("0", False), ("false", False), ("", True), ("yes", True)):
+    assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is False  # (off by default)
+    for text, want in (("1", True), ("0", False), ("false", False), ("", False), ("yes", True)):
         monkeypatch.setenv("SPILL_FAIR_AGENTS", text)
         assert TierPolicy.from_env(FakeEngine(), log=lambda _m: None).fair_agents is want, text
 
@@ -312,7 +312,7 @@ def test_dedup_layout_make_room_applies_the_retention_order(tmp_path):
     eng.dir = tmp_path / "spill" / "entries"
     clock = Clock()
     tier = TierPolicy(eng, str(tmp_path / "spill"), ram_retention_s=0, ssd_gib=10_000 * B, ssd_min_free_gib=0, ttl_days=7, tick_s=0,
-                      clock=clock, disk_free=lambda _d: 10 ** 12, log=lambda _m: None)
+                      clock=clock, disk_free=lambda _d: 10 ** 12, log=lambda _m: None, fair_agents=True)
     tier.start()
     eng.dir.mkdir(parents=True, exist_ok=True)
     big_hit = eng.add_disk(1, hits=4)

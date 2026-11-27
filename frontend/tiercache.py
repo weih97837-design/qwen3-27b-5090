@@ -6,6 +6,12 @@ busy) is written to a file in the directory (engine.spill_export). Files stay wi
 written first) and a free-space reserve, and are deleted after ttl_days. A file an earlier run wrote is indexed at
 start() (engine.spill_import). A checkpoint that is reused leaves the engine's list by itself.
 
+The SSD tier is OFF by default (SPILL_SSD_GIB=0, and SPILL_SSD_GIB=0 set explicitly means the same): TierPolicy then has no
+directory, and the engine is started with SPILL_DIR empty (ssd_off_env, called by worker.Scheduler before the engine is made;
+launch.py does the same in the engine's settings), so the engine DROPS the victims of a full RAM tier instead of writing them.
+Nothing is written to, read from, scanned or deleted in any SPILL_DIR then (no write at a stop, no import at a start, no sweep): a
+folder an earlier run left is not touched.
+
 Idle backups (VRAM_BACKUP_IDLE_S, worker.Scheduler): while the engine is idle, the engine copies VRAM checkpoints to
 RAM without removing them from VRAM (engine.spill_backup_one); their entries have "backup": True. Retention never writes
 them to the SSD (tick skips them: the checkpoint is still in VRAM). flush() does write them on a stop
@@ -73,6 +79,27 @@ def _float(name, raw):
     return v
 
 
+def ssd_gib_of_env(environ=None):
+    """SPILL_SSD_GIB as a number of GiB: unset or empty is 0 (the SSD tier is off by default). Raises ValueError for a bad value."""
+    env = os.environ if environ is None else environ
+    text = env.get("SPILL_SSD_GIB")
+    return 0.0 if text is None or not text.strip() else _float("SPILL_SSD_GIB", text)
+
+
+def ssd_off_env(environ=None):
+    """Makes an environment the engine will read say "no SSD tier" when the SSD cap is 0 (the default): SPILL_DIR is set to the empty
+    string, which is what makes the engine drop the victims of a full RAM tier instead of writing them to a folder (the policy would
+    delete them again). Returns True when the SSD tier is off. An unreadable SPILL_SSD_GIB changes nothing (TierPolicy.from_env raises)."""
+    env = os.environ if environ is None else environ
+    try:
+        off = not ssd_gib_of_env(env) > 0
+    except ValueError:
+        return False
+    if off:
+        env["SPILL_DIR"] = ""
+    return off
+
+
 def _size(path):
     if not path:
         return 0
@@ -133,14 +160,15 @@ def _cold_owners(entries, times, now, after):
 
 
 class TierPolicy:
-    def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=100, ssd_min_free_gib=10, ttl_days=7,
+    def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=0, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
-                 backup_victims=8, ssd_min_tokens=32768, fair_agents=True, unused_ttl_s=1800, cold_after_s=600,
+                 backup_victims=8, ssd_min_tokens=32768, fair_agents=False, unused_ttl_s=1800, cold_after_s=600,
                  cold_first=True, ssd_warm_only=True, probation_gib=4):
         self.engine = engine
-        self.directory = Path(directory) if directory else None  # None: no SSD tier
-        self.ram_retention_s = float(ram_retention_s)
         self.budget = float(ssd_gib) * GiB
+        # None: no SSD tier. Also when the cap is 0 (the default): "0 GiB" means off, not "a zero budget that deletes what the engine writes".
+        self.directory = Path(directory) if directory and self.budget > 0 else None
+        self.ram_retention_s = float(ram_retention_s)
         self.reserve = float(ssd_min_free_gib) * GiB
         self.ttl_s = float(ttl_days) * DAY
         self.tick_s = float(tick_s)
@@ -184,7 +212,7 @@ class TierPolicy:
             return None
         opts = {}
         for env, key, default in (("SPILL_RAM_RETENTION_S", "ram_retention_s", 3600),
-                                  ("SPILL_SSD_GIB", "ssd_gib", 100),
+                                  ("SPILL_SSD_GIB", "ssd_gib", 0),
                                   ("SPILL_SSD_MIN_FREE_GIB", "ssd_min_free_gib", 10),
                                   ("SPILL_TTL_DAYS", "ttl_days", 7),
                                   ("SPILL_TICK_S", "tick_s", 30),
@@ -197,10 +225,10 @@ class TierPolicy:
                                   ("SPILL_PROBATION_GIB", "probation_gib", 4)):
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else _float(env, text)
-        for env, key in (("SPILL_FAIR_AGENTS", "fair_agents"), ("SPILL_COLD_FIRST", "cold_first"),
-                         ("SPILL_SSD_WARM_ONLY", "ssd_warm_only")):  # (flags: 1 / 0; unset or empty: on)
+        for env, key, default in (("SPILL_FAIR_AGENTS", "fair_agents", False), ("SPILL_COLD_FIRST", "cold_first", True),
+                                  ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", True)):  # (flags: 1 / 0; unset or empty: the default)
             text = os.environ.get(env)
-            opts[key] = True if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
+            opts[key] = default if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
             log(f"tiered cache: SPILL_FLUSH_ON_STOP_S {opts['flush_on_stop_s']:g} cut to {STOP_FLUSH_MAX_S:g} s "
                 "(the server stops the engine within 10-15 s)")
@@ -754,5 +782,7 @@ class TierPolicy:
                 "unused_ttl_s": self.unused_ttl_s, "cold_after_s": self.cold_after_s, "ssd_warm_only": self.ssd_warm_only,
                 "probation_bytes": int(self.probation_bytes),
                 "agent_rows": list(self.agent_rows),
-                "ssd_budget_bytes": int(self.budget), "ssd_min_tokens": self.ssd_min_tokens,
+                "ssd_enabled": self.directory is not None,
+                "ssd_off_reason": None if self.directory is not None else ("gib" if not self.budget > 0 else "dir"),
+                "ssd_budget_bytes": int(self.budget) if self.directory is not None else 0, "ssd_min_tokens": self.ssd_min_tokens,
                 "ssd_skipped_short": self.skipped_short, "last_error": self.last_error}

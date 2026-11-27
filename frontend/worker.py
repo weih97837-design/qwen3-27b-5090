@@ -322,6 +322,7 @@ class Scheduler:
 
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
+        from tiercache import ssd_off_env  # (the frontend dir is on sys.path)
 
         self.conn, self.cfg, self.KvFull = conn, cfg, KvFull
         for k, v in cfg.get("env", {}).items():  # (the start settings, launch.py; None: unset)
@@ -329,6 +330,9 @@ class Scheduler:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # SSD tier off (SPILL_SSD_GIB=0, the default): the engine gets SPILL_DIR="" and drops the victims of a full RAM tier instead of
+        # writing files the policy would delete (docs/tiered-cache.md). Before the engine is made: it reads SPILL_DIR then.
+        ssd_off_env(os.environ)
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         from tiercache import TierPolicy  # (tiered cache: SPILL_RAM_GIB; the frontend dir is on sys.path)
