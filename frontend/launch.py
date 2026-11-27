@@ -43,7 +43,7 @@ ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "8", "KV_POOL_
 # rest: the engine process reads the engine's (SPILL_RAM_GIB, SPILL_PINNED_GIB, SPILL_ASYNC_*) and worker.TierPolicy
 # the policy's (retention, SSD cap and free space, TTL, VRAM backup) from its environment when it loads, so a change
 # takes effect with an engine restart. The defaults are those of compose.yaml and TierPolicy (tests/test_launch.py).
-# kind: "num" (a number, 0 or more; no upper limit: the machine decides), "flag" (0 or 1) or "path".
+# kind: "num" (a number, 0 or more; no upper limit: the machine decides), "flag" (0 or 1), "path" or "choice" (one of TIER_CHOICES[key]).
 TIER_SETTINGS = {
     "spill_ram_gib": ("SPILL_RAM_GIB", 64, "num"),                # 0: no tiered cache at all
     "spill_ram_retention_s": ("SPILL_RAM_RETENTION_S", 3600, "num"),
@@ -63,9 +63,14 @@ TIER_SETTINGS = {
     "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"),
     "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", False, "flag"),
     "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num"),
+    # the retention policy of the tiers and the VRAM checkpoints (docs/tiered-cache.md "CACHE_POLICY=smart"): legacy (the rules above) or
+    # smart (value based; read by the engine for RAM / VRAM and by TierPolicy for the SSD). Its constants (CACHE_PREFILL_T0_US, ...) are
+    # plain variables, not settings here.
+    "cache_policy": ("CACHE_POLICY", "legacy", "choice"),
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier (it also is, whatever the folder, when spill_ssd_gib is 0)
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down
+TIER_CHOICES = {"cache_policy": ("legacy", "smart")}  # the values of the "choice" settings (cache_policy.POLICIES)
 TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
 
 # ----- Video / image media settings: THE place of their defaults ------------------------------------------------------
@@ -166,6 +171,13 @@ def parse_tier(key, text, warn=None):
         return default
     if kind == "flag":
         return atoi(text) != 0  # (capi.cc: atoi(value) != 0)
+    if kind == "choice":  # (case and blanks ignored, as the engine's cache_policy_of)
+        v = "".join(text.split()).lower()
+        if v in TIER_CHOICES[key]:
+            return v
+        (warn or (lambda m: print(m, file=sys.stderr, flush=True)))(
+            f"{var}={text!r} is not one of {', '.join(TIER_CHOICES[key])}: using {default}")
+        return default
     try:
         v = float(text)
         if math.isfinite(v) and v >= 0:
@@ -331,6 +343,9 @@ class Launch:
             elif kind == "flag":
                 if not isinstance(v, bool):
                     raise ValueError(f"{k}: true or false")
+            elif kind == "choice":
+                if v not in TIER_CHOICES[k]:
+                    raise ValueError(f"{k}: one of {', '.join(TIER_CHOICES[k])}")
             elif not isinstance(v, str) or "\0" in v or len(v) > 4096 or v.strip() != v:
                 raise ValueError(f"{k}: a folder path, without spaces around it (empty: no SSD tier)")
             elif check_budget and v and os.path.exists(v) and not os.path.isdir(v):  # (not for the server's own start)

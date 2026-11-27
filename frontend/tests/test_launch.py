@@ -280,6 +280,8 @@ def test_tier_defaults_are_the_compose_ones():
         assert m, var
         if kind == "path":
             assert m.group(1) == launch.ENGINE_ENV_DEFAULTS[var]
+        elif kind == "choice":  # (CACHE_POLICY: a word)
+            assert m.group(1) == default and default in launch.TIER_CHOICES[key], var
         else:
             assert float(m.group(1)) == float(default), var
         assert launch.ENV_NAMES[key] == var

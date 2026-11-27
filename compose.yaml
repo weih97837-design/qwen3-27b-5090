@@ -108,6 +108,13 @@ services:
       SPILL_COLD_AFTER_S: ${SPILL_COLD_AFTER_S:-600}  # an agent with no hit in a tier whose newest entry there is this old is "cold"
       SPILL_COLD_FIRST: ${SPILL_COLD_FIRST:-1}  # cold agents' entries are evicted first (0: off)
       SPILL_SSD_WARM_ONLY: ${SPILL_SSD_WARM_ONLY:-0}  # [SSD tier on only] 1: never-hit entries of agents without any hit are not written to the SSD (auto: agents: never; agents with an id: within SPILL_PROBATION_GIB); 0 (default): write everything
+      CACHE_POLICY: ${CACHE_POLICY:-legacy}  # retention of the RAM / SSD tiers and the VRAM checkpoints: legacy (default, the SPILL_* rules) | smart (value based, docs/tiered-cache.md "CACHE_POLICY=smart"; validate with tools/cache_sim.py first)
+      CACHE_PREFILL_T0_US: ${CACHE_PREFILL_T0_US:-54}  # [smart] prefill microseconds per token at depth 0 (RTX 5090 default)
+      CACHE_PREFILL_K_US: ${CACHE_PREFILL_K_US:-0.31}  # [smart] more microseconds per token per 1,000 tokens of depth
+      CACHE_SUPERSEDED_FACTOR: ${CACHE_SUPERSEDED_FACTOR:-0.25}  # [smart] value of a checkpoint a deeper one of its chain stands in for
+      CACHE_JUNCTION_FACTOR: ${CACHE_JUNCTION_FACTOR:-2}  # [smart] value of a branch point / a prefix shared by >= 2 agents
+      CACHE_HIT_WEIGHT: ${CACHE_HIT_WEIGHT:-0}  # [smart] value x (1 + this x hits); hits count a conversation's turns (inherited and never decay); default 0: ignore them
+      CACHE_MIN_RESIDENT_S: ${CACHE_MIN_RESIDENT_S:-300}  # [smart] RAM / SSD entries younger than this are not victims unless all are
       SPILL_PROBATION_GIB: ${SPILL_PROBATION_GIB:-4}  # [SSD tier on only, and only with SPILL_SSD_WARM_ONLY=1] SSD room of all such unproven entries together; the oldest goes first
       SPILL_TTL_DAYS: ${SPILL_TTL_DAYS:-7}         # [SSD tier on only] files not reused for this many days are deleted
       SPILL_TICK_S: ${SPILL_TICK_S:-30}            # seconds between the tier maintenance passes

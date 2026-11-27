@@ -43,6 +43,15 @@ engine reports "hits" for, so an engine without the retention fields keeps the o
      (SPILL_PROBATION_GIB, 4: all unproven entries on the SSD together; the oldest unproven one goes first); one of an `auto:` agent
      (no X-Agent-Id: a new id per prompt) is dropped instead. "not_written".
 
+CACHE_POLICY=smart (frontend/cache_policy.py; docs/tiered-cache.md "CACHE_POLICY=smart"; default legacy: everything above unchanged).
+For the SSD tier: the victim is the minimum GreedyDual priority (stamp + prefill seconds saved over the parent / GiB x (1 + hits) x
+junction x superseded factor) among the SSD leaves, young entries (written < CACHE_MIN_RESIDENT_S ago) protected; no cold-agent step, no
+per-agent step. A superseded entry is written like any other (with its reduced value), never dropped for being superseded. SSD admission
+replaces SPILL_SSD_WARM_ONLY / the probation quota: an entry goes to the SSD only when its priority there is above the SSD's watermark L
+(the priority of the last SSD victim: below it, it would be the next victim). The tick path checks it before writing; an entry the
+engine's RAM cap wrote is checked at the first tick that sees it on the SSD (and dropped when it fails). The per-entry numbers come from
+the engine's spill_meta (parent_pos, desc_tiers, junction, appended under smart); SPILL_SSD_MIN_TOKENS and rule A still apply.
+
 Everything runs on the caller's thread: the engine is not thread-safe.
 """
 
@@ -52,6 +61,8 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+
+import cache_policy as cp
 
 GiB = 1 << 30
 DAY = 86400.0
@@ -164,8 +175,14 @@ class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=300, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
                  backup_victims=8, ssd_min_tokens=32768, fair_agents=False, unused_ttl_s=0, cold_after_s=600,
-                 cold_first=True, ssd_warm_only=False, probation_gib=4):
+                 cold_first=True, ssd_warm_only=False, probation_gib=4, cache_policy=cp.LEGACY, smart_params=None):
         self.engine = engine
+        self.cache_policy = cp.policy_of(cache_policy)  # CACHE_POLICY: legacy (the rules above) or smart (cache_policy.py)
+        self.smart = self.cache_policy == cp.SMART
+        self.smart_params = smart_params or cp.SmartParams()
+        self.gd = cp.GdTier()                           # smart: the SSD's watermark, stamps and counters
+        self.not_admitted = 0                           # smart: entries refused by the SSD admission (below the watermark)
+        self._pick = None                               # smart: (entry id, Pick) of the last victim chosen, until its drop succeeds
         self.budget = float(ssd_gib) * GiB
         # None: no SSD tier. Also when the cap is 0 (set explicitly): "0 GiB" means off, not "a zero budget that deletes what the engine writes".
         self.directory = Path(directory) if directory and self.budget > 0 else None
@@ -230,6 +247,8 @@ class TierPolicy:
                                   ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", False)):  # (flags: 1 / 0; unset or empty: the default)
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
+        opts["cache_policy"] = cp.policy_of(os.environ.get("CACHE_POLICY"))  # (ValueError for anything but legacy / smart)
+        opts["smart_params"] = cp.SmartParams.from_env(os.environ)
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
             log(f"tiered cache: SPILL_FLUSH_ON_STOP_S {opts['flush_on_stop_s']:g} cut to {STOP_FLUSH_MAX_S:g} s "
                 "(the server stops the engine within 10-15 s)")
@@ -344,6 +363,7 @@ class TierPolicy:
         for book in (self.written, self.ram_since):
             for entry_id in [i for i in book if i not in listed]:
                 del book[entry_id]
+        fresh = []  # smart: entries first seen on the SSD (the engine's RAM cap wrote them): their admission is checked below
         for e in entries:
             entry_id = e["id"]
             if e["ram_bytes"] > 0:
@@ -354,11 +374,16 @@ class TierPolicy:
                 self.ram_since.pop(entry_id, None)
                 if e["on_disk"] and entry_id not in self.written:
                     self.written[entry_id] = _mtime(e["path"], now)
+                    fresh.append(entry_id)
 
         entries = self._expire(entries, now)  # A (also without an SSD: RAM entries nobody used go too)
         if self.directory is None:  # no SSD tier: RAM entries stay until the engine's own cap drops them
             return
-        probation = self._probation_state(entries, now)  # C: also removes unproven entries that reached the SSD some other way
+        if self.smart:
+            entries = self._admit_fresh(entries, fresh, now)
+            probation = None  # (no warm-only test under smart: the admission replaces it)
+        else:
+            probation = self._probation_state(entries, now)  # C: also removes unproven entries that reached the SSD some other way
 
         # RAM -> SSD: the oldest checkpoints first; when busy, only after twice the retention. An idle backup is not
         # written: its checkpoint is still in VRAM, so the file would be a copy of data that is not lost.
@@ -371,7 +396,7 @@ class TierPolicy:
             age = now - self.ram_since.get(e["id"], now)
             if age < self.ram_retention_s or not (idle or age >= 2 * self.ram_retention_s):
                 continue
-            if _sup_durable(e):
+            if not self.smart and _sup_durable(e):
                 self.skipped_superseded += 1
                 self._drop(e["id"], f"superseded: a deeper checkpoint of its conversation is on the SSD ({e['pos']} tokens)")
                 continue
@@ -380,6 +405,10 @@ class TierPolicy:
                 self._drop(e["id"], f"shorter than SPILL_SSD_MIN_TOKENS ({e['pos']} < {self.ssd_min_tokens} tokens)")
                 continue
             if not self._gate(e, probation):
+                continue
+            if self.smart and not self._smart_admit(e, now):
+                if self._drop(e["id"], "below the SSD's watermark (CACHE_POLICY=smart admission)"):
+                    self.not_admitted += 1
                 continue
             self._to_disk(e, now)
 
@@ -554,11 +583,11 @@ class TierPolicy:
         deadline = clock() + budget_s
         now = self.clock()
         ram = sorted((e for e in self.engine.spill_list()  # (short ones stay in RAM, and so do those whose deeper checkpoint is already on the SSD; deeper ones first)
-                      if e["ram_bytes"] > 0 and not e.get("busy") and not self._short(e) and not _sup_durable(e)),
+                      if e["ram_bytes"] > 0 and not e.get("busy") and not self._short(e) and (self.smart or not _sup_durable(e))),
                      key=lambda e: (not _hit(e), -(e.get("pos") or 0), self.ram_since.get(e["id"], now)))
         rate = self.write_bps or DEFAULT_WRITE_BPS
         skipped = 0
-        probation = self._probation_state(self.engine.spill_list(), now)
+        probation = None if self.smart else self._probation_state(self.engine.spill_list(), now)
         for i, e in enumerate(ram):
             remaining = deadline - clock()
             if remaining <= 0:
@@ -626,6 +655,7 @@ class TierPolicy:
             except RuntimeError as ex:
                 self._error(f"make room, drop {entry_id}: {ex}")
                 continue  # its bytes are still on disk: not freed
+            self._evicted(entry_id, entries)
             self.written.pop(entry_id, None)
             self.log(f"tiered cache: entry {entry_id} deleted to make room ({sizes[entry_id]} bytes)")
             used -= sizes[entry_id]
@@ -646,6 +676,8 @@ class TierPolicy:
         among cold agents is "most bytes first"; with fair_agents off: all cold entries, then the entry order below)."""
         if not disk:
             return None
+        if self.smart:
+            return self._smart_victim(disk)
         cand = disk
         if self.cold_first:
             now = self.clock()
@@ -663,6 +695,63 @@ class TierPolicy:
             size = e.get("logical_bytes") or unique
             return (not e.get("superseded"), _hit(e), unique < MOSTLY_SHARED * size, self.written.get(e["id"], 0.0))
         return min(cand, key=key)
+
+    # ------------------------------------------------------------ CACHE_POLICY=smart (the SSD tier)
+
+    def _cand(self, e, now, size=None):
+        """cache_policy.Cand of an entry for the SSD tier, from the engine's spill_meta numbers (an engine without them: no parent, a
+        leaf, no junction). size: the bytes it costs on the SSD (default: what dropping it frees there)."""
+        if size is None:
+            size = e.get("unique_disk_bytes") or e.get("logical_bytes") or _size(e.get("path")) or e.get("ram_bytes") or 0
+        written = self.written.get(e["id"], now)
+        return cp.Cand(depth=e.get("pos") or 0, parent_depth=e.get("parent_pos") or 0, bytes=size, hits=e.get("hits") or 0,
+                       junction=bool(e.get("junction")), superseded=bool(e.get("superseded")),
+                       leaf=not (int(e.get("desc_tiers") or 0) & cp.TIER_SSD), young=now - written < self.smart_params.min_resident_s,
+                       stamp=self.gd.stamp_at(e.get("last_use") or 0), age_key=written, ref=e["id"])
+
+    def _smart_victim(self, disk):
+        now = self.clock()
+        cands = [self._cand(e, now) for e in disk]
+        k = cp.smart_pick(cands, self.smart_params)
+        if k.idx < 0:
+            return None
+        self._pick = (cands[k.idx].ref, k)
+        return disk[k.idx]
+
+    def _evicted(self, entry_id, entries):
+        """A victim of make_room was dropped: under smart the watermark moves to its priority (legacy: nothing)."""
+        if self.smart and self._pick is not None and self._pick[0] == entry_id:
+            self.gd.evicted(self._pick[1], max((e.get("last_use") or 0 for e in entries), default=0))
+        self._pick = None
+
+    def _smart_admit(self, e, now, size=None):
+        """Whether entry e may stay on / go to the SSD (smart): its priority there is above the SSD's watermark L. size: what it costs
+        there (default for a RAM entry: new_disk_bytes, the chunk files and manifest not on the SSD yet)."""
+        if self.gd.L <= 0:
+            return True  # (nothing was evicted from the SSD yet: there is room)
+        if size is None:
+            size = (e.get("new_disk_bytes", e.get("ram_bytes")) if self._layout() else e.get("ram_bytes")) or 0
+        return cp.smart_priority(self.smart_params, self._cand(e, now, size=size)) > self.gd.L
+
+    def _admit_fresh(self, entries, fresh, now):
+        """Entries the engine's RAM cap wrote to the SSD since the last tick get the admission test now (dropped when they fail).
+        Returns the engine's list again when something went."""
+        if not fresh or self.gd.L <= 0:
+            return entries
+        byid = {e["id"]: e for e in entries}
+        gone = False
+        for i in fresh:
+            e = byid.get(i)
+            if e is None or e.get("busy") or not e["on_disk"] or e["ram_bytes"] > 0:
+                continue
+            if not self._smart_admit(e, now, size=e.get("unique_disk_bytes") or e.get("logical_bytes") or _size(e.get("path"))):
+                if self._drop(i, "below the SSD's watermark (CACHE_POLICY=smart admission)"):
+                    self.not_admitted += 1
+                    gone = True
+        if gone:
+            entries = self.engine.spill_list()
+            self.listed = entries
+        return entries
 
     def _read_agents(self):
         """The engine's per-agent bytes [{"owner", "ram_bytes", "ssd_bytes", "ram_entries", "ssd_entries"}], [] without the call."""
@@ -722,6 +811,7 @@ class TierPolicy:
             except RuntimeError as ex:
                 self._error(f"make room, drop {victim}: {ex}")
                 continue  # its bytes are still on disk: not freed
+            self._evicted(victim, entries)
             self.written.pop(victim, None)
             # The siblings' unique bytes and the incoming entry's new bytes changed with this drop: ask again.
             entries = self.engine.spill_list()
@@ -786,4 +876,6 @@ class TierPolicy:
                 "ssd_enabled": self.directory is not None,
                 "ssd_off_reason": None if self.directory is not None else ("gib" if not self.budget > 0 else "dir"),
                 "ssd_budget_bytes": int(self.budget) if self.directory is not None else 0, "ssd_min_tokens": self.ssd_min_tokens,
-                "ssd_skipped_short": self.skipped_short, "last_error": self.last_error}
+                "ssd_skipped_short": self.skipped_short, "last_error": self.last_error,
+                "cache_policy": self.cache_policy, "ssd_not_admitted": self.not_admitted,
+                **{f"ssd_smart_{k}": v for k, v in self.gd.stats().items()}}

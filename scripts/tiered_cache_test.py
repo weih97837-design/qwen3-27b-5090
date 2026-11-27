@@ -55,6 +55,12 @@ checks the spill counters to show that the intended path was taken.
                       so the spilled entry stays) is reported superseded, and the eviction of that continuation subsumes it instead of
                       writing it. Every restored follow-up (B from RAM, A's from the file) must equal the uncached reference. Prompts
                       are >= 25K tokens (superseded needs more than kKeepShort = 16384).
+                      With CACHE_POLICY=smart in the driver's environment (docs/tiered-cache.md "CACHE_POLICY=smart"; the driver then
+                      also sets CACHE_MIN_RESIDENT_S=0 for k, else every entry would be "young") the legacy order checks are replaced by
+                      the smart ones: the engine reports smart (spill_stats cache_smart, spill_meta parent_pos / desc_tiers / junction),
+                      the cap's victims were leaves of the RAM tier when chosen and are counted (GdTier counters), and evicting A3's
+                      continuation keeps A3's superseded entry (nothing subsumed). The restored follow-ups must equal the reference as
+                      under legacy (B's and A2's restores may come from RAM or the SSD).
 
   l  Video input      (docs/tiered-cache.md, the video input section; needs the vision tower and NVDEC, else skipped.) The prompts are a text
                       prefix and the video bench/vision/colors.mp4 sampled to ~9,000 tokens (num_frames: the frames are looped, so the
@@ -768,6 +774,9 @@ def scen_k(R, spill_dir):
         R.turn1(k, make_prompt(R.docs, R.L, conv[k][1]))
 
     s0 = R.snap("run start")
+    smart = bool(R.cache and s0.get("cache_smart") == 1)  # (CACHE_POLICY=smart: the smart checks below instead of the legacy order's)
+    if R.cache:
+        R.log(f"  scenario k runs with CACHE_POLICY={'smart' if smart else 'legacy'}")
     turn1("A1")
     turn1("B")                       # evicts A1's checkpoint: RAM {A1}
     own(K_OWNER_A)
@@ -778,13 +787,16 @@ def scen_k(R, spill_dir):
     turn1("A3")                      # RAM {B, A1', A2}
     if R.cache:
         mid = k_ents(R)
+        pre = {e["id"]: e for e in mid}
         R.check("A1's restored checkpoint came back with hits >= 1 and A's owner",
                 any(e["owner"] == K_OWNER_A and e["hits"] >= 1 and k_tier(e) == "ram" for e in mid), [(e["owner"], e["hits"], k_tier(e)) for e in mid])
         R.check("B's entry carries B's owner and no hits", any(e["owner"] == K_OWNER_B and e["hits"] == 0 and k_tier(e) == "ram" for e in mid))
     sa = R.snap("RAM holds B, A1' (hit), A2 (3 entries)")
     turn1("A4")                      # evicts A3's checkpoint: 4 entries do not fit
     sb = R.snap("RAM cap enforced")
-    if R.cache:
+    if smart:
+        k_smart_checks(R, pre, sa, sb)
+    elif R.cache:
         ents = k_ents(R)
         ram = [e for e in ents if k_tier(e) == "ram"]
         disk = [e for e in ents if k_tier(e) == "disk"]
@@ -816,16 +828,24 @@ def scen_k(R, spill_dir):
             R.eng.spill_sync_lookup(True)
         after = k_ents(R)
         sup = [e for e in after if e.get("superseded")]
+        # (under smart the restored A1 checkpoint is spilled too and is superseded by A1's deeper one: hits >= 1, not A3's)
+        a3 = [e for e in sup if e["owner"] == K_OWNER_A and e["hits"] == 0]
         R.check("the shallower entry of A3 is reported superseded by the continuation in the pool",
-                len(sup) == 1 and sup[0]["owner"] == K_OWNER_A and sup[0]["hits"] == 0,
+                (len(a3) == 1 if smart else len(sup) == 1 and sup[0]["owner"] == K_OWNER_A and sup[0]["hits"] == 0),
                 [(e["owner"], e["hits"], e.get("superseded"), k_tier(e)) for e in after])
         se = R.snap("continuation of A3 in the pool")
         turn1("A5")  # evicts the continuation
         sf = R.snap("after A5")
-        R.check("evicting the continuation replaced the superseded entry (subsumed), not kept both",
-                sf["subsumed"] > se["subsumed"] and not any(e.get("superseded") for e in k_ents(R)),
-                f"subsumed +{sf['subsumed'] - se['subsumed']}")
-        R.check("the small agent's entry survived all of this", any(e["owner"] == K_OWNER_B and k_tier(e) == "ram" for e in k_ents(R)))
+        if smart:
+            ids_after = {e["id"] for e in k_ents(R)}
+            R.check("smart: evicting the continuation kept A3's superseded entry (spilled with its reduced value, nothing subsumed)",
+                    sf["subsumed"] == se["subsumed"] and bool(a3) and a3[0]["id"] in ids_after,
+                    f"subsumed +{sf['subsumed'] - se['subsumed']}, A3's entry {'kept' if a3 and a3[0]['id'] in ids_after else 'gone'}")
+        else:
+            R.check("evicting the continuation replaced the superseded entry (subsumed), not kept both",
+                    sf["subsumed"] > se["subsumed"] and not any(e.get("superseded") for e in k_ents(R)),
+                    f"subsumed +{sf['subsumed'] - se['subsumed']}")
+            R.check("the small agent's entry survived all of this", any(e["owner"] == K_OWNER_B and k_tier(e) == "ram" for e in k_ents(R)))
     else:
         R.turn2("A3", follow["A3"])
         turn1("A5")
@@ -838,8 +858,28 @@ def scen_k(R, spill_dir):
     own(K_OWNER_A)
     R.turn2("A2", follow["A2"])
     se = R.snap("after A2's follow-up")
-    R.check("A2's follow-up restored its checkpoint (the SSD file written by the RAM cap)", delta(sd, se, "restored") > 0,
+    R.check("A2's follow-up restored its checkpoint (" + ("RAM or the SSD" if smart else "the SSD file written by the RAM cap") + ")",
+            delta(sd, se, "restored") > 0,
             f"restored +{delta(sd, se, 'restored')}, from_disk +{delta(sd, se, 'restored_disk') if 'restored_disk' in se else '?'}")
+
+
+def k_smart_checks(R, pre, sa, sb):
+    """Scenario k under CACHE_POLICY=smart: what holds whatever the exact values (spill_freed is the engine's): the engine runs smart and
+    reports the chain numbers, the RAM cap took its victims among the RAM tier's leaves, and counted them."""
+    ents = k_ents(R)
+    R.check("smart: the engine runs CACHE_POLICY=smart and spill_meta has parent_pos / desc_tiers / junction",
+            sb.get("cache_smart") == 1 and all({"parent_pos", "desc_tiers", "junction"} <= e.keys() for e in ents),
+            [sorted(set(e) & {"parent_pos", "desc_tiers", "junction"}) for e in ents])
+    now = {e["id"]: e for e in ents}
+    left = [i for i, e in pre.items() if k_tier(e) == "ram" and (i not in now or k_tier(now[i]) != "ram")]
+    R.check("the RAM cap was enforced (a fourth entry did not fit)", sb["spilled"] > sa["spilled"] and len(left) >= 1,
+            f"left RAM: {left}")
+    R.check("smart: every RAM victim was a leaf of the RAM tier (no deeper entry of its chain in RAM)",
+            all(not (pre[i].get("desc_tiers", 0) & 2) for i in left), [(i, pre[i].get("desc_tiers")) for i in left])
+    n0 = sum(sa.get(f"ram_smart_evictions_{r}", 0) for r in ("leaf", "non_leaf", "young"))
+    n1 = sum(sb.get(f"ram_smart_evictions_{r}", 0) for r in ("leaf", "non_leaf", "young"))
+    R.check("smart: the RAM evictions are counted and the watermark rose", n1 - n0 >= len(left) and sb.get("ram_smart_watermark_milli", 0) > 0,
+            f"evictions +{n1 - n0}, watermark {sb.get('ram_smart_watermark_milli', 0) / 1000:.3f}")
 
 
 def chunk_files(spill_dir):
@@ -1282,6 +1322,8 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
         set_env.update(SCEN_ENV.get(scen, {}))
         if scen == "k" and phase == "run":
             set_env["SPILL_RAM_GIB"] = k_ram_gib(prior, a.ram_gib)
+        if scen == "k" and (os.environ.get("CACHE_POLICY") or "").strip().lower() == "smart" and not os.environ.get("CACHE_MIN_RESIDENT_S"):
+            set_env["CACHE_MIN_RESIDENT_S"] = "0"  # (smart: the scenario's entries are seconds old; the residency guard would decide all)
     # -u and faulthandler: the output is not buffered, and a crash (e.g. a Windows access violation) dumps the stack
     cmd = [sys.executable, "-u", "-X", "faulthandler", str(pathlib.Path(__file__).resolve()), "--worker",
            "--scenario", scen, "--mode", mode, "--phase", phase, "--out", str(out), "--spill-dir", str(spill_dir or ""),

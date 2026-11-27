@@ -105,3 +105,17 @@ def test_the_windows_scripts_turn_the_ssd_on_explicitly():
         assert "--ssd-gib 10" in line and line.index("--ssd-gib 10") < line.index("%*"), name  # (the user's arguments come later and win)
     bench = (root / "scripts/tiered_cache_bench.py").read_text(encoding="utf-8")
     assert 'require_ssd(args.ssd_gib' in bench and '"--ssd-gib"' in bench
+
+
+def test_scenario_k_under_smart_turns_the_residency_guard_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("CACHE_POLICY", "smart")
+    monkeypatch.delenv("CACHE_MIN_RESIDENT_S", raising=False)
+    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert env["CACHE_MIN_RESIDENT_S"] == "0" and env["SPILL_FAIR_AGENTS"] == "1"
+    monkeypatch.setenv("CACHE_MIN_RESIDENT_S", "30")  # (an explicit value is the user's)
+    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert "CACHE_MIN_RESIDENT_S" not in env
+    monkeypatch.setenv("CACHE_POLICY", "legacy")
+    monkeypatch.delenv("CACHE_MIN_RESIDENT_S")
+    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert "CACHE_MIN_RESIDENT_S" not in env  # (the default run: legacy, unchanged)

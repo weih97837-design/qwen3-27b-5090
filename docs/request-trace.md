@@ -25,7 +25,7 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 | `build` | Windows 程式包的版本（`app\VERSION`，例如 `v0.6.2.7-cache-tier`）；在原始碼 checkout 裡沒有這個檔案，值為 `null`。用來分辨不同版本的追蹤檔 |
 | `block_tokens` | 256 |
 | `ts` | 檔案開始時間（epoch 秒） |
-| `settings` | 與快取有關的設定：所有 `SPILL_*`、`STATE_HOST_CACHE`、`CHECKPOINT_INTERVAL`、`PREFILL_CHUNK`、`MAX_SEQS`、`KV_POOL_TOKENS`（有設定才有）、`kv_pool_pages`、`kv_pool_tokens`（引擎實際的 KV 池）等 |
+| `settings` | 與快取有關的設定：所有 `SPILL_*` 與 `CACHE_*`（保留策略 `CACHE_POLICY` 及其常數）、`STATE_HOST_CACHE`、`CHECKPOINT_INTERVAL`、`PREFILL_CHUNK`、`MAX_SEQS`、`KV_POOL_TOKENS`（有設定才有）、`kv_pool_pages`、`kv_pool_tokens`（引擎實際的 KV 池）等 |
 
 `req`：請求開始（`prefix_begin` 之後，所以命中與分岔已知）。
 
@@ -41,6 +41,7 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 | `max_tokens` | 允許的最大輸出 |
 | `cached` | 快取供應的 token 數（`prefix_begin` 的回傳） |
 | `reusable` | 與最近歷史的最長共同前綴（可重用上限） |
+| `reusable_from` | 這段可重用前綴來自誰的歷史：`"same"`（共用該最長前綴的歷史 entry 之中有一個屬於同一個 agent，即 agent id 的 `/` 之前那段、快取的 owner）、`"other"`（只有其他 agent 的）、`"none"`（沒有可重用前綴）；無法判斷時為 `null`。歷史（最近 64 段）另外記每段的 agent 名稱，記憶體只多 64 個字串。只是量測：快取依內容查找，與 agent 無關 |
 | `diverged_at` | 與最佳歷史分岔的位置，沒有則 `null` |
 | `restored_from` | 這次命中從分層快取載回時為 `"ram"` 或 `"ssd"`，否則 `null`（無法判斷時為 `null`） |
 | `queued_s` | 排隊秒數 |
@@ -68,4 +69,13 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 python tools/trace_summary.py trace-*.jsonl [--json]
 ```
 
-只用 CPU，印出請求數、各 agent 的請求數、提示詞大小分佈、平均 `cached`／`reusable`、大於 16K 的提示詞完全沒有命中的比例、有 `diverged_at` 的比例與位置分佈、各 agent 相鄰請求的間隔（中位數、p90），以及「可重用但沒命中」的 token 總數。
+只用 CPU，印出請求數、各 agent 的請求數、提示詞大小分佈、平均 `cached`／`reusable`、大於 16K 的提示詞完全沒有命中的比例、有 `diverged_at` 的比例與位置分佈、各 agent 相鄰請求的間隔（中位數、p90），以及「可重用但沒命中」的 token 總數；有 `reusable_from` 的軌跡另外印出各來源（same／other／none）的請求數與可重用 token 數，以及「可重用 token 中來自其他 agent 的比例」。
+
+## 模擬器
+
+```
+python tools/cache_sim.py trace-*.jsonl --policy legacy,legacy-nofair,smart,lru,sglang_statecost,marconi_utility,ideal
+python tools/cache_sim_gen.py synth.jsonl --workload mixed|continuation|diverging [--churn 0.08]   # 合成軌跡
+```
+
+把軌跡重播過 VRAM 檢查點（槽與頁）、RAM 層、SSD 層的模型，比較各保留策略；說明與近似見 `docs/tiered-cache.md`「CACHE_POLICY=smart」與 `tools/cache_sim.py` 開頭。

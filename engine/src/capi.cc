@@ -149,6 +149,11 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   // SPILL_COLD_FIRST (default 1) / SPILL_COLD_AFTER_S (default 600): cold agents' entries are the first RAM victims (retention.h).
   if (const char* e = getenv("SPILL_COLD_FIRST"); e && *e) o.spill_cold_first = atoi(e) != 0;
   if (const char* e = getenv("SPILL_COLD_AFTER_S"); e && *e) o.spill_cold_after_s = std::max(0.0, atof(e));
+  // CACHE_POLICY (legacy, the default | smart) and its constants (retention.h SmartParams; docs/tiered-cache.md "CACHE_POLICY=smart").
+  const int cache_policy = cache_policy_of(getenv("CACHE_POLICY"));
+  Q27_CHECK(cache_policy >= 0, "CACHE_POLICY: legacy or smart");
+  o.cache_smart = cache_policy == 1;
+  o.smart = smart_params_from_env([](const char* n) { return getenv(n); });
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
   // per request).
   if (const char* e = getenv("VISION"); e && *e) {
