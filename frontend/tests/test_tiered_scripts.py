@@ -49,3 +49,59 @@ def test_first_diff():
     assert t.first_diff([1, 2], [1, 2, 3]) == 2
     assert "different at token 2 (got 198, ref 271" in t.diff_text([198, 1, 198], [198, 1, 271])
     assert t.diff_text([1], [1]).startswith("equal")
+
+
+# ---- the SSD tier is off by default in the server: the SSD scenarios and the bench must turn it on, or fail loudly
+
+def test_require_ssd_fails_loudly_with_the_ssd_off():
+    import pytest
+    for bad in (0, 0.0, "0", "", None, "x", -1):
+        with pytest.raises(SystemExit, match="needs the SSD tier on"):
+            t.require_ssd(bad, "scenario b")
+    with pytest.raises(SystemExit, match="SPILL_DIR"):
+        t.require_ssd("10", "scenario b worker", "")
+    with pytest.raises(SystemExit, match="SPILL_DIR"):
+        t.require_ssd("10", "scenario b worker", None)
+    t.require_ssd(10, "scenario b")
+    t.require_ssd("0.5", "scenario b worker", "/cache/kv/x")
+
+
+def test_the_ssd_scenarios_are_the_ones_that_use_spill_dir():
+    assert t.SSD_SCENARIOS == set("bcfghijkl") and not t.SSD_SCENARIOS & set("ae") and "d" not in t.SSD_SCENARIOS  # (i runs scen_h: export_ram too)
+    assert t.SCEN_ENV["k"]["SPILL_FAIR_AGENTS"] == "1"
+    assert t.SSD_SCENARIOS <= set(t.SCENARIOS) and t.DEFAULT_SSD_GIB == 10
+
+
+def _args(**kw):
+    import types
+    base = dict(prompt_len=3665, tokens=48, pool_tokens=0, kv_dtype="nvfp4", weights="nvidia", ram_gib=2.0, spec="none", ssd_gib=10.0)
+    return types.SimpleNamespace(**dict(base, **kw))
+
+
+def test_the_tiered_workers_get_the_ssd_cap_and_dir_explicitly(tmp_path):
+    for scen in sorted(t.SSD_SCENARIOS):
+        env, cmd = t.worker_invocation(_args(), scen, "tiered", "full", tmp_path / "spill", tmp_path / "o.json")
+        assert env["SPILL_SSD_GIB"] == "10" and env["SPILL_DIR"] == str(tmp_path / "spill"), scen
+        assert cmd[cmd.index("--ssd-gib") + 1] == "10"
+    env, cmd = t.worker_invocation(_args(ssd_gib=0.5), "b", "tiered", "full", tmp_path, tmp_path / "o.json")
+    assert env["SPILL_SSD_GIB"] == "0.5"
+    env, _ = t.worker_invocation(_args(), "b", "ref", "full", "", tmp_path / "o.json")
+    assert "SPILL_SSD_GIB" not in env and env["STATE_HOST_CACHE"] == "0"  # (the reference has no cache at all)
+
+
+def test_the_driver_refuses_ssd_scenarios_with_the_ssd_off():
+    import subprocess
+    import sys
+    for scen in ("b", "a,c", "j"):
+        r = subprocess.run([sys.executable, str(PATH), "--ssd-gib", "0", "--scenarios", scen], capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0 and "needs the SSD tier on" in (r.stdout + r.stderr), (scen, r.stdout, r.stderr)
+
+
+def test_the_windows_scripts_turn_the_ssd_on_explicitly():
+    root = PATH.parents[1]
+    for name, script in (("test.cmd", "tiered_cache_test.py"), ("bench.cmd", "tiered_cache_bench.py")):
+        text = (root / "scripts/windows" / name).read_text(encoding="utf-8")
+        line = next(ln for ln in text.splitlines() if script in ln and not ln.startswith("rem"))
+        assert "--ssd-gib 10" in line and line.index("--ssd-gib 10") < line.index("%*"), name  # (the user's arguments come later and win)
+    bench = (root / "scripts/tiered_cache_bench.py").read_text(encoding="utf-8")
+    assert 'require_ssd(args.ssd_gib' in bench and '"--ssd-gib"' in bench

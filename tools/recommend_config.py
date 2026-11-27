@@ -88,7 +88,7 @@ SPILL_DIR_DEFAULT = "/cache/kv"
 DEFAULT_KV_POOL_TOKENS = 0  # 0: what the VRAM budget leaves
 DEFAULT_MAX_TOKENS = 262144
 DEFAULT_SPILL_RAM_GIB = 64
-DEFAULT_SPILL_SSD_GIB = 100
+DEFAULT_SPILL_SSD_GIB = 0  # compose.yaml's SPILL_SSD_GIB: the SSD tier is off by default (a detected disk gets a size below: the tool is opt-in)
 
 # nvidia-smi memory.used above this means something (usually the engine itself) already holds VRAM.
 VRAM_USED_WARN_GIB = 4.0

@@ -81,6 +81,9 @@ conversations exceed the usable pool, so B's prefill evicts A's checkpoint. It p
     STATE_HOST_CACHE=1 docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py
     python scripts/tiered_cache_test.py --scenarios a,c --keep-dir /cache/kv/test
 
+The SSD tier is off by default in the server (SPILL_SSD_GIB=0). The scenarios that use it (b, c, f, g, h, i, j, k, l) are run with
+SPILL_SSD_GIB=--ssd-gib (default 10) and SPILL_DIR set, and exit with FAIL when --ssd-gib is 0: they never pass with the SSD off.
+
 Native Windows package (no Docker, no torch): test.cmd runs this with the package's Python; the weights are where
 start.cmd downloads them (settings.ini HF_HOME, else the package's huggingface folder), q27.dll is app\\engine\\build\\.
 --spec {dspine,dflash2,none} picks the draft model every engine of the test is created with (as the server does:
@@ -163,7 +166,10 @@ L_VIDEO_TOKENS = 9000  # the video's tokens in the prompt at least (two chunks o
 L_MIN_PROMPT = 12288   # tokens of a prompt of scenario l at least (the video, the text before it and the question)
 L_QUESTIONS = ("What colors appear in the video, and in which order?", "At about which second does the color change first?")
 # Extra engine variables of a scenario's tiered run (the driver clears every SPILL_* variable first).
-SCEN_ENV = {"f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
+# k tests the per-agent step of the eviction order: SPILL_FAIR_AGENTS is off by default now, so it is asked for here, not left
+# to the engine's C++ default
+SCEN_ENV = {"k": {"SPILL_FAIR_AGENTS": "1"},
+            "f": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1"},
             "g": {"SPILL_PINNED_GIB": "2", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1"},
             "j": {"SPILL_ASYNC_PROMOTE": "1"},  # (prefix_begin still promotes synchronously; the delay-hit API is used for one entry)
             "i": {"SPILL_PINNED_GIB": "1", "SPILL_PINNED_SLAB_MIB": "16", "SPILL_ASYNC_IO": "1", "SPILL_ASYNC_PROMOTE": "1",
@@ -184,6 +190,25 @@ H_PREFIX = H_CHUNKS * 4096
 H_MIN_TAIL = 512  # the shortest distinct tail of a prompt of scenario h
 H_N = 4  # conversations that share the prefix
 # Variables the tiered cache reads at engine creation: the driver sets them per run, never inherits them.
+# The scenarios that write to, read from or restart-import from the SSD tier (SPILL_DIR). The SSD tier is OFF by default
+# (SPILL_SSD_GIB=0: the server starts the engine with an empty SPILL_DIR), so these runs set SPILL_SSD_GIB (--ssd-gib, default 10) and
+# SPILL_DIR explicitly, and refuse to run when either is missing: a run with the SSD off would otherwise "pass" without touching the SSD.
+SSD_SCENARIOS = frozenset("bcfghijkl")
+DEFAULT_SSD_GIB = 10.0
+
+
+def require_ssd(ssd_gib, what, spill_dir=True):
+    """Exits (loudly) unless the SSD tier is on: ssd_gib (SPILL_SSD_GIB, a number or its text) above 0 and, when given, a SPILL_DIR."""
+    try:
+        gib = float(ssd_gib)
+    except (TypeError, ValueError):
+        gib = 0.0
+    if not gib > 0 or not spill_dir:
+        got = f"SPILL_SSD_GIB={ssd_gib!r}" + ("" if spill_dir is True else f" and SPILL_DIR={spill_dir!r}")
+        raise SystemExit(f"FAIL {what}: it needs the SSD tier on, but {got} (the default of SPILL_SSD_GIB is 0 = SSD off). Pass --ssd-gib "
+                         "with a number above 0 (default 10) and a SPILL_DIR: with the SSD off this would not test the SSD.")
+
+
 CACHE_VARS = {"STATE_HOST_CACHE", "KV_POOL_TOKENS", "CHECKPOINT_INTERVAL", "MAX_SEQS", "VRAM_BACKUP_IDLE_S"}
 
 
@@ -1211,6 +1236,9 @@ def worker(a):
         if a.use_spec:  # (scenario e needs it; the others run without)
             return write_json(a.out, {"skip": f"no draft model ({e})"})
         say(f"  (no {a.spec} draft: {e}; the engine runs without one)")
+    if a.mode == "tiered" and a.scenario in SSD_SCENARIOS:  # (what this process was really given, not what the driver meant to give)
+        require_ssd(os.environ.get("SPILL_SSD_GIB"), f"scenario {a.scenario} worker", os.environ.get("SPILL_DIR"))
+        say(f"  SSD tier on: SPILL_SSD_GIB={os.environ['SPILL_SSD_GIB']} SPILL_DIR={os.environ['SPILL_DIR']}")
     _, max_tokens = sizes(a.prompt_len, a.tokens)
     say(f"  > Engine ({a.mode}, max_tokens {max_tokens}, KV_POOL_TOKENS {os.environ.get('KV_POOL_TOKENS')})")
     eng = Engine(engine_target(a.weights), max_tokens=max_tokens, kv_dtype=a.kv_dtype, draft=draft)
@@ -1250,7 +1278,7 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
         set_env["STATE_HOST_CACHE"] = "0"
     else:
         set_env.update(STATE_HOST_CACHE="1", SPILL_RAM_GIB=str(a.ram_gib), SPILL_DIR=str(spill_dir),
-                       VRAM_BACKUP_IDLE_S="0")
+                       SPILL_SSD_GIB=f"{a.ssd_gib:g}", VRAM_BACKUP_IDLE_S="0")
         set_env.update(SCEN_ENV.get(scen, {}))
         if scen == "k" and phase == "run":
             set_env["SPILL_RAM_GIB"] = k_ram_gib(prior, a.ram_gib)
@@ -1258,7 +1286,7 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
     cmd = [sys.executable, "-u", "-X", "faulthandler", str(pathlib.Path(__file__).resolve()), "--worker",
            "--scenario", scen, "--mode", mode, "--phase", phase, "--out", str(out), "--spill-dir", str(spill_dir or ""),
            "--tokens", str(a.tokens), "--prompt-len", str(a.prompt_len), "--kv-dtype", a.kv_dtype, "--weights", a.weights,
-           "--ram-gib", str(a.ram_gib), "--pool-tokens", str(pool), "--spec", a.spec]
+           "--ram-gib", str(a.ram_gib), "--ssd-gib", f"{a.ssd_gib:g}", "--pool-tokens", str(pool), "--spec", a.spec]
     if scen == "e":
         cmd.append("--use-spec")
     if prior:
@@ -1325,6 +1353,9 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=3000,
                     help="tokens per conversation (raised to the smallest length that evicts, unless --pool-tokens)")
     ap.add_argument("--ram-gib", type=float, default=2.0, help="SPILL_RAM_GIB of the tiered runs")
+    ap.add_argument("--ssd-gib", type=float, default=DEFAULT_SSD_GIB,
+                    help="SPILL_SSD_GIB of the tiered runs (default 10). The scenarios b, c, f, g, h, i, j, k, l use the SSD tier and fail "
+                         "when this is 0 (the server's own default is 0 = SSD off)")
     ap.add_argument("--pool-tokens", type=int,
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
     ap.add_argument("--spec", choices=SPEC_CHOICES,
@@ -1352,6 +1383,8 @@ def main():
     for s in chosen:
         if s not in SCENARIOS:
             ap.error(f"unknown scenario {s} (a-l)")
+        if s in SSD_SCENARIOS:  # (before any engine is loaded: a run with the SSD off must not be mistaken for a pass)
+            require_ssd(a.ssd_gib, f"scenario {s} ({SCENARIOS[s][0]})")
     if a.pool_tokens:
         _, max_tokens = sizes(a.prompt_len, a.tokens)
         say("pool: " + describe_pool(a.prompt_len, a.tokens, a.kv_dtype, a.pool_tokens, max_tokens), flush=True)

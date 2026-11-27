@@ -65,7 +65,7 @@ python3 tools/recommend_config.py --json     # 同樣內容，機器可讀，輸
   - **成功判準**：`.env` 產生或更新，結束碼 0。若 `.env` 已存在，工具會先建立 `.env.bak`。
   - 只會更新工具管理的鍵：`KV_POOL_TOKENS`、`MAX_TOKENS`、`MAX_SEQS`、`KV_DTYPE`、`SPILL_RAM_GIB`、`SPILL_SSD_GIB`、`SPILL_DIR`、`SPILL_RAM_RETENTION_S`、`SPILL_TTL_DAYS`、`SPILL_TICK_S`。
   - **失敗時**：`--write` 失敗時結束碼為 1；檢查路徑與權限。
-- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=8`、`KV_POOL_TOKENS=0`、`SPILL_RAM_GIB=64`、`SPILL_SSD_GIB=100` 等）。這是正常狀態，不是錯誤。
+- **`.env` 不存在時**：`compose.yaml` 的 `${VAR:-預設}` 預設值全部生效（`MAX_SEQS=8`、`KV_POOL_TOKENS=0`、`SPILL_RAM_GIB=64`、`SPILL_SSD_GIB=0`（SSD 層關閉）等）。這是正常狀態，不是錯誤。
 - **SSD 層所在磁碟的量測（第一次啟動後才能做）**：`kvcache` 是 Docker 具名磁碟區，位於 WSL 虛擬磁碟。取得其主機路徑後，用 `--spill-dir` 量測：
 
   ```bash
@@ -187,7 +187,7 @@ curl -s http://127.0.0.1:46320/metrics | grep -E '^q27:tier_'
 
 - **成功判準**：出現 `q27:tier_ram_bytes`、`q27:tier_in_ram`、`q27:tier_on_disk`、`q27:tier_spilled`、`q27:tier_restored`、`q27:tier_written`、`q27:tier_dropped`、`q27:tier_subsumed`、`q27:tier_failed`、`q27:tier_ssd_bytes`、`q27:tier_ssd_budget_bytes` 等行。
 - **沒有輸出時**：`frontend/worker.py:821` 只在分層啟用時才輸出這些指標。依序檢查：
-  1. 設定是否啟用：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' qwen3-27b-5090 | grep -E '^(SPILL_RAM_GIB|SPILL_DIR|SPILL_SSD_GIB)='`。`SPILL_RAM_GIB=0` 代表分層關閉（`docs/tiered-cache.md`）。
+  1. 設定是否啟用：`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' qwen3-27b-5090 | grep -E '^(SPILL_RAM_GIB|SPILL_DIR|SPILL_SSD_GIB)='`。`SPILL_RAM_GIB=0` 代表分層關閉、`SPILL_SSD_GIB=0`（預設）代表只有 RAM 層（`docs/tiered-cache.md`）。
   2. 容器是否為本分支建置：見第 11 節「image 版本不對」。
 - **分層是否真的在運作**：送幾個請求後（最好有一個長到會把 checkpoint 逐出上下文池的提示），檢查：
   ```bash
@@ -236,7 +236,7 @@ scripts/serve.sh up --build
 
 - 不要使用 `docker compose pull serve`（見文件開頭的注意事項）。`scripts/serve.sh update` 只是 `up --build`，可以用。
 - `docker compose up -d serve` 或 `docker compose restart serve` **不會**套用新程式碼，必須 `--build`。
-- **會發生什麼**：容器重建會中斷進行中的請求，並重新載入引擎（前綴快取會清空）。`./hf` 的權重不會重新下載。`kvcache` 具名磁碟區會保留，所以 SSD 層的 checkpoint 在重建後仍在。
+- **會發生什麼**：容器重建會中斷進行中的請求，並重新載入引擎（前綴快取會清空）。`./hf` 的權重不會重新下載。`kvcache` 具名磁碟區會保留；SSD 層預設關閉（`SPILL_SSD_GIB=0`），所以預設沒有東西留在磁碟上、重建後 RAM／VRAM 快取是冷的；若你設了 `SPILL_SSD_GIB`，SSD 層的 checkpoint 在重建後仍在。
 - **成功判準**：重跑第 6 節的驗證全部通過。
 
 ---
@@ -261,7 +261,7 @@ scripts/serve.sh down        # 等同 docker compose down
 
 **清除 SSD 層（會刪除 SSD 上的快取，不可復原）**：
 
-> **警告**：`kvcache` 具名磁碟區就是 SSD 層（`SPILL_DIR=/cache/kv`）。刪除後，所有被分層保存的 checkpoint 會消失。**權重不受影響**：`./hf` 是主機上的綁定掛載，不在磁碟區內。
+> **警告**：`kvcache` 具名磁碟區就是 SSD 層（`SPILL_DIR=/cache/kv`；SSD 層預設關閉，磁碟區在 `SPILL_SSD_GIB=0` 時不會被讀寫或清理，舊版留下的檔案仍佔用空間，要回收請用下面的指令刪除）。刪除後，所有被分層保存的 checkpoint 會消失。**權重不受影響**：`./hf` 是主機上的綁定掛載，不在磁碟區內。
 
 ```bash
 docker compose down

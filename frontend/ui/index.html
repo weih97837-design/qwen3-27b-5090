@@ -878,6 +878,11 @@ function drawSlots() {
 // Tier usage: RAM and SSD (bytes used / cap), with the counters and settings from the tiers block.
 const TIER_COUNTERS = [["擠出 spilled", "spilled"], ["載回 restored", "restored"], ["寫入 SSD written", "written"],
   ["已備份 backed_up", "backed_up"], ["背景載回 restored_async", "restored_async"], ["丟棄 dropped", "dropped"], ["過期丟棄 expired", "expired"], ["未寫入 SSD not_written", "not_written"], ["被涵蓋 subsumed", "subsumed"], ["失敗 failed", "failed"]];
+// The SSD tier is off (SPILL_SSD_GIB=0, the default; or no SPILL_DIR): the tiers block says ssd_enabled false, or (an older server without
+// that key) the cap is 0 or absent. No bar then, so nothing divides by a zero or missing cap.
+const ssdOffOf = (t) => !!t && typeof t === "object" && !t.error && (t.ssd_enabled === false || (t.ssd_enabled == null && !t.ssd_cap_bytes));
+const ssdOffText = (t) => `SSD 層：已關閉（${t && t.ssd_off_reason === "dir" ? "SPILL_DIR 為空" : "SPILL_SSD_GIB=0"}）`;
+const SSD_ONLY_COUNTERS = new Set(["written", "not_written"]);
 function tierCol(title, used, cap, note) {
   const pct = cap ? Math.min(1, (used ?? 0) / cap) : 0;
   return el("div", { class: "tier" },
@@ -896,7 +901,8 @@ function drawTiers() {
   }
   const kids = [];
   if (t.error) kids.push(warnBox("錯誤", t.error));
-  sum.textContent = `RAM ${t.in_ram ?? "–"} 份 · SSD ${t.on_disk ?? "–"} 份`;
+  const ssdOff = ssdOffOf(t);
+  sum.textContent = ssdOff ? `RAM ${t.in_ram ?? "–"} 份 · SSD 已關閉` : `RAM ${t.in_ram ?? "–"} 份 · SSD ${t.on_disk ?? "–"} 份`;
   const n = (v) => v == null ? "–" : Number(v).toLocaleString();
   const cols = [];  // a bar only when its used bytes are known; a null cap shows as "X / –"
   // RAM dedup: ram_bytes is what the tier physically holds; the logical size is what the entries would take without sharing.
@@ -907,10 +913,12 @@ function drawTiers() {
   if (t.ram_bytes != null) cols.push(tierCol("RAM 層", t.ram_bytes, t.ram_cap_bytes, `${n(t.in_ram)} 份在 RAM${dedup}` + split("ram")));
   // SSD dedup: ssd_bytes is what the files physically take (each shared chunk once); logical is what the entries would take as separate files.
   const ssdDedup = t.ssd_logical_bytes && t.ssd_dedup_ratio ? ` · 去重前 ${fmtGiB(t.ssd_logical_bytes)}（去重比 ${t.ssd_dedup_ratio.toFixed(2)}×）` : "";
-  if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 份在 SSD${ssdDedup} · 磁碟可用空間 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
+  if (ssdOff) cols.push(el("div", { class: "tier ssd-off" }, el("div", { class: "ssd-off-title" }, ssdOffText(t)),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, "RAM 層滿時，擠出的存檔點直接丟棄，不寫入磁碟。要啟用請把 SPILL_SSD_GIB 設為大於 0。")));
+  else if (t.ssd_bytes != null) cols.push(tierCol("SSD 層", t.ssd_bytes, t.ssd_cap_bytes, `${n(t.on_disk)} 份在 SSD${ssdDedup} · 磁碟可用空間 ${fmtGiB(t.disk_free_bytes)}` + split("disk")));
   if (cols.length) kids.push(el("div", { class: "tiers-grid" }, ...cols));
   kids.push(el("div", { class: "kv", style: "margin-top:12px" },
-    ...TIER_COUNTERS.map(([label, key]) => el("div", {},
+    ...TIER_COUNTERS.filter(([, key]) => !(ssdOff && SSD_ONLY_COUNTERS.has(key))).map(([label, key]) => el("div", {},
       el("span", {}, label + " "), el("b", { style: key === "failed" && t.failed > 0 ? "color:var(--critical)" : "" }, n(t[key]))))));
   // Retention: per tier the entries that were restored at least once vs never (and the superseded ones, evicted first), and the
   // reuse rate = restored / entries received (RAM: spilled, SSD: written).
@@ -918,15 +926,15 @@ function drawTiers() {
   const reuseRow = (label, p, rate, restored) => t[p + "_reused_entries"] == null ? [] : [kvRow(label,
     `曾重用 ${n(t[p + "_reused_entries"])} 份 ${fmtGiB(t[p + "_reused_bytes"])} · 從未重用 ${n(t[p + "_never_entries"])} 份 ${fmtGiB(t[p + "_never_bytes"])}` +
     ` · 被取代 ${n(t[p + "_superseded_entries"])} 份 ${fmtGiB(t[p + "_superseded_bytes"])} · 重用率 ${pct(t[rate])}${t[restored] == null ? "" : `（載回 ${n(t[restored])}）`}`)];
-  const reuse = [...reuseRow("RAM 重用", "ram", "ram_reuse_rate", "ram_restored"), ...reuseRow("SSD 重用", "disk", "ssd_reuse_rate", "ssd_restored")];
+  const reuse = [...reuseRow("RAM 重用", "ram", "ram_reuse_rate", "ram_restored"), ...(ssdOff ? [] : reuseRow("SSD 重用", "disk", "ssd_reuse_rate", "ssd_restored"))];
   if (reuse.length) kids.push(el("div", { class: "kv", style: "margin-top:10px" }, ...reuse,
     kvRow("依 Agent 公平淘汰 SPILL_FAIR_AGENTS", t.fair_agents == null ? "–" : t.fair_agents ? "開" : "關")));
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
-    kvRow("RAM 停留時間 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–"),
+    ...(ssdOff ? [] : [kvRow("RAM 停留時間 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–")]),
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 份`),
     ...(t.restoring || t.restored_async ? [kvRow("載回中", `${n(t.restoring)} 份`),
       kvRow("載回速度", t.restore_gbps == null ? "–" : `${t.restore_gbps.toFixed(1)} GB/s`)] : []),
-    kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")));
+    ...(ssdOff ? [] : [kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")])));
   if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
   if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));
   body.replaceChildren(...kids);
@@ -962,7 +970,7 @@ function drawDeploy() {
     kids.push(el("div", { class: "scroll", style: "margin-top:12px" },
       el("table", { class: "kvt" }, el("tr", {}, el("th", {}, "設定"), el("th", { class: "r" }, "值")),
         ...SETTING_KEYS.map((k) => el("tr", {}, el("td", { class: "mono" }, k),
-          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "自動（最大）" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
+          el("td", { class: "r" }, k === "KV_POOL_TOKENS" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "自動（最大）" : k === "SPILL_DIR" && s[k] === "" ? "（空：SSD 層關閉）" : k === "SPILL_SSD_GIB" && Number(s[k]) === 0 && s[k] != null && s[k] !== "" ? "0（SSD 層關閉）" : typeof s[k] === "string" ? wbrText(fmtSetting(s[k])) : fmtSetting(s[k])))))));
   }
   body.replaceChildren(...kids);
 }
@@ -997,14 +1005,14 @@ function drawHeader() {
 }
 // Agents: X-Agent-Id / "user" (agent = the part before the first "/"; auto:<hash> without one), from tick.agents.
 function drawAgents() {
-  const rows = state.tick?.agents, sec = $("agents-sec");
+  const rows = state.tick?.agents, sec = $("agents-sec"), ssdOff = ssdOffOf(snapTiers());
   if (!Array.isArray(rows) || !rows.length) { sec.hidden = true; return; }
   sec.hidden = false;
   $("agents-sum").textContent = `${rows.filter((a) => !a.kind).length} 個 Agent`;
   const tb = $("agents"); tb.replaceChildren();
   tb.append(el("tr", {}, el("th", {}, "Agent"), el("th", { class: "r" }, "執行中"), el("th", { class: "r" }, "等待中"),
     el("th", { class: "r lo" }, "請求"), el("th", { class: "r lo" }, "輸入 token"), el("th", { class: "r" }, "快取命中"),
-    el("th", { class: "r" }, "RAM"), el("th", { class: "r" }, "SSD")));
+    el("th", { class: "r" }, "RAM"), ...(ssdOff ? [] : [el("th", { class: "r" }, "SSD")])));
   // owner 0 (kind "owner0") and the owners with tier bytes but no row in the stats table (kind "overflow", a.count of them) are
   // not agents with names: label them apart instead of lumping them together
   const agName = (a) => a.kind === "overflow" ? `其他 ${a.count || 0} 個 agent（超出統計表）` : a.agent;
@@ -1012,7 +1020,7 @@ function drawAgents() {
     el("td", { class: "r g2", "data-l": "執行中" }, String(a.running)), el("td", { class: "r g2", "data-l": "等待中" }, String(a.waiting)), el("td", { class: "r lo" }, a.kind ? "–" : String(a.requests)),
     el("td", { class: "r lo" }, a.kind ? "–" : fmtTok(a.prompt_tokens)), el("td", { class: "r g2", "data-l": "快取命中" }, a.kind ? "–" : `${fmtTok(a.cached_tokens)} (${fmtPct(a.hit)})`),
     el("td", { class: "r g3", "data-l": "RAM" }, a.ram_bytes == null ? "–" : fmtGiB(a.ram_bytes) + (a.ram_entries ? ` (${a.ram_entries})` : "")),
-    el("td", { class: "r g3", "data-l": "SSD" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))));
+    ...(ssdOff ? [] : [el("td", { class: "r g3", "data-l": "SSD" }, a.ssd_bytes == null ? "–" : fmtGiB(a.ssd_bytes) + (a.ssd_entries ? ` (${a.ssd_entries})` : ""))])));
 }
 // 機器 (clients): one row per machine (X-Client-Id / CLIENT_NAMES / peer address; loopback = "local"), from tick.clients. Counting only.
 const fmtAgo = (s) => s == null ? "–" : s < 3600 ? fmtDur(s) + "前" : s < 86400 ? `${Math.floor(s / 3600)} 小時前` : `${Math.floor(s / 86400)} 天前`;
@@ -1096,22 +1104,22 @@ const OPTS = [
 // apply with a restart; they change no plan of the pools. kind: num (0 or more), flag, path.
 const TIER_OPTS = [
   { key: "spill_ram_gib", label: "RAM 層", note: "SPILL_RAM_GIB", help: "存放 KV 池擠出的存檔點所用的主機 RAM。0 表示關閉分層快取。", kind: "num", unit: "GiB", step: "1" },
-  { key: "spill_ram_retention_s", label: "RAM 停留時間", note: "SPILL_RAM_RETENTION_S", help: "RAM 中的存檔點閒置多少秒後寫入 SSD。", kind: "num", unit: "s", step: "60" },
-  { key: "spill_ssd_gib", label: "SSD 上限", note: "SPILL_SSD_GIB", help: "SSD 層最多存放的容量；最舊的檔案先刪除。", kind: "num", unit: "GiB", step: "10" },
-  { key: "spill_ssd_min_free_gib", label: "SSD 最小可用空間", note: "SPILL_SSD_MIN_FREE_GIB", help: "寫入後磁碟的可用空間不會低於此值。", kind: "num", unit: "GiB", step: "1" },
-  { key: "spill_ssd_min_tokens", label: "SSD 最小 token 數", note: "SPILL_SSD_MIN_TOKENS", help: "短於此長度的存檔點會被丟棄，不寫入 SSD（重新計算和讀取一樣快）。0 表示全部寫入。", kind: "num", unit: "token", step: "1024" },
-  { key: "spill_ttl_days", label: "檔案 TTL", note: "SPILL_TTL_DAYS", help: "超過這麼多天沒有被重用的檔案會被刪除。", kind: "num", unit: "天", step: "1" },
+  { key: "spill_ram_retention_s", label: "RAM 停留時間", note: "SPILL_RAM_RETENTION_S", help: "RAM 中的存檔點閒置多少秒後寫入 SSD（SSD 層關閉時不使用）。", kind: "num", unit: "s", step: "60" },
+  { key: "spill_ssd_gib", label: "SSD 上限", note: "SPILL_SSD_GIB", help: "SSD 層最多存放的容量；最舊的檔案先刪除。0（預設）：SSD 層關閉，RAM 層滿時直接丟棄，不寫入磁碟；引擎重新啟動後 RAM／VRAM 快取是冷的。", kind: "num", unit: "GiB", step: "10" },
+  { key: "spill_ssd_min_free_gib", label: "SSD 最小可用空間", note: "SPILL_SSD_MIN_FREE_GIB", help: "寫入後磁碟的可用空間不會低於此值。 只在 SSD 層開啟時有效。", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_ssd_min_tokens", label: "SSD 最小 token 數", note: "SPILL_SSD_MIN_TOKENS", help: "短於此長度的存檔點會被丟棄，不寫入 SSD（重新計算和讀取一樣快）。0 表示全部寫入。 只在 SSD 層開啟時有效。", kind: "num", unit: "token", step: "1024" },
+  { key: "spill_ttl_days", label: "檔案 TTL", note: "SPILL_TTL_DAYS", help: "超過這麼多天沒有被重用的檔案會被刪除。 只在 SSD 層開啟時有效。", kind: "num", unit: "天", step: "1" },
   { key: "vram_backup_idle_s", label: "VRAM 備份閒置時間", note: "VRAM_BACKUP_IDLE_S", help: "閒置多少秒後，也把 VRAM 的存檔點複製到 RAM（仍保留在 VRAM）。0 表示關閉。", kind: "num", unit: "s", step: "10" },
   { key: "spill_pinned_gib", label: "固定 RAM", note: "SPILL_PINNED_GIB", help: "固定的主機記憶體，複製更快；在 Windows 上會計入共用 GPU 記憶體。0 表示關閉。", kind: "num", unit: "GiB", step: "1" },
   { key: "spill_async_io", label: "非同步複製", note: "SPILL_ASYNC_IO", help: "KV 複製使用獨立的 stream；請搭配固定 RAM 使用。請先用 scripts/tiered_cache_test.py 測試。", kind: "flag" },
   { key: "spill_async_promote", label: "延遲命中", note: "SPILL_ASYNC_PROMOTE", help: "命中已擠出存檔點的請求會等它載回，其他請求照常執行。", kind: "flag" },
-  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。關閉：對全部項目套用該順序。", kind: "flag" },
+  { key: "spill_fair_agents", label: "依 Agent 公平淘汰", note: "SPILL_FAIR_AGENTS", help: "RAM 或 SSD 已滿時，先從用量最多的 Agent 淘汰（再依序：被取代、從未重用、最舊）。預設關閉：對全部項目套用該順序（實測 RAM 重用率約 30%，開啟時約 6%）。", kind: "flag" },
   { key: "spill_unused_ttl_s", label: "從未命中保留時間", note: "SPILL_UNUSED_TTL_S", help: "一份存檔點從存入起這麼多秒都沒有被命中，就從 RAM 與 SSD 丟棄（不論還有沒有空間）。曾命中的不受影響。0 表示關閉。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_after_s", label: "冷 Agent 門檻", note: "SPILL_COLD_AFTER_S", help: "某 Agent 在該層沒有任何命中、且最新的存檔點已超過這麼多秒，就算「冷」；剛開始的對話不算。", kind: "num", unit: "s", step: "60" },
   { key: "spill_cold_first", label: "冷 Agent 先淘汰", note: "SPILL_COLD_FIRST", help: "RAM 或 SSD 已滿時，先淘汰冷 Agent 的項目（其中用量最多者先），再套用公平淘汰順序。", kind: "flag" },
-  { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。", kind: "flag" },
-  { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。", kind: "num", unit: "GiB", step: "1" },
-  { key: "spill_dir", label: "SSD 資料夾", note: "SPILL_DIR", help: "擠出的存檔點寫入的位置。留空：只用 RAM。", kind: "path" },
+  { key: "spill_ssd_warm_only", label: "SSD 只收已證明的", note: "SPILL_SSD_WARM_ONLY", help: "從未命中、且其 Agent 也沒有任何命中的項目不寫入 SSD（沒有 X-Agent-Id 的 auto: Agent 直接丟棄；有 id 的受下方試用額度限制）。 只在 SSD 層開啟時有效。", kind: "flag" },
+  { key: "spill_probation_gib", label: "SSD 試用額度", note: "SPILL_PROBATION_GIB", help: "有明確 id、但還沒有命中的 Agent，其項目合計最多佔用的 SSD 容量；超過時最舊的先丟棄。 只在 SSD 層開啟時有效。", kind: "num", unit: "GiB", step: "1" },
+  { key: "spill_dir", label: "SSD 資料夾", note: "SPILL_DIR", help: "擠出的存檔點寫入的位置（只在 SSD 上限大於 0 時使用）。留空：只用 RAM。", kind: "path" },
 ];
 // Images and videos (docs/configuration.md "Long videos"): empty is the default (launch.MEDIA_DEFAULTS). IMAGE_TOKENS is the engine's
 // (a pinned host table, so the plan changes); VIDEO_MAX_* are the server's. The defaults are launch.MEDIA_DEFAULTS.

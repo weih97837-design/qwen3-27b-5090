@@ -33,8 +33,9 @@ GiB = 1 << 30
 # MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
 # cache keeps 4 GiB of pinned state checkpoints. The tiered cache (docs/tiered-cache.md): the largest KV pool the VRAM budget leaves
 # (KV_POOL_TOKENS=0: with MAX_SEQS=8 and DSpine an estimated 600K+ tokens on an RTX 5090, not measured; the planner and the UI show the pool
-# the engine really got, from its cache_stats), and 64 GiB of host RAM for the checkpoints it gives up, written to SPILL_DIR (the compose kvcache volume here; on
-# Windows a per-user folder, see spill_dir_default). These match compose.yaml (tests/test_parsing.py); an env
+# the engine really got, from its cache_stats), and 64 GiB of host RAM for the checkpoints it gives up. They go on to SPILL_DIR (the compose kvcache volume here; on
+# Windows a per-user folder, see spill_dir_default) only with SPILL_SSD_GIB > 0: the SSD tier is off by default and the engine
+# is then started with an empty SPILL_DIR (tier_env, worker.Scheduler). These match compose.yaml (tests/test_parsing.py); an env
 # variable, a .env value or a settings.ini [env] entry of the tray app overrides them, as the setdefault does.
 ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "8", "KV_POOL_TOKENS": "0",
                        "SPILL_RAM_GIB": "64", "SPILL_DIR": "/cache/kv"}
@@ -46,7 +47,7 @@ ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "8", "KV_POOL_
 TIER_SETTINGS = {
     "spill_ram_gib": ("SPILL_RAM_GIB", 64, "num"),                # 0: no tiered cache at all
     "spill_ram_retention_s": ("SPILL_RAM_RETENTION_S", 3600, "num"),
-    "spill_ssd_gib": ("SPILL_SSD_GIB", 100, "num"),
+    "spill_ssd_gib": ("SPILL_SSD_GIB", 0, "num"),                 # 0 (default): no SSD tier, and the engine gets SPILL_DIR=""
     "spill_ssd_min_free_gib": ("SPILL_SSD_MIN_FREE_GIB", 10, "num"),
     "spill_ssd_min_tokens": ("SPILL_SSD_MIN_TOKENS", 32768, "num"),  # shorter spilled entries are never written to the SSD
     "spill_ttl_days": ("SPILL_TTL_DAYS", 7, "num"),
@@ -54,7 +55,7 @@ TIER_SETTINGS = {
     "spill_pinned_gib": ("SPILL_PINNED_GIB", 8, "num"),
     "spill_async_io": ("SPILL_ASYNC_IO", True, "flag"),
     "spill_async_promote": ("SPILL_ASYNC_PROMOTE", True, "flag"),
-    "spill_fair_agents": ("SPILL_FAIR_AGENTS", True, "flag"),  # a tier's victim comes from the agent using the most of it (retention)
+    "spill_fair_agents": ("SPILL_FAIR_AGENTS", False, "flag"),  # on: a tier's victim comes from the agent using the most of it (off: RAM reuse was 6% vs ~30%)
     # never-hit entries and cold agents (docs/tiered-cache.md "Retention"): dropped after this many seconds without a hit (0: off) / an
     # agent without hits whose newest entry is this old is evicted first / that step off / no unproven entry on the SSD but the quota
     "spill_unused_ttl_s": ("SPILL_UNUSED_TTL_S", 1800, "num"),
@@ -62,7 +63,7 @@ TIER_SETTINGS = {
     "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"),
     "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", True, "flag"),
     "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num"),
-    "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier
+    "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier (it also is, whatever the folder, when spill_ssd_gib is 0)
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down
 TIER_ENV = frozenset(v[0] for v in TIER_SETTINGS.values())
@@ -136,6 +137,17 @@ def tier_number(value):
 def tier_env_value(key, value):
     """A tier setting as its variable has it ("1" / "0" for a flag)."""
     return ("1" if value else "0") if TIER_SETTINGS[key][2] == "flag" else str(value)
+
+
+def tier_env(s):
+    """The tiered cache variables the engine process starts with for settings s: every one of TIER_SETTINGS, explicitly (so the engine's
+    own defaults, e.g. spill_fair_agents on in C++, never decide). With no SSD tier (spill_ssd_gib 0, the default) SPILL_DIR is empty:
+    the engine then drops the victims of a full RAM tier instead of writing files the policy would delete. The setting itself keeps
+    the folder, for when the cap is raised. (worker.Scheduler makes the same SPILL_DIR for an engine started by any other path.)"""
+    env = {TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS}
+    if not s["spill_ssd_gib"] > 0:
+        env["SPILL_DIR"] = ""
+    return env
 
 
 def atoi(text):
@@ -339,7 +351,7 @@ class Launch:
                "IMAGE_TOKENS": str(image_tokens_env(s)),
                **{MEDIA_SETTINGS[k][0]: str(s[k]) for k in ("video_max_tokens", "video_max_frames")},
                # (the tiered cache: the engine and worker.TierPolicy read these when the engine process loads)
-               **{TIER_SETTINGS[k][0]: tier_env_value(k, s[k]) for k in TIER_SETTINGS},
+               **tier_env(s),
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
         return dict(self.base, model=str(path), weights=s["weights"], draft=str(draft) if draft else None,
                     max_tokens=s["max_tokens"], kv_dtype=s["kv_dtype"], max_seqs=s["max_seqs"],
