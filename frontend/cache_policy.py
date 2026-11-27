@@ -184,6 +184,50 @@ class GdTier:
                 "young_skipped": self.young_skipped, "victim_priority_mean": self.prio_sum / n if n else None, "watermark": self.L}
 
 
+def engine_counters(sp):
+    """The engine's smart counters (q27lib spill_stats: cache_smart, ram_smart_*, vram_smart_*) as {tier: GdTier.stats()-like dict}; {}
+    from an engine without them."""
+    out = {}
+    for tier in ("ram", "vram"):
+        k = f"{tier}_smart_evictions_leaf"
+        if k not in sp:
+            continue
+        n = sum(sp.get(f"{tier}_smart_evictions_{r}", 0) for r in REASONS)
+        out[tier] = {"evictions_leaf": sp[k], "evictions_non_leaf": sp.get(f"{tier}_smart_evictions_non_leaf", 0),
+                     "evictions_young": sp.get(f"{tier}_smart_evictions_young", 0), "young_skipped": sp.get(f"{tier}_smart_young_skipped", 0),
+                     "victim_priority_mean": sp.get(f"{tier}_smart_victim_priority_mean_milli", 0) / 1000 if n else None,
+                     "watermark": sp.get(f"{tier}_smart_watermark_milli", 0) / 1000}
+    return out
+
+
+def status_block(sp, ts):
+    """For the stats UI (stats.tiers_block): the policy name and, per tier (ram / vram from the engine, ssd from tiercache), the
+    evictions by reason, the mean victim priority and the watermark. sp: engine.spill_stats(), ts: TierPolicy.status()."""
+    policy = ts.get("cache_policy") or (SMART if sp.get("cache_smart") == 1 else LEGACY)
+    tiers = engine_counters(sp)
+    if "ssd_smart_evictions_leaf" in ts:
+        tiers["ssd"] = {k[len("ssd_smart_"):]: v for k, v in ts.items() if k.startswith("ssd_smart_")}
+    return {"cache_policy": policy, "cache_smart": tiers if policy == SMART else None,
+            "ssd_not_admitted": ts.get("ssd_not_admitted", 0)}
+
+
+def metrics(sp, ts):
+    """/metrics lines of the policy: q27:cache_policy{policy=...} 1, and under smart q27:cache_evictions_total{tier,reason},
+    q27:cache_young_skipped_total{tier}, q27:cache_victim_priority_mean{tier}, q27:cache_watermark{tier}, q27:cache_ssd_not_admitted_total."""
+    st = status_block(sp, ts)
+    out = {f'q27:cache_policy{{policy="{st["cache_policy"]}"}}': 1}
+    for tier, c in (st["cache_smart"] or {}).items():
+        for r in REASONS:
+            out[f'q27:cache_evictions_total{{tier="{tier}",reason="{r}"}}'] = c.get(f"evictions_{r}", 0)
+        out[f'q27:cache_young_skipped_total{{tier="{tier}"}}'] = c.get("young_skipped", 0)
+        if c.get("victim_priority_mean") is not None:
+            out[f'q27:cache_victim_priority_mean{{tier="{tier}"}}'] = c["victim_priority_mean"]
+        out[f'q27:cache_watermark{{tier="{tier}"}}'] = c.get("watermark") or 0
+    if st["cache_policy"] == SMART:
+        out["q27:cache_ssd_not_admitted_total"] = st["ssd_not_admitted"]
+    return out
+
+
 def chain_info(nodes):
     """retention.h chain_info on (ids, owner, tiers) triples (ids: a sequence of token ids or block hashes): per node a dict with
     parent (index or -1), parent_depth, desc_tiers, branch, shared. O(n^2): for tests and small sets (the simulator keeps a trie)."""

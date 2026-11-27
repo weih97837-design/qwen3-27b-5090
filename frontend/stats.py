@@ -15,6 +15,7 @@ import threading
 import time
 
 import agent
+import cache_policy
 import clients
 
 SAMPLE_S = float(os.environ.get("STATS_SAMPLE_S", 1.0))  # s between GPU samples (0: no sampling)
@@ -214,7 +215,8 @@ OVERFLOW_AGENT = "其他 agent（超出統計表）"  # the UI shows the count: 
 DEPLOY_SETTINGS = ("KV_POOL_TOKENS", "MAX_SEQS", "MAX_TOKENS", "KV_DTYPE", "WEIGHTS", "SPEC", "SPILL_RAM_GIB",
                    "SPILL_DIR", "SPILL_RAM_RETENTION_S", "SPILL_SSD_GIB", "SPILL_SSD_MIN_FREE_GIB", "SPILL_SSD_MIN_TOKENS", "SPILL_TTL_DAYS",
                    "VRAM_RESERVE_GIB", "SPILL_PINNED_GIB", "SPILL_ASYNC_IO", "SPILL_ASYNC_PROMOTE", "SPILL_FAIR_AGENTS", "SPILL_UNUSED_TTL_S", "SPILL_COLD_AFTER_S", "SPILL_COLD_FIRST", "SPILL_SSD_WARM_ONLY", "SPILL_PROBATION_GIB", "VRAM_BACKUP_IDLE_S",
-                   "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")
+                   "CACHE_POLICY", "CACHE_PREFILL_T0_US", "CACHE_PREFILL_K_US", "CACHE_SUPERSEDED_FACTOR", "CACHE_JUNCTION_FACTOR",
+                   "CACHE_MIN_RESIDENT_S", "IMAGE_TOKENS", "VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES")
 DAY_S = 86400.0
 
 
@@ -364,6 +366,8 @@ def tiers_block(engine, tiers, environ=None):
                 "ssd_reuse_rate": _rate(sp.get("restored_disk"), sp["written"]),
                 "fair_agents": ts.get("fair_agents"), "ssd_skipped_superseded": ts.get("ssd_skipped_superseded", 0),
                 "expired": ts.get("expired", 0), "not_written": ts.get("not_written", 0),
+                # CACHE_POLICY (legacy / smart) and, under smart, its counters per tier (ram / vram: the engine's; ssd: the policy's)
+                **cache_policy.status_block(sp, ts),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),
                 "ttl_days": ttl_s / DAY_S if ttl_s is not None else None,
                 "dir": str(directory) if directory else None}
