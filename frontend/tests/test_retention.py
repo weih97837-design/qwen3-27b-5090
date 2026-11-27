@@ -220,7 +220,8 @@ def test_agents_block_fills_ram_and_ssd_bytes_per_agent():
     rows = {r["agent"]: r for r in stats.agents_block([], totals, use)}
     assert rows["alpha"]["ram_bytes"] == 3 * GiB and rows["alpha"]["ssd_bytes"] == 20 * GiB and rows["alpha"]["ssd_entries"] == 30
     assert rows["beta"]["ram_bytes"] == GiB and rows["beta"]["ssd_bytes"] == 0
-    assert rows["unknown"]["ram_bytes"] == 15 and rows["unknown"]["ssd_bytes"] == 17 and rows["unknown"]["ssd_entries"] == 3
+    assert rows[stats.UNKNOWN_AGENT]["ram_bytes"] == 5 and rows[stats.UNKNOWN_AGENT]["ssd_bytes"] == 7 and rows[stats.UNKNOWN_AGENT]["ssd_entries"] == 1
+    assert rows[stats.OVERFLOW_AGENT]["ram_bytes"] == 10 and rows[stats.OVERFLOW_AGENT]["ssd_bytes"] == 10 and rows[stats.OVERFLOW_AGENT]["count"] == 1
     # without the engine's figures (an older engine) they stay None
     plain = {r["agent"]: r for r in stats.agents_block([], totals, None)}
     assert plain["alpha"]["ram_bytes"] is None and plain["alpha"]["ssd_bytes"] is None

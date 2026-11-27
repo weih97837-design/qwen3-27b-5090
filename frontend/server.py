@@ -1812,7 +1812,12 @@ def main():
     ap.add_argument("--idle-unload", type=float, default=float(env("ENGINE_IDLE_UNLOAD_S", 0)),
                     help="stop the engine after this many seconds without a request, freeing its VRAM; the next "
                          "request loads it again (0: off, the engine stays ready)")
+    ap.add_argument("--request-trace", default=env("REQUEST_TRACE", ""),
+                    help="record a trace of every request (counts and block hashes only, no text) to this directory or file "
+                         "name prefix, for cache simulation (docs/request-trace.md); off by default")
     args = ap.parse_args()
+    if args.request_trace:
+        os.environ["REQUEST_TRACE"] = args.request_trace  # (the engine process reads it)
 
     from tokenizer import Tokenizer, fingerprint
 
