@@ -537,3 +537,21 @@ def test_the_slot_card_shows_the_instantaneous_speed_big_and_the_average_small()
     html = (pathlib.Path(__file__).resolve().parents[1] / "ui/index.html").read_text()
     assert "tok/s 生成速度（即時）" in html and '"平均 " + fmtRate(s.tok_s)' in html and "s.tok_s_now > 0" in html
     assert ".slot .speed small { font-size: 12px" in html
+
+
+def test_tiers_block_pure_speeds_from_the_engines_timings(tmp_path):
+    # ssd_read_gbps = bytes / ns (1 byte/ns is 1 GB/s); 0 until the engine timed a read or a copy
+    class TimedEngine(FakeEngine):
+        def __init__(self, **extra):
+            super().__init__()
+            self.extra = extra
+
+        def spill_stats(self):
+            return {**super().spill_stats(), **self.extra}
+
+    out = stats.tiers_block(TimedEngine(ssd_read_bytes=4 * GiB, ssd_read_ns=int(2e9), h2d_bytes=3 * GiB, h2d_ns=int(0.5e9)),
+                            FakeTiers(tmp_path), environ={})
+    assert out["ssd_read_gbps"] == pytest.approx(4 * GiB / 2e9) and out["h2d_gbps"] == pytest.approx(3 * GiB / 0.5e9)
+    json.dumps(out)
+    none = stats.tiers_block(FakeEngine(), FakeTiers(tmp_path), environ={})  # an older engine: nothing timed
+    assert none["ssd_read_gbps"] == 0.0 and none["h2d_gbps"] == 0.0

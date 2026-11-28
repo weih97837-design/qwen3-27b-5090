@@ -25,6 +25,7 @@ class Eng:
         self.released = []
         self.pos = 0
         self.resets = []
+        self.counters = {}  # the engine's pure timings (spill_stats ssd_read_* / h2d_*), set by a test before a poll
 
     def spill_match(self, ids, spec=False):
         self.match_calls.append((len(ids), spec))
@@ -47,7 +48,7 @@ class Eng:
         return True
 
     def spill_stats(self):
-        return {"restore_failed": self.failed, "restoring": 0}
+        return {"restore_failed": self.failed, "restoring": 0, **self.counters}
 
     def spill_sync_lookup(self, on):
         self.sync.append(bool(on))
@@ -148,7 +149,7 @@ def test_a_restoring_request_does_not_take_an_engine_slot():
     assert s.alive == [b] and list(s.waiting) == [a]  # (a waits for its load, not for b's slot)
 
 
-def test_disk_entry_begin_2_and_bandwidth_is_measured_per_tier(monkeypatch):
+def test_disk_entry_begin_2_and_ssd_speed_comes_from_the_engine_counters(monkeypatch):
     clk = Clock()
     monkeypatch.setattr(worker.time, "time", clk)
     eng = Eng(match=ram_match(nbytes=4 * GB, on_disk=True, eid=9), begin=2)
@@ -157,12 +158,13 @@ def test_disk_entry_begin_2_and_bandwidth_is_measured_per_tier(monkeypatch):
     s.waiting.append(a)
     s.admit_waiting()
     assert a.restoring is not None and eng.begin_calls == [9]
-    clk.t += 4.0
+    clk.t += 4.0  # (the wall time: the scheduler saw the end late; the file reads took 2 s by the engine's count)
     eng.finished = [(9, True)]
+    eng.counters = {"ssd_read_bytes": 4 * GB, "ssd_read_ns": int(2e9)}
     s.poll_restores()
     assert a.restoring is None
-    assert s.restore_bw["ssd"] == 4 * GB / 4.0 and "ram" not in s.restore_bw
-    assert s.bandwidth(True) == 1 * GB  # measured, inside the clamp
+    assert s.restore_bw == {"ssd": 4 * GB / 2.0}  # learned from the counters, not from the 4 s of wall time
+    assert s.bandwidth(True) == 2 * GB  # measured, inside the clamp
     s.restore_bw["ssd"] = 1  # absurdly slow: clamped so restores do not lock themselves out
     assert s.bandwidth(True) == worker.RESTORE_BW_SSD * worker.RESTORE_BW_CLAMP[0]
     assert s.bandwidth(False) == worker.RESTORE_BW_RAM_PINNED
@@ -432,8 +434,9 @@ def test_a_failure_does_not_poison_later_speed_samples(monkeypatch):
     s.poll_restores()
     clk.t += 0.5
     eng.finished = [(8, True)]
+    eng.counters = {"h2d_bytes": 3 * GB, "h2d_ns": int(0.5e9)}
     s.poll_restores()
-    assert s.restore_bw == {"ram": 3 * GB / 0.5}
+    assert s.restore_bw == {"ram": 3 * GB / 0.5}  # (from the engine's copy counters)
 
 
 # ---- review fixes: sync lookup restore, fit check, KvFull retry, release, per-id attribution, restart, no blocking
@@ -639,6 +642,7 @@ def test_failure_is_attributed_to_its_own_id(monkeypatch):
     s.admit_waiting()
     clk.t += 1.0
     eng.finished = [(1, False), (2, True)]  # one poll: 1 failed, 2 worked
+    eng.counters = {"h2d_bytes": 6 * GB, "h2d_ns": int(1e9)}  # (the copy of the one that worked)
     s.poll_restores()
     assert a.restoring is None and b.restoring is None
     assert s.restore_bw == {"ram": 6 * GB / 1.0}  # only the success is a sample
@@ -736,3 +740,63 @@ def test_running_cur_is_not_reset_for_a_restore():
     s.waiting.append(a)
     s.admit_waiting()
     assert eng.resets == [] and s.cur is run and eng.begin_calls == [7]
+
+
+# ---- speeds from the engine's pure timings (learn_speeds): counters, not wall time; small deltas wait; restarts re-baseline
+
+def test_learn_speeds_waits_for_64_mib_and_restarts_rebaseline():
+    eng = Eng(match=ram_match(), begin=1)
+    s = sched(eng)
+    mib = 1 << 20
+    eng.counters = {"ssd_read_bytes": 32 * mib, "ssd_read_ns": int(1e6)}
+    s.learn_speeds()
+    assert s.restore_bw == {}  # under 64 MiB: nothing learned yet
+    eng.counters = {"ssd_read_bytes": 48 * mib, "ssd_read_ns": int(2e6)}
+    s.learn_speeds()
+    assert s.restore_bw == {}  # still under 64 MiB since the baseline: the small reads keep accumulating
+    total = 48 * mib + 2 * GB
+    eng.counters = {"ssd_read_bytes": total, "ssd_read_ns": int(1e9)}
+    s.learn_speeds()
+    assert s.restore_bw == {"ssd": total / 1.0}  # (bytes / seconds from the counters)
+    eng.counters = {"ssd_read_bytes": 1 * GB, "ssd_read_ns": int(0.5e9)}  # the engine restarted: its counters went back
+    s.learn_speeds()
+    assert s.restore_bw == {"ssd": total / 1.0}  # (no sample from a restart, the baseline is the new engine's)
+    eng.counters = {"ssd_read_bytes": 3 * GB, "ssd_read_ns": int(1.5e9)}  # 2 GB in 1 s since the restart
+    s.learn_speeds()
+    want = (1 - worker.RESTORE_BW_SMOOTH) * total + worker.RESTORE_BW_SMOOTH * 2e9
+    assert abs(s.restore_bw["ssd"] - want) < 1
+
+
+def test_wall_time_teaches_no_speed_and_ram_comes_from_the_copy_counters(monkeypatch):
+    clk = Clock()
+    monkeypatch.setattr(worker.time, "time", clk)
+    eng = Eng(match=ram_match(nbytes=3 * GB), begin=1)
+    s = sched(eng)
+    a = seq("a")
+    s.waiting.append(a)
+    s.admit_waiting()
+    clk.t += 0.01  # a fast wall time: it must not raise anything either
+    eng.finished = [(7, True)]
+    s.poll_restores()
+    assert a.restoring is None and s.restore_bw == {}  # no counters: no sample
+    assert s.bandwidth(False) == worker.RESTORE_BW_RAM_PINNED
+    eng.counters = {"h2d_bytes": 3 * GB, "h2d_ns": int(0.1e9)}  # a copy the engine timed at 30 GB/s
+    eng.match = ram_match(eid=8, nbytes=3 * GB)
+    b = seq("b")
+    s.waiting.append(b)
+    s.admit_waiting()
+    eng.finished = [(8, True)]
+    s.poll_restores()
+    assert s.restore_bw == {"ram": 3 * GB / 0.1}
+    assert s.bandwidth(False) == 3 * GB / 0.1  # inside the clamp (0.25 .. 4 x the default)
+    s.restore_bw["ram"] = 1  # far too slow: the clamp keeps it at a quarter of the default
+    assert s.bandwidth(False) == worker.RESTORE_BW_RAM_PINNED * worker.RESTORE_BW_CLAMP[0]
+
+
+def test_default_speeds_and_their_clamped_range():
+    assert worker.RESTORE_BW_SSD == 3e9 and worker.RESTORE_BW_RAM_PINNED == 40e9 and worker.RESTORE_BW_RAM_PAGEABLE == 12e9
+    eng = Eng(match=ram_match(), begin=1)
+    s = sched(eng)
+    hi = worker.RESTORE_BW_CLAMP[1]
+    s.restore_bw = {"ssd": 1e15}
+    assert s.bandwidth(True) == worker.RESTORE_BW_SSD * hi == 12e9  # (3 GB/s default: the range is 0.75 .. 12 GB/s)

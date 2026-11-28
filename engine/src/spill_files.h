@@ -521,7 +521,8 @@ inline bool read_manifest_head(const std::string& path, ManifestHead& out) {
 // thread, so the engine keeps stepping (run_sync() does the same on the calling thread: spill_load). THREADING CONTRACT: the
 // thread touches only this object (a copy of everything it needs: paths, expected ids / names / geometry), the buffers it
 // was given (`state`, `tail`, `chunk[i]`: pieces of a HostKv that nobody else reads or frees meanwhile, as the entry is busy)
-// and the files. It never touches Model, the spill map, the page pool, the PinnedPool bookkeeping, the DiskIndex or CUDA.
+// and the files. With threads > 1 the chunk reads run on worker threads that DiskRead starts and joins (read_chunks_parallel),
+// under the same rules: the workers share only the atomics and the buffers of distinct chunks. It never touches Model, the spill map, the page pool, the PinnedPool bookkeeping, the DiskIndex or CUDA.
 // It ends by storing `st` (release); the engine thread reads it with acquire, and only then joins the thread and uses the
 // bytes. The destructor sets `cancel` (the thread stops between blocks) and joins, so a Model can be destroyed while one
 // runs. Not movable (the thread holds `this`): keep it in a unique_ptr.
@@ -541,6 +542,7 @@ struct DiskRead {
   char* state = nullptr;                          // info.state_bytes bytes
   Pieces tail;                                    // the tail payload, in file order (sum == info.tail_bytes)
   std::vector<Pieces> chunk;                      // chunk i's payload, in file order (each sum == g.chunk_payload())
+  int threads = 1;                                // SPILL_READ_THREADS: > 1 reads the chunk files on that many threads (this one too)
   // outputs
   std::atomic<int> st{0};                         // 0 running, 1 ok, -1 failed
   std::atomic<bool> cancel{false};
@@ -587,15 +589,25 @@ struct DiskRead {
              std::memory_order_relaxed);
     return ok;
   }
+  // Set by the I/O failure of the calling thread (a chunk worker decides its own verdict with it: io_error is shared).
+  static inline thread_local bool tl_io_error = false;
   // A failed open: a missing file is a verdict (the file is gone), anything else (EACCES, a sharing violation, EMFILE ...) is not.
   bool open_failed(int err) {
-    if (err != ENOENT && err != ENOTDIR) io_error.store(true, std::memory_order_relaxed);
+    if (err != ENOENT && err != ENOTDIR) io_error.store(true, std::memory_order_relaxed), tl_io_error = true;
     return false;
   }
   // A read that returned less than asked: ferror is an I/O error, plain EOF is a truncated file (a verdict).
   bool short_read(std::FILE* f) {
-    if (std::ferror(f) && !cancel.load(std::memory_order_relaxed)) io_error.store(true, std::memory_order_relaxed);
+    if (std::ferror(f) && !cancel.load(std::memory_order_relaxed)) io_error.store(true, std::memory_order_relaxed), tl_io_error = true;
     return false;
+  }
+  // A hint for the kernel's read-ahead: each file is read once, front to back (Linux; Windows has no such call here).
+  static void advise_sequential(std::FILE* f) {
+#ifndef _WIN32
+    posix_fadvise(fileno(f), 0, 0, POSIX_FADV_SEQUENTIAL);
+#else
+    (void)f;
+#endif
   }
   bool rh(std::FILE* f, void* p, size_t n, Hash64& hh) { return read_hashed(f, p, n, hh, &cancel, kBlock) || short_read(f); }
   bool read_trailer(std::FILE* f, const Hash64& h) {
@@ -611,6 +623,7 @@ struct DiskRead {
     std::FILE* f = std::fopen(manifest.c_str(), "rb");
     if (!f) return open_failed(errno);
     FileCloser guard{f};
+    advise_sequential(f);
     Hash64 hh;
     ManifestHeader h{};
     const ManifestHeader want = make_manifest_header(info, ids.size(), names.size());
@@ -632,6 +645,7 @@ struct DiskRead {
     return read_trailer(f, hh);
   }
   bool read_chunks() {
+    if (threads > 1 && names.size() > 1) return read_chunks_parallel();
     const size_t ct = size_t(info.g.chunk_pages) * info.g.page_tokens;
     const std::vector<ChunkId> chain = chunk_chain(info.fingerprint, int(info.g.chunk_pages), ids.data(), names.size(), ct);
     for (size_t i = 0; i < names.size(); i++) {
@@ -647,11 +661,71 @@ struct DiskRead {
     }
     return true;
   }
+  // threads > 1 (SPILL_READ_THREADS): the chunk files are claimed in ascending index order from an atomic counter by up to
+  // `threads` threads (this one included; a thread that cannot be started is skipped). Each claimed chunk is read into its
+  // own pieces (disjoint) with its own FILE and Hash64, so the workers share nothing but the atomics. `bad` is the LOWEST index
+  // that failed verification (atomic min): a worker stops claiming once an index at or above `bad` is next, and once an I/O
+  // error or a cancel is seen; the chunks already claimed run to the end. An I/O error is judged per chunk (tl_io_error), so
+  // one worker's I/O error does not turn another's verdict into a non-verdict. An exception is a failure, not a verdict.
+  // The result is true only when every chunk was verified: the same as the serial loop above.
+  bool read_chunks_parallel() {
+    const size_t n = names.size(), ct = size_t(info.g.chunk_pages) * info.g.page_tokens;
+    const std::vector<ChunkId> chain = chunk_chain(info.fingerprint, int(info.g.chunk_pages), ids.data(), n, ct);
+    std::atomic<size_t> next{0}, done{0};
+    auto note_bad = [this](size_t i) {  // atomic min over the failing indices (-1: none yet)
+      int cur = bad.load();
+      while (cur < 0 || int(i) < cur)
+        if (bad.compare_exchange_weak(cur, int(i))) break;
+    };
+    auto work = [&] {
+      try {
+        for (;;) {
+          const size_t i = next.fetch_add(1);
+          if (i >= n || cancel.load(std::memory_order_relaxed) || io_error.load(std::memory_order_relaxed)) return;
+          const int b = bad.load();
+          if (b >= 0 && i >= size_t(b)) return;  // (a lower chunk failed: this one cannot be the lowest)
+          if (chain[i].name != names[i] || pieces_bytes(chunk[i]) != info.g.chunk_payload() || (i + 1) * ct > ids.size()) {
+            note_bad(i);
+            return;
+          }
+          tl_io_error = false;
+          if (!read_chunk(i, chain[i], ct)) {
+            if (!cancel.load(std::memory_order_relaxed) && !tl_io_error) note_bad(i);
+            return;
+          }
+          done.fetch_add(1);
+        }
+      } catch (...) {  // (bad_alloc: this worker stops; the restore fails without a verdict)
+      }
+    };
+    {
+      // Joined before this function returns, on every path (a throw from emplace_back included: no joinable thread escapes).
+      std::vector<std::thread> ws;
+      struct JoinAll {
+        std::vector<std::thread>& v;
+        ~JoinAll() {
+          for (auto& t : v)
+            if (t.joinable()) t.join();
+        }
+      } join_all{ws};
+      ws.reserve(std::min(size_t(threads), n) - 1);  // (may throw before any thread started)
+      for (size_t k = 1; k < std::min(size_t(threads), n); k++) {
+        try {
+          ws.emplace_back(work);
+        } catch (const std::system_error&) {
+          break;  // (no more threads: the ones running and this one read on)
+        }
+      }
+      work();
+    }
+    return done.load() == n;
+  }
   bool read_chunk(size_t i, const ChunkId& id, size_t ct) {
     errno = 0;
     std::FILE* f = std::fopen(chunk_paths[i].c_str(), "rb");
     if (!f) return open_failed(errno);
     FileCloser guard{f};
+    advise_sequential(f);
     Hash64 hh;
     ChunkHeader h{};
     const std::string parent = i ? names[i - 1] : std::string();

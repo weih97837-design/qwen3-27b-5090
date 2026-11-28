@@ -107,6 +107,10 @@ struct Checkpoint {
   // move or copy that reads its pages first makes s_ wait for load_ev. Poll clears `loading` once load_ev completed.
   bool loading = false;
   cudaEvent_t load_ev = nullptr;
+  // SPILL_ASYNC_PROMOTE: the copy's start event (recorded on io_s_ before it: spill_restore_issue) and the bytes it copies; with
+  // load_ev complete, spill_loading_done turns them into the h2d_ns / h2d_bytes counters and returns the event.
+  cudaEvent_t h2d_t0 = nullptr;
+  uint64_t h2d_bytes = 0;
   uint64_t load_id = 0;       // the spill_ entry it was restored from (kept after the copy completes: spill_release finds it)
   // Set when a restore completes: the request that waited for it has not run prefix_begin yet, so evict_checkpoint takes
   // any other checkpoint first (and cache_stats does not count its pages as room). Cleared by prefix_begin using it,
@@ -176,6 +180,9 @@ struct SpillStats {
   // Restores by where the entry was: in memory / only on the SSD (also counted in `restored`). The reuse rate of a tier is these
   // over the entries it received (spilled / written).
   int64_t restored_ram = 0, restored_disk = 0;
+  // Speeds measured by the engine (spill_stats 49..52, model.h): the SSD reads' time / bytes (ok reads only), the host -> device
+  // copies of async restores (CUDA events on io_s_).
+  int64_t ssd_read_ns = 0, ssd_read_bytes = 0, h2d_ns = 0, h2d_bytes = 0;
   // spill_restore_begin's refusals (the frontend's restore-decision counters): busy, no room (spill_room), dropped: a chunk file is missing
   int64_t restore_refused_busy = 0, restore_refused_room = 0, restore_dropped_missing = 0;
 };

@@ -66,11 +66,14 @@ STATS_IDLE = 5.0      # s between them while idle
 RESTORE_TIMEOUT_S = 30.0   # a request waits at most this long for its checkpoint, then it is admitted (prefix_begin falls back)
 RESTORE_MARGIN = 0.8       # restore only if the estimated load time is below this fraction of the recompute time
 RESTORE_OVERHEAD_S = 0.05  # fixed cost of a restore: thread start, slot and page allocation, the polls that notice the end
-# Load speeds in bytes/s until measured (a finished restore: bytes / seconds, begin to visible, smoothed). A RAM entry is
-# a host -> device copy (pinned memory is about twice as fast as pageable); an SSD entry is a file read plus that copy.
-RESTORE_BW_RAM_PINNED, RESTORE_BW_RAM_PAGEABLE, RESTORE_BW_SSD = 12e9, 6e9, 2e9
+# Load speeds in bytes/s until measured. The measurements are the engine's own pure timings (spill_stats: h2d_* = the host ->
+# device copy of an async restore, ssd_read_* = the SSD file reads; learn_speeds), never the wall time of a restore: the
+# scheduler polls only between engine steps, so wall time reads far below the real speed. A RAM entry is a host -> device copy
+# (pinned memory is about twice as fast as pageable); an SSD entry is a file read plus that copy.
+RESTORE_BW_RAM_PINNED, RESTORE_BW_RAM_PAGEABLE, RESTORE_BW_SSD = 40e9, 12e9, 3e9
 RESTORE_BW_CLAMP = (0.25, 4.0)  # a measurement counts within these multiples of the default (a stalled loop must not lock restores out)
 RESTORE_BW_SMOOTH = 0.3         # weight of a new measurement
+RESTORE_BW_MIN_SAMPLE = 64 << 20  # bytes a counter must have moved since the last measurement before it teaches a speed
 # Prompt tokens/s until a prefill chunk was measured: docs/architecture.md measures 11,295 tok/s at 19K and 5,875 tok/s at
 # 194K context; this is in between and leans toward loading.
 PREFILL_TPS_DEFAULT = 8000.0
@@ -333,6 +336,7 @@ class Scheduler:
     async_promote = False
     restores = None       # spilled entry id -> record {"t0", "bytes", "on_disk", "seqs", "late"} while it loads
     restore_bw = None     # kind ("ram" / "ssd") -> measured bytes/s
+    restore_seen = None   # kind -> (bytes, ns) of the engine's counters at the last measurement (learn_speeds)
     restore_pinned = False
     prefill_tps = None    # measured prompt tokens/s (smoothed)
     restore_released = 0  # requests a poll released (count, for the logs and tests)
@@ -365,7 +369,7 @@ class Scheduler:
         if self.tiers is not None:
             self.tiers.start()
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
-        self.restores, self.restore_bw = {}, {}
+        self.restores, self.restore_bw, self.restore_seen = {}, {}, {}
         self.async_promote = (self.tiers is not None and getattr(self.engine, "has_spill_async", False)
                               and _env_flag("SPILL_ASYNC_PROMOTE"))
         self.restore_pinned = (_env_float("SPILL_PINNED_GIB") or 0.0) > 0
@@ -855,7 +859,7 @@ class Scheduler:
                 self.alive.append(self.waiting.popleft())
             return
         if self.restores is None:
-            self.restores, self.restore_bw = {}, {}
+            self.restores, self.restore_bw, self.restore_seen = {}, {}, {}
         self.poll_restores()
         for s in list(self.waiting):
             if len(self.alive) >= self.max_seqs:
@@ -1112,15 +1116,12 @@ class Scheduler:
             rec = self.restores.pop(sid, None)
             if rec is None:
                 continue
-            dt = now - rec["t0"]
-            if ok and not rec["late"] and dt > 0:  # (only a restore that worked, and that was waited for, teaches the speed)
-                kind = "ssd" if rec["on_disk"] else "ram"
-                bw = rec["bytes"] / dt
-                old = self.restore_bw.get(kind)
-                self.restore_bw[kind] = bw if old is None else (1 - RESTORE_BW_SMOOTH) * old + RESTORE_BW_SMOOTH * bw
+            dt = now - rec["t0"]  # (the wall time: for the log only; the speeds come from learn_speeds)
             log(f"restore of {rec['pos']} tokens ended after {dt:.2f} s" + ("" if ok else " (failed)"))
             self.restore_ended(rec, "restored" if ok else "failed")
             freed += self.release(rec, "done")
+        if any(ok for _sid, ok in done):
+            self.learn_speeds()
         for rec in self.restores.values():
             if not rec["late"] and now - rec["t0"] > RESTORE_TIMEOUT_S:
                 rec["late"] = True  # (the engine goes on loading it; nobody waits for it any more)
@@ -1130,6 +1131,35 @@ class Scheduler:
                 freed += self.release(rec, "timeout")
                 self.engine_release(rec["id"])  # (its checkpoint must not stay held for nobody)
         return freed
+
+    def learn_speeds(self):
+        """Teaches restore_bw from the engine's pure timings (spill_stats): "ssd" from the SSD reads (ssd_read_ns / ssd_read_bytes),
+        "ram" from the host -> device copies of async restores (h2d_ns / h2d_bytes). Each is a delta since the last measurement,
+        taken once it covers RESTORE_BW_MIN_SAMPLE bytes (smaller deltas keep accumulating); a counter that went back (the engine
+        restarted) starts a new baseline. Never raises: a failing stats call teaches nothing."""
+        try:
+            sp = self.engine.spill_stats()
+        except Exception:  # noqa: BLE001 - no measurement is no lesson
+            return
+        if self.restore_seen is None:
+            self.restore_seen = {}
+        if self.restore_bw is None:
+            self.restore_bw = {}
+        for kind, bkey, nkey in (("ssd", "ssd_read_bytes", "ssd_read_ns"), ("ram", "h2d_bytes", "h2d_ns")):
+            if bkey not in sp or nkey not in sp:  # (an older engine: nothing to learn from)
+                continue
+            now_b, now_n = int(sp[bkey]), int(sp[nkey])
+            base = self.restore_seen.get(kind, (0, 0))  # (a new engine's counters start at 0)
+            if now_b < base[0] or now_n < base[1]:  # (the engine restarted: its counters went back)
+                self.restore_seen[kind] = (now_b, now_n)
+                continue
+            db, dn = now_b - base[0], now_n - base[1]
+            if db < RESTORE_BW_MIN_SAMPLE or dn <= 0:
+                continue
+            self.restore_seen[kind] = (now_b, now_n)
+            bw = db / (dn / 1e9)
+            old = self.restore_bw.get(kind)
+            self.restore_bw[kind] = bw if old is None else (1 - RESTORE_BW_SMOOTH) * old + RESTORE_BW_SMOOTH * bw
 
     def restore_due(self):
         """For the decode loops: whether a restore ended and released a request, so the turn should end and let the admission
@@ -1865,6 +1895,9 @@ class Scheduler:
                         "restore_refused_busy", "restore_refused_room", "restore_dropped_missing"):
                 if key in sp:  # (the SSD gate / restore refusals: an older engine does not report them)
                     out[f"q27:tier_{key}"] = sp[key]
+            if "ssd_read_ns" in sp:  # (the engine's pure transfer counters: SSD reads and host -> device copies; bytes and seconds)
+                out.update({"q27:ssd_read_bytes_total": sp["ssd_read_bytes"], "q27:ssd_read_seconds_total": sp["ssd_read_ns"] / 1e9,
+                            "q27:h2d_bytes_total": sp["h2d_bytes"], "q27:h2d_seconds_total": sp["h2d_ns"] / 1e9})
             for key in ("ssd_logical_bytes", "ssd_physical_bytes"):
                 if ts.get(key) is not None:  # (SSD dedup: an older engine keeps flat files and has no such figures)
                     out[f"q27:tier_{key}"] = ts[key]

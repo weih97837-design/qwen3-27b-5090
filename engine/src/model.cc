@@ -493,8 +493,10 @@ Model::~Model() {
   // Tiered cache: in-flight copies finish before their host buffers (spill_, retired_) and the pinned slabs go.
   restoring_.clear();  // (joins the threads that read files into the entries' buffers: before any of them is freed)
   if (io_s_) cudaStreamSynchronize(io_s_);
-  for (auto& c : ckpts_)  // (loading checkpoints: their copies are complete now)
+  for (auto& c : ckpts_) {  // (loading checkpoints: their copies are complete now)
     if (c.load_ev) cudaEventDestroy(c.load_ev);
+    if (c.h2d_t0) cudaEventDestroy(c.h2d_t0);  // (only set while loading: spill_loading_done returns it otherwise)
+  }
   for (auto& kv : spill_)  // (the events of in-flight entries are complete now)
     if (kv.second.done) cudaEventDestroy(kv.second.done);
   for (Retired& r : retired_)

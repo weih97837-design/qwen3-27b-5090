@@ -49,6 +49,9 @@ struct Options {
   // background (spill_match / spill_restore_begin / spill_restore_poll) while other requests keep running, instead of
   // prefix_begin promoting it synchronously. With it off those calls do nothing and every code path is unchanged.
   bool spill_async_promote = false;
+  // SPILL_READ_THREADS (1..16, default 4): the threads that read an SSD entry's chunk files in one restore (DiskRead::threads;
+  // spill_files.h). 1: one file after another, as before.
+  int spill_read_threads = 4;
   // RAM dedup of spilled entries (spill.cc (H)-(K), chunk_store.h): full 4096-token chunks shared by content. false: every
   // entry keeps its whole KV (SPILL_DEDUP=0), as before.
   bool spill_dedup = true;
@@ -193,7 +196,7 @@ class Model {
   // in progress, async restores finished, async restores that failed, their total wall time in ms and bytes (begin ->
   // visible); out[20..25] (appended, RAM dedup): logical bytes of the entries in memory (what they would take without
   // sharing), physical bytes (what the RAM tier holds: out[3]), shared chunks resident, chunk hits, chunk misses (full chunks
-  // of spilled entries found resident / copied), dedup_saved_bytes (logical - physical). kSpillStats = 28 values in all (restored_ram, restored_disk: restores of entries that were in memory / only on disk);
+  // of spilled entries found resident / copied), dedup_saved_bytes (logical - physical). kSpillStats = 53 values in all (restored_ram, restored_disk: restores of entries that were in memory / only on disk);
   // spill_list's ram_bytes stays the entry's LOGICAL size. spill_list's "live" column is 0 none, 1 an idle backup, 2 busy (being restored by
   // spill_restore_*: neither written out nor dropped meanwhile); the line format is unchanged.
   std::string spill_list() const;
@@ -226,7 +229,11 @@ class Model {
   // out[41..48] (appended): the SSD gate (ssd_gate.h): 1 when pushed and on, victims rejected (all), of them too short / below the
   // watermark, victims judged; then spill_restore_begin's refusals: busy (unknown / live / busy / already restoring), no room
   // (spill_room), dropped because a chunk file of its manifest is missing (also in failed / restore_failed).
-  static constexpr int kSpillStats = 49;
+  // out[49..50] (appended): the SSD reads' pure time (ns: DiskRead::ns, summed over the reads that ended ok) and the bytes they
+  // loaded (the entry's kv + state, the restore's `bytes`; the file headers are not counted). out[51..52] (appended): the host ->
+  // device copies of async restores, measured on io_s_ with CUDA events (start recorded before the copy, elapsed read when the
+  // copy is complete): ns and bytes. Counted only when the events report a time.
+  static constexpr int kSpillStats = 53;
   void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
@@ -445,7 +452,7 @@ class Model {
   void spill_wait(Spilled& s, bool with_chunks = true);  // CPU: the entry's (and its chunks') in-flight copy has completed (no-op unless inflight)
   void spill_reap();                     // frees the host memory of promoted entries whose host -> device copy is done
   HostKv spill_alloc_kv(size_t bytes);   // pinned segments if the pool holds ALL of it (SPILL_PINNED_GIB > 0), else one new char[]
-  cudaEvent_t spill_event();             // a recycled / new event (no timing)
+  cudaEvent_t spill_event();             // a recycled / new event (timing enabled: the H2D timing reads elapsed times)
   void spill_event_put(cudaEvent_t ev);
   uint64_t spill_fingerprint() const;
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
