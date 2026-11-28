@@ -139,7 +139,17 @@ gate without an explicit decision, recorded below with its numbers.
   pairs): mixed prompts +9.1% / +4.3% at 4 / 8 requests, four code requests +20.6%, eight Japanese +4.4%. Through the
   server on reasoning ([benchmarks.md](benchmarks.md#concurrent-requests)) four and eight requests are as fast as with
   v0.5.0 (899-901 and 1,313-1,314 tok/s), and DFlash2 is still 3% and 6% faster there. The width depends only on past steps, so the output distribution
-  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
+  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). Since
+  2026-11-23 (P3-39) a lane may also verify only a prefix of its draft, chosen per step from the draft's own tables
+  (`Q27_SPEC_CUT`). The choice must not depend on the drafted tokens: an argmax over the drawn path's confidence (as
+  in a step-cost-aware policy we compared) biased the output distribution in an exact enumeration once the cost has
+  steps, while any function of the table (here the expected tokens, marginalized over the draws) keeps it, even
+  chosen jointly over the lanes. A single request does not use it: cutting 16 rows to 8 saves about 1 ms (7%) and
+  the host's decision costs 0.2 ms and the step could no longer be launched ahead. In-process against the rule alone, four / eight requests:
+  sampled +2.0% / +3.2%, greedy +5.6% / +5.6%; four requests at a 16K context: sampled +2.3%, greedy +1.7%. The split
+  changes in most cut steps, so the kernels read it from device memory instead of their arguments
+  (`Q27_BATCH_DEV_ROWS`): re-capturing and updating the graph cost 0.55 ms per new split, and with it gone four /
+  eight requests are another +0.5-2.0% faster (in-process, identical outputs). The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
   At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)
@@ -412,6 +422,16 @@ gate without an explicit decision, recorded below with its numbers.
   CUDA's virtual memory management (available on WSL2 and on native Windows), and the server lends the blocks below
   the parking areas for the decode's duration: unmapping 1 GiB takes 3 to 7 ms in 32 MiB chunks, does not wait for
   running kernels, and gives the memory back to the device (NVML used drops by as much).
+- **Under WSL2, the GPU is woken before a video decode** (2026-11, driver 621.01, RTX 5090). The video tests
+  sometimes ended in "illegal memory access": a job on the GPU had stopped for 2 s, with the GPU and the decoder at
+  0% utilization, and Windows had reset the engine. It also happened with no other decoder on the GPU. All four
+  traced failures were decodes in P8. Replaying one failing process's 26 decode calls (the same inputs) failed in 2
+  of 4 runs with the original pauses between the calls, in none of 30 without the pauses (the GPU stays in P1), and
+  in none of 12 with the pauses and the wake-up. The cause inside the driver is not known, so this avoids the
+  condition rather than repairing it. Destroying the decoder before its stream and synchronizing after the unmap
+  did not help. A burst of kernels raises P1 only after about 0.2 s of work and, when it was light, held it for
+  0.5 s; a context created and destroyed takes 0.1 s and holds it for 6 s. Native Windows and Linux were not seen
+  to fail and are left alone.
 
 ## Weights
 
@@ -436,6 +456,21 @@ gate without an explicit decision, recorded below with its numbers.
   quantizes them with a common one; in vLLM it decodes 7 to 15% faster than NVIDIA's checkpoint with the same
   GSM8K and BFCL.
 - **Other public NVFP4 checkpoints** keep their projections in FP8 and are no faster than NVIDIA's.
+- **PQ-21: two-term activations for the NVFP4 lm_head (W4A4x2, default since 2026-11-23).** Judged against the
+  BF16 original, the one-term head was a cheap place to win accuracy back
+  ([results](results/20261123-pq21-lm-head.json)):
+  - Gain: KL to the original 0.0467 -> 0.0426 (top-1 87.1 -> 87.9%); perplexity on the golden texts 3.91 -> 3.20%
+    above the original's. That is the level of NVIDIA's checkpoint as shipped (3.16%) in perplexity, not in KL
+    (0.0383). NVIDIA's checkpoint gains from the two terms too (2.65%, KL 0.0343) and stays ahead of `gdnfp4`.
+  - Cost: none in weights or KV pool (601,856 tokens). Steps at a fixed number of rows -0.35 to +0.33%, with the
+    adaptive width up to +0.31% (code +1.9%, where it picks more rows). Accepted tokens per step +0.11%
+    [-1.14, +1.32].
+  - Gate, paired on one build: GSM8K 94.7 -> 95.0%; BFCL 89.4 -> 89.0%; Japanese passes; needles the same
+    (16 of 16, 58 of 64); no reasoning loops in 200 either way. BFCL is 4 fewer of 1,000, short of "no fewer right":
+    8 questions right only before and 4 only after (p = 0.39), which was accepted as no measurable difference.
+  - Rejected, an FP8 lm_head: perplexity 3.10% above the original's and KL a little lower, but 4.8% less KV pool
+    and steps 1.9 to 3.4% longer. Rejected, BF16 activations on the NVFP4 weights (W4A16, unpacked in the kernel):
+    the same quality as two terms, slower at every row count (eight requests +2.6%).
 
 ## Serving and concurrency
 
