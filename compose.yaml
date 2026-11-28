@@ -98,6 +98,7 @@ services:
       SPILL_PINNED_GIB: ${SPILL_PINNED_GIB:-8}     # pinned host memory for spill entries, faster copies (0: off; counts against Windows shared GPU memory, see docs/tiered-cache.md)
       SPILL_PINNED_SLAB_MIB: ${SPILL_PINNED_SLAB_MIB:-1024}  # size of each pinned slab, pinned one per idle step (an entry may span several; only used with SPILL_PINNED_GIB)
       SPILL_ASYNC_IO: ${SPILL_ASYNC_IO:-1}         # KV copies on their own stream, no stall of GPU work; frees the CPU only for pinned entries, so use with SPILL_PINNED_GIB (0: off)
+      SPILL_READ_THREADS: ${SPILL_READ_THREADS:-4}  # threads that read an SSD entry's chunk files in one restore (1-16; 1: one file after another)
       SPILL_ASYNC_PROMOTE: ${SPILL_ASYNC_PROMOTE:-1}  # a request that matches a spilled checkpoint waits for it to load in the background while others run (delay hit), instead of stalling the engine (0: off; use together with SPILL_PINNED_GIB and SPILL_ASYNC_IO)
       SPILL_FAIR_AGENTS: ${SPILL_FAIR_AGENTS:-0}  # 0 (default): when a tier is full the victim is chosen over the whole tier (superseded, never-reused, oldest; one user measured RAM reuse ~30% instead of ~6% with 1, early numbers); 1: the agent using the most of the tier is the first victim (for many tenants sharing one engine). docs/tiered-cache.md "Retention"
       SPILL_DEDUP: ${SPILL_DEDUP:-1}  # RAM tier: spilled entries that share a prefix share its 4096-token chunks in RAM (0: every entry keeps its whole KV; docs/tiered-cache.md)

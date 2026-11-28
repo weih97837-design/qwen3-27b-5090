@@ -157,7 +157,7 @@ int main() {
       *bad = r.bad.load(), *io = r.io_error.load();
       return st;
     };
-    const Entry four = make_entry(rng, {}, 4, 100, 256);
+    const Entry four = make_entry(rng, {}, 4, 100, 256, 3, 4, size_t(1) << 18);  // (256 KiB pages: chunks of 3 MiB, so workers overlap)
     // a. threads 1 and 4: the same bytes, both equal to what was exported
     {
       DiskIndex ix;

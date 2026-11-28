@@ -244,3 +244,28 @@ def test_metrics_have_the_gate_and_refusal_series():
     m = s.metrics()
     assert m["q27:tier_ssd_gate_rejected"] == 5 and m["q27:tier_ssd_gate_rejected_watermark"] == 3 and m["q27:tier_ssd_gate_checked"] == 9
     assert m["q27:tier_restore_refused_room"] == 0 and m[key("ram", "started")] == 1
+
+
+def test_metrics_have_the_speed_counters_only_from_an_engine_that_reports_them():
+    class Tiers:
+        def status(self):
+            return {"ssd_bytes": 0, "ssd_budget_bytes": 0, "cache_policy": "smart"}
+
+    eng = RefEng(match=ram_match(), begin=1)
+    base = dict(ram_bytes=0, in_ram=0, on_disk=0, spilled=0, written=0, dropped=0, subsumed=0, failed=0,
+                ssd_read_bytes=4 * 10**9, ssd_read_ns=2 * 10**9, h2d_bytes=3 * 10**9, h2d_ns=5 * 10**8)
+    eng.spill_stats = lambda: dict(eng.ctr, **base)
+    s = sched(eng)
+    s.tiers, s.clock, s.share, s.engine_seqs = Tiers(), worker.EngineClock(), 1.0, 4
+    s.client_metrics = lambda: {}
+    s.waiting.append(seq("a"))
+    s.admit_waiting()
+    m = s.metrics()
+    assert m["q27:ssd_read_bytes_total"] == 4 * 10**9 and m["q27:ssd_read_seconds_total"] == 2.0
+    assert m["q27:h2d_bytes_total"] == 3 * 10**9 and m["q27:h2d_seconds_total"] == 0.5
+    del base["ssd_read_bytes"], base["ssd_read_ns"], base["h2d_bytes"], base["h2d_ns"]  # an older engine
+    s2 = sched(eng)
+    s2.tiers, s2.clock, s2.share, s2.engine_seqs = Tiers(), worker.EngineClock(), 1.0, 4
+    s2.client_metrics = lambda: {}
+    m2 = s2.metrics()
+    assert "q27:ssd_read_bytes_total" not in m2 and "q27:h2d_seconds_total" not in m2
