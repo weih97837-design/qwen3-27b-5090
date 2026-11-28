@@ -591,10 +591,11 @@ int q27_spill_set_ssd_gate(void* m, int on, int64_t min_tokens, double watermark
 - **`SPILL_SSD_WARM_ONLY`／`SPILL_PROBATION_GIB`（legacy）仍只在 frontend**：它們需要跨層的 agent hits 與 frontend 才知道的 `auto:` owner，沒有推給引擎；
   開啟時仍是事後刪除（`not_written`）。
 - frontend 的事後檢查（`_admit_fresh`、probation）保留為安全網，計數方式不變。兩次 tick 之間 SSD 水位若上升，引擎用的是上一次推送的值，可能多寫入幾筆，下一次 tick 再刪。
-- **行為改變**：legacy 下，RAM 滿時短於 `SPILL_SSD_MIN_TOKENS` 的 entry 以前會被引擎寫入 SSD（之後一直留著，tick 只檢查 RAM entry），現在直接丟棄。
+- **行為改變**（legacy 與 smart 都是）：RAM 滿時短於 `SPILL_SSD_MIN_TOKENS` 的唯一副本 victim 以前會被引擎寫入 SSD（之後一直留著：tick 的 `_short` 只檢查 RAM entry，
+  smart 的事後檢查只看水位），現在直接丟棄，不會以任何路徑進入 SSD（包括 16K–32K 的共用前綴）。
 
 **計數器**（`spill_stats` 第 41–45 個值；`/stats` tiers 區塊；狀態頁分層快取面板的「SSD 寫入前拒收」）：
-`ssd_gate_on`（1 = 已推送且開啟）、`ssd_gate_rejected`（全部拒收）、`ssd_gate_rejected_short`、`ssd_gate_rejected_watermark`、`ssd_gate_checked`（gate 判斷過的 victim 數 = 寫入 + 拒收）。
+`ssd_gate_on`（1 = 已推送且開啟）、`ssd_gate_rejected`（全部拒收）、`ssd_gate_rejected_short`、`ssd_gate_rejected_watermark`、`ssd_gate_checked`（gate 判斷過的 victim 數 = 准入 + 拒收；准入後 `spill_write` 失敗者仍會被丟棄，`written` 另外也含 tick 的寫出，所以 `written` 不等於 准入數）。
 `/metrics`：`q27:tier_ssd_gate_rejected`、`q27:tier_ssd_gate_rejected_short`、`q27:tier_ssd_gate_rejected_watermark`、`q27:tier_ssd_gate_checked`。
 `TierPolicy.status()` 的 `ssd_gate` 是最後一次推送的值（`min_tokens`、`watermark`、`steps`、`smart`；沒有推送時為 `null`）。
 

@@ -225,3 +225,22 @@ def test_the_tiers_block_carries_the_decisions_for_the_tier_panel():
     blk = s.tiers_with_decisions({"ram_bytes": 1})
     assert blk["restore_decisions"]["counts"]["ram"]["started"] == 1
     assert s.tiers_with_decisions(None) is None and "restore_decisions" not in s.tiers_with_decisions({"error": "x"})
+
+
+def test_metrics_have_the_gate_and_refusal_series():
+    class Tiers:
+        def status(self):
+            return {"ssd_bytes": 0, "ssd_budget_bytes": 0, "cache_policy": "smart"}
+
+    eng = RefEng(match=ram_match(), begin=1)
+    base = dict(ram_bytes=0, in_ram=0, on_disk=0, spilled=0, written=0, dropped=0, subsumed=0, failed=0,
+                ssd_gate_rejected=5, ssd_gate_rejected_short=2, ssd_gate_rejected_watermark=3, ssd_gate_checked=9)
+    eng.spill_stats = lambda: dict(eng.ctr, **base)
+    s = sched(eng)
+    s.tiers, s.clock, s.share, s.engine_seqs = Tiers(), worker.EngineClock(), 1.0, 4
+    s.client_metrics = lambda: {}
+    s.waiting.append(seq("a"))
+    s.admit_waiting()
+    m = s.metrics()
+    assert m["q27:tier_ssd_gate_rejected"] == 5 and m["q27:tier_ssd_gate_rejected_watermark"] == 3 and m["q27:tier_ssd_gate_checked"] == 9
+    assert m["q27:tier_restore_refused_room"] == 0 and m[key("ram", "started")] == 1
