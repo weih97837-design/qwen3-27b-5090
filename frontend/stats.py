@@ -283,6 +283,11 @@ def _gbps(nbytes, ms):
     return nbytes / (ms / 1000.0) / 1e9 if nbytes and ms and ms > 0 else None
 
 
+def _speed_gbps(nbytes, ns):
+    """GB/s (10^9 bytes) of a pure transfer the engine timed in nanoseconds (1 byte/ns is 1 GB/s); 0 before any was timed."""
+    return nbytes / ns if nbytes and ns and ns > 0 else 0.0
+
+
 TIER_SPLIT_KEYS = tuple(f"{t}_{k}_{u}" for t in ("ram", "disk") for k in ("backup", "evicted") for u in ("entries", "bytes"))
 TIER_REUSE_KEYS = tuple(f"{t}_{k}_{u}" for t in ("ram", "disk") for k in ("reused", "never", "superseded") for u in ("entries", "bytes"))
 
@@ -354,6 +359,9 @@ def tiers_block(engine, tiers, environ=None):
                 "backed_up": sp.get("backed_up", 0), "restoring": sp.get("restoring", 0),
                 "restored_async": sp.get("restored_async", 0), "restore_failed": sp.get("restore_failed", 0),
                 "restore_gbps": _gbps(sp.get("restore_bytes_total", 0), sp.get("restore_ms_total", 0)),
+                # the pure speeds the engine times (no scheduler lag): the SSD reads (file bytes / read time) and the host -> device copies
+                "ssd_read_gbps": _speed_gbps(sp.get("ssd_read_bytes", 0), sp.get("ssd_read_ns", 0)),
+                "h2d_gbps": _speed_gbps(sp.get("h2d_bytes", 0), sp.get("h2d_ns", 0)),
                 "pinned_bytes": sp.get("pinned_bytes", 0),
                 "pinned_used": sp.get("pinned_used", 0), "backup_entries": ts.get("backup_entries", 0),
                 # per tier: entries and bytes, split into live backups (copies of checkpoints still in VRAM) and evicted ones

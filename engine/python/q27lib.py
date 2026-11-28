@@ -646,7 +646,7 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 49)(*([-1] * 49))  # (an older engine writes the first 20 / 28 / 41 and leaves the rest -1)
+        out = (ctypes.c_int64 * 53)(*([-1] * 53))  # (an older engine writes the first 20 / 28 / 41 / 49 and leaves the rest -1)
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
@@ -668,7 +668,11 @@ class Engine:
                 "ssd_gate_on", "ssd_gate_rejected", "ssd_gate_rejected_short", "ssd_gate_rejected_watermark", "ssd_gate_checked",
                 # spill_restore_begin's refusals: busy (unknown / live / busy / already restoring), no room in the KV pool (spill_room),
                 # dropped because a chunk file of its manifest is missing (also in failed / restore_failed)
-                "restore_refused_busy", "restore_refused_room", "restore_dropped_missing")
+                "restore_refused_busy", "restore_refused_room", "restore_dropped_missing",
+                # speeds measured by the engine (spill_stats 49..52): SSD reads (time ns, bytes loaded; ok reads only) and the
+                # host -> device copies of async restores (CUDA events on io_s_: time ns, bytes)
+                "ssd_read_ns", "ssd_read_bytes", "h2d_ns", "h2d_bytes")
+        assert len(keys) == len(out)  # (a key added without its slot would shift every later value)
         # An engine built before RAM dedup never writes the last six: absent, not a misleading 0 (callers use .get()).
         return {k: v for k, v in zip(keys, out) if v != -1}
 

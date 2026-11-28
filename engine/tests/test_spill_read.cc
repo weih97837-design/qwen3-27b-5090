@@ -136,6 +136,119 @@ int main() {
     }
   }
 
+  // 4. SPILL_READ_THREADS (DiskRead::threads > 1: the chunk files are read by several threads). Each case gets its own chunk
+  // directory (the files it damages are not shared with another case). threads 1 and 4 must give the same bytes, the damaged
+  // chunk is named (the LOWEST index that failed verification), a missing file is named, a cancel joins cleanly, and an entry of
+  // one chunk reads like before.
+  {
+    auto exported = [&](const std::string& tag, const Entry& e, DiskIndex& ix, Exported& x) {
+      ix.set_dir(dir + "/" + tag + "/chunks");
+      return export_entry(e, ix, dir + "/" + tag + "/e.q27m", &x);
+    };
+    // reads `e` from its manifest with `threads` threads: the status, the named chunk, and the bytes read
+    auto read = [&](const Entry& e, const Exported& x, const DiskIndex& ix, int threads, int* bad, bool* io,
+                    std::vector<char>* state, HostKv* dst) {
+      *dst = empty_kv(e.linear.size());
+      DiskRead r;
+      plan_read(r, e, ix, x.manifest, x.names, state, dst);
+      r.threads = threads;
+      r.start();
+      const int st = wait_state(r);
+      *bad = r.bad.load(), *io = r.io_error.load();
+      return st;
+    };
+    const Entry four = make_entry(rng, {}, 4, 100, 256);
+    // a. threads 1 and 4: the same bytes, both equal to what was exported
+    {
+      DiskIndex ix;
+      Exported x;
+      CHECK(exported("a", four, ix, x));
+      int bad1 = 0, bad4 = 0;
+      bool io1 = false, io4 = false;
+      std::vector<char> st1, st4;
+      HostKv d1, d4;
+      CHECK(read(four, x, ix, 1, &bad1, &io1, &st1, &d1) == 1);
+      CHECK(read(four, x, ix, 4, &bad4, &io4, &st4, &d4) == 1);
+      CHECK(bad1 == -1 && bad4 == -1 && !io1 && !io4);
+      CHECK(same(four, st1, d1) && same(four, st4, d4));
+      CHECK(st1 == st4);
+    }
+    // b. the chunk at index 2 is damaged: bad == 2 with 4 threads (and with 1); two damaged chunks (1 and 3): bad == 1, every
+    // time (the race between the workers is run 50 times)
+    {
+      DiskIndex ix;
+      Exported x;
+      CHECK(exported("b", four, ix, x));
+      const std::string c2 = ix.path(x.names[2]);
+      fs::copy_file(c2, c2 + ".keep");
+      flip(c2, long(sizeof(ChunkHeader) + four.chunk_tokens() * 4 + 100));
+      int bad = 0;
+      bool io = false;
+      std::vector<char> state;
+      HostKv dst;
+      CHECK(read(four, x, ix, 1, &bad, &io, &state, &dst) == -1 && bad == 2 && !io);
+      CHECK(read(four, x, ix, 4, &bad, &io, &state, &dst) == -1 && bad == 2 && !io);
+      fs::rename(c2 + ".keep", c2);
+      const std::string c1 = ix.path(x.names[1]), c3 = ix.path(x.names[3]);
+      flip(c1, long(sizeof(ChunkHeader) + four.chunk_tokens() * 4 + 100));
+      flip(c3, long(sizeof(ChunkHeader) + four.chunk_tokens() * 4 + 100));
+      for (int round = 0; round < 50; round++) {
+        CHECK(read(four, x, ix, 4, &bad, &io, &state, &dst) == -1 && bad == 1 && !io);
+      }
+      CHECK(read(four, x, ix, 1, &bad, &io, &state, &dst) == -1 && bad == 1);
+      flip(c1, long(sizeof(ChunkHeader) + four.chunk_tokens() * 4 + 100));  // (the same flip again: undone)
+      flip(c3, long(sizeof(ChunkHeader) + four.chunk_tokens() * 4 + 100));
+      CHECK(read(four, x, ix, 4, &bad, &io, &state, &dst) == 1);
+    }
+    // c. a chunk file that is gone (index 2): named, and not an I/O error
+    {
+      DiskIndex ix;
+      Exported x;
+      CHECK(exported("c", four, ix, x));
+      const std::string c2 = ix.path(x.names[2]);
+      fs::rename(c2, c2 + ".away");
+      int bad = 0;
+      bool io = false;
+      std::vector<char> state;
+      HostKv dst;
+      CHECK(read(four, x, ix, 4, &bad, &io, &state, &dst) == -1 && bad == 2 && !io);
+    }
+    // d. a cancel in the middle of the reads (the big entry, 4 threads): the destructor joins, no hang, and a cancelled read is
+    // no verdict (bad -1, not an I/O error). Repeated, so that the cancel lands at different points.
+    {
+      DiskIndex ix;
+      Exported x;
+      const Entry big = make_entry(rng, {}, 6, 40 * 64, 256, 3, 4, size_t(1) << 20);
+      CHECK(exported("d", big, ix, x));
+      for (int round = 0; round < 20; round++) {
+        HostKv dst = empty_kv(big.linear.size());
+        std::vector<char> state;
+        auto r = std::make_unique<DiskRead>();
+        plan_read(*r, big, ix, x.manifest, x.names, &state, &dst);
+        r->threads = 4;
+        r->start();
+        for (int k = 0; k < round; k++) std::this_thread::yield();
+        r->cancel.store(true);
+        const int st = wait_state(*r);
+        CHECK(st == 1 || (st == -1 && r->bad.load() == -1 && !r->io_error.load()));
+        r.reset();
+        dst.reset();
+      }
+    }
+    // e. an entry of one chunk, with 4 threads (the serial path): the same as before
+    {
+      const Entry one = make_entry(rng, {}, 1, 50, 256);
+      DiskIndex ix;
+      Exported x;
+      CHECK(exported("e", one, ix, x));
+      int bad = 0;
+      bool io = false;
+      std::vector<char> state;
+      HostKv dst;
+      CHECK(read(one, x, ix, 4, &bad, &io, &state, &dst) == 1 && same(one, state, dst));
+    }
+  }
+
   fs::remove_all(dir);
   std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
   return fails ? 1 : 0;
