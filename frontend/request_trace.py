@@ -20,6 +20,8 @@ SEED = b"q27-request-trace-v1"
 SNAP_S = 10.0          # s between "snap" events while requests are in flight
 FILE_MIB = 64          # a new file at this size
 MAX_MIB = 512          # REQUEST_TRACE_MAX_MIB default: the oldest files go beyond this total
+ANCHOR_EVERY = 128     # REQUEST_TRACE_ANCHOR_EVERY: one token in this many is an anchor (content-defined)
+ANCHOR_K = 32          # REQUEST_TRACE_ANCHOR_K: tokens hashed per anchor (the anchor and the K-1 after it)
 ENGINE_VERSION = "q27-phase6"  # (what GET /version reports)
 
 
@@ -50,6 +52,22 @@ def block_chain(ids, prev=SEED, data=None):
     return out, prev
 
 
+def anchors(data, start, every=ANCHOR_EVERY, k=ANCHOR_K):
+    """Content-defined anchors of the tokens at index >= start (int32 bytes in `data`): token i is an anchor when
+    ((id * 2654435761) & 0xFFFFFFFF) >> 7) % every == 0 and k tokens (i .. i+k-1) lie inside the prompt. Its hash is the first 6
+    bytes (12 hex digits) of blake2b over those k int32 ids. Depends only on the ids, so the same content at another offset or
+    behind another prefix gives the same hashes (position-independent measurement; no ids or text are kept)."""
+    a = array.array("i")
+    a.frombytes(data)
+    end = len(a) - k + 1
+    if end <= start or every < 1 or k < 1:
+        return []
+    mv = memoryview(data)
+    base = max(start, 0)
+    return [hashlib.blake2b(mv[4 * i:4 * (i + k)], digest_size=6).hexdigest()
+            for i, t in enumerate(a[base:end], base) if (((t * 2654435761) & 0xFFFFFFFF) >> 7) % every == 0]
+
+
 def reusable_from(n, prompt, history, history_agents, agent):
     """The `reusable_from` of a req event: "same" when one of the history entries that share the prompt's longest reusable prefix (n
     tokens, Scheduler.best_history) belongs to the request's agent (Request.agent: the cache's owner, the part of the agent id before
@@ -75,7 +93,8 @@ def hash_agent(agent):
 
 
 class Recorder:
-    def __init__(self, target, header, hash_agents=False, max_mib=MAX_MIB, file_mib=FILE_MIB, log=print, snap_s=SNAP_S):
+    def __init__(self, target, header, hash_agents=False, max_mib=MAX_MIB, file_mib=FILE_MIB, log=print, snap_s=SNAP_S,
+                 anchor_every=ANCHOR_EVERY, anchor_k=ANCHOR_K):
         t = str(target)
         if os.path.isdir(t) or t.endswith(("/", "\\")):
             t = os.path.join(t, "trace")
@@ -85,6 +104,7 @@ class Recorder:
         self.f, self.size, self.path, self.dead = None, 0, None, False
         self.stem, self.k = None, 0
         self.last_snap = 0.0
+        self.anchor_every, self.anchor_k = anchor_every, anchor_k  # (every <= 0: no anchors)
         self._open()
 
     # -- files
@@ -110,7 +130,8 @@ class Recorder:
         if self.f is not None:
             self.f.close()
         self.f, self.path, self.size = open(path, "a", encoding="utf-8"), path, 0
-        self._write({"t": "hdr", "version": 1, "block_tokens": BLOCK, "ts": time.time(), **self.header})
+        self._write({"t": "hdr", "version": 1, "block_tokens": BLOCK, "ts": time.time(),
+                     "anchor_every": self.anchor_every, "anchor_k": self.anchor_k, **self.header})
         files = self._files()  # oldest first (the names sort by time)
         total = 0
         for p in files:
@@ -168,8 +189,14 @@ class Recorder:
             return
         try:
             from stats import media_of
-            blocks, _ = block_chain(None, data=s.ids_bytes())  # (eng_ids: what prefix_begin keys on)
-            self.emit({"t": "req", "ts": time.time(), "rid": s.rid, "agent": self.agent_name(s), "client": s.client,
+            data = s.ids_bytes()
+            blocks, _ = block_chain(None, data=data)  # (eng_ids: what prefix_begin keys on)
+            extra = {}
+            if self.anchor_every > 0:  # (the tail the prefix cache had to compute: see anchors())
+                start = s.reusable or 0
+                extra = {"new_tokens": max(0, len(s.prompt) - start),
+                         "new_anchors": anchors(data, start, self.anchor_every, self.anchor_k)}
+            self.emit({**extra, "t": "req", "ts": time.time(), "rid": s.rid, "agent": self.agent_name(s), "client": s.client,
                        "prompt_tokens": len(s.prompt), "media_tokens": (media_of(s.images) or {}).get("tokens", 0),
                        "max_tokens": s.max_new, "cached": s.cached, "reusable": s.reusable,
                        "reusable_from": getattr(s, "reusable_from", None), "diverged_at": s.diverged_at,
@@ -226,8 +253,17 @@ def from_env(env, header_settings, log=print):
             max_mib = float(env.get("REQUEST_TRACE_MAX_MIB") or MAX_MIB)
         except ValueError:
             max_mib = MAX_MIB
+        def num(name, default):
+            try:
+                return int(env.get(name) or default)
+            except ValueError:
+                return default
+        every = num("REQUEST_TRACE_ANCHOR_EVERY", ANCHOR_EVERY)
+        if (env.get("REQUEST_TRACE_ANCHORS") or "").strip() == "0":
+            every = 0
         rec = Recorder(target, {"engine": ENGINE_VERSION, "build": package_version(), "settings": settings},
-                       hash_agents=(env.get("REQUEST_TRACE_HASH_AGENTS") or "") not in ("", "0"), max_mib=max_mib, log=log)
+                       hash_agents=(env.get("REQUEST_TRACE_HASH_AGENTS") or "") not in ("", "0"), max_mib=max_mib, log=log,
+                       anchor_every=every, anchor_k=max(1, num("REQUEST_TRACE_ANCHOR_K", ANCHOR_K)))
         log(f"request trace: recording to {rec.path} (counts and hashes only; docs/request-trace.md)")
         return rec
     except Exception as e:  # noqa: BLE001 - an unwritable path: serve without it

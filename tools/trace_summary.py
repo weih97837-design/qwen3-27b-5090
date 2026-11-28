@@ -82,7 +82,99 @@ def summarize(reqs, dones=(), snaps=()):
         total = sum(b["reusable_tokens"] for b in by.values())
         out["reusable_from"] = by
         out["reusable_from_other_share"] = by.get("other", {}).get("reusable_tokens", 0) / total if total else None
+    out["anchors"] = anchor_stats(reqs)
     return out
+
+
+SHARE_BINS = ((0.0, 0.0, "0%"), (0.0, 0.25, "0-25%"), (0.25, 0.75, "25-75%"), (0.75, 1.0, "75-100%"), (1.0, 1.0, "100%"))
+
+
+def share_bin(x):
+    if x <= 0:
+        return "0%"
+    if x >= 1:
+        return "100%"
+    return "0-25%" if x <= 0.25 else "25-75%" if x <= 0.75 else "75-100%"
+
+
+def anchor_stats(reqs):
+    """Position-independent view (req.new_anchors, docs/request-trace.md): per request the share of the anchors of its 'new' tail
+    (beyond `reusable`) that an EARLIER request (file/time order) already had in its own tail: any agent / the same agent / another
+    agent. Estimated shareable tokens = share x new_tokens. None when the trace has no new_anchors (an older version)."""
+    if not any("new_anchors" in r for r in reqs):
+        return None
+    seen = {}  # anchor hash -> agents whose earlier request had it
+    shares, groups = [], {}
+    tot_new = cov_new = 0
+    est = {"any": 0.0, "same": 0.0, "other": 0.0}
+    nanch = no_anchor = 0
+    for r in reqs:
+        a = r.get("new_anchors")
+        if a is None:
+            continue
+        nt = r.get("new_tokens")
+        if nt is None:
+            nt = max(0, (r.get("prompt_tokens") or 0) - (r.get("reusable") or 0))
+        tot_new += nt
+        nanch += len(a)
+        if a:
+            ag = r["agent"]
+            c = {"any": 0, "same": 0, "other": 0}
+            for h in a:
+                who = seen.get(h)
+                if who:
+                    c["any"] += 1
+                    if ag in who:
+                        c["same"] += 1
+                    if len(who - {ag}):
+                        c["other"] += 1
+            f = {k: v / len(a) for k, v in c.items()}
+            cov_new += nt
+            for k in est:
+                est[k] += f[k] * nt
+            shares.append(f["any"])
+            for g in ("cached 0" if not r.get("cached") else "cached >0", "reusable_from " + str(r.get("reusable_from"))):
+                b = groups.setdefault(g, {"requests": 0, "new_tokens": 0, "shareable_est": 0.0})
+                b["requests"] += 1
+                b["new_tokens"] += nt
+                b["shareable_est"] += f["any"] * nt
+            for h in a:
+                seen.setdefault(h, set()).add(ag)
+        elif nt:
+            no_anchor += 1
+    hist = {}
+    for x in shares:
+        hist[share_bin(x)] = hist.get(share_bin(x), 0) + 1
+    return {"requests": len(shares), "requests_without_anchor": no_anchor, "anchors": nanch, "new_tokens": tot_new,
+            "new_tokens_with_anchors": cov_new,
+            "shareable_est": est, "shareable_share": {k: (v / cov_new if cov_new else None) for k, v in est.items()},
+            "share_p10": pct(shares, 0.1), "share_median": pct(shares, 0.5), "share_p90": pct(shares, 0.9),
+            "share_histogram": hist, "groups": groups}
+
+
+ANCHOR_CAVEAT = ("caveat: estimate only. One anchor per ~128 tokens (sampled), each a window of 32 tokens (see the header's anchor_every / "
+                 "anchor_k); a window counts as seen only if its 32 tokens are identical to an earlier request's tail. Content-defined: "
+                 "a changed header or offset shifts nothing. 'Seen' is an upper bound of what position-independent reuse could find; "
+                 "the prefix cache cannot reuse it (KV and recurrent state depend on everything before).")
+
+
+def render_anchors(a):
+    if a is None:
+        return "position-independent sharing: no new_anchors in this trace (older version or REQUEST_TRACE_ANCHORS=0), skipped"
+    L = ["position-independent sharing of the 'new' tail (beyond reusable):",
+         f"  requests with anchors {a['requests']}  without {a['requests_without_anchor']}  anchors {a['anchors']}  "
+         f"new tokens {a['new_tokens']} (with anchors {a['new_tokens_with_anchors']})"]
+    sh = a["shareable_share"]
+    f = lambda x: "-" if x is None else f"{100 * x:.1f}%"  # noqa: E731
+    L.append(f"  estimated new tokens shareable by content: any agent {a['shareable_est']['any']:.0f} ({f(sh['any'])})  "
+             f"same agent {a['shareable_est']['same']:.0f} ({f(sh['same'])})  other agent {a['shareable_est']['other']:.0f} ({f(sh['other'])})")
+    L.append(f"  per-request share seen before: p10 {f(a['share_p10'])}  median {f(a['share_median'])}  p90 {f(a['share_p90'])}  histogram "
+             + "  ".join(f"{lab}: {a['share_histogram'].get(lab, 0)}" for _, _, lab in SHARE_BINS))
+    for g, b in sorted(a["groups"].items()):
+        L.append(f"  {g}: {b['requests']} requests, new {b['new_tokens']}, shareable ~{b['shareable_est']:.0f} "
+                 f"({f(b['shareable_est'] / b['new_tokens'] if b['new_tokens'] else None)})")
+    L.append("  " + ANCHOR_CAVEAT)
+    return "\n".join(L)
 
 
 def render(s):
@@ -107,6 +199,7 @@ def render(s):
         L.append("reusable prefix from (requests / reusable tokens): " + "  ".join(
             f"{k} {v['requests']} / {v['reusable_tokens']}" for k, v in sorted(s["reusable_from"].items()))
             + "  -> share of reusable tokens from other agents: " + ("-" if o is None else f"{100 * o:.1f}%"))
+    L.append(render_anchors(s.get("anchors")))
     return "\n".join(L)
 
 
