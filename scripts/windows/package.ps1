@@ -63,6 +63,8 @@ foreach ($d in "bench\draft-vocab", "engine\python", "frontend") {
   Copy-Item -Recurse $d (Join-Path $app $d)
 }
 Remove-Item -Recurse -Force (Join-Path $app "frontend\tests")
+New-Item -ItemType Directory -Force "$app\tools" | Out-Null
+Copy-Item tools\zero_hit.py "$app\tools\"  # (the live zero-hit view imports it: frontend/stats.py)
 New-Item -ItemType Directory -Force "$app\reference\qwen27b", "$app\scripts", "$app\engine\build" | Out-Null
 foreach ($f in "__init__.py", "paths.py", "image_tokens.py") { Copy-Item "reference\qwen27b\$f" "$app\reference\qwen27b\" }
 Copy-Item scripts\download_weights.py, scripts\windows\start_package.py, scripts\windows\update.ps1 "$app\scripts\"

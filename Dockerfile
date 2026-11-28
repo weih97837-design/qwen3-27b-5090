@@ -79,5 +79,6 @@ COPY bench/draft-vocab bench/draft-vocab
 COPY reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/image_tokens.py reference/qwen27b/
 COPY engine/python engine/python
 COPY frontend frontend
+COPY tools/zero_hit.py tools/zero_hit.py
 EXPOSE 46320
 CMD ["python", "frontend/server.py"]

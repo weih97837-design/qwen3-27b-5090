@@ -248,6 +248,7 @@ class Seq:
         self.restore_pos = 0     # tokens of its prompt that entry covers (their pages are counted in its need, not as room)
         self.trace_src = None    # where its async restore loaded from ("ram" / "ssd"; the request trace)
         self.restore_outcome = None  # the last restore decision for it (RESTORE_OUTCOMES / RESTORE_NONE_OUTCOMES; the trace's req.restore)
+        self.head = None             # the chained hashes of its first 16 blocks (begin; request_trace.head_hashes; the zero-hit view)
         self.restore_tier = None     # the tier of the entry that decision was about ("ram" / "ssd"; None: no entry)
         self.no_sync = False     # recompute chosen over loading: prefix_begin must not promote a spilled match itself
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
@@ -1495,6 +1496,7 @@ class Scheduler:
         s.started, s.fed = True, cached
         if s.cached is None:
             s.cached, s.begun = cached, time.time()
+            s.head = request_trace.head_hashes(s.ids_bytes())  # (the live zero-hit view: the start message carries the first 16)
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.agent_count(s, len(s.prompt), cached)
@@ -1528,7 +1530,10 @@ class Scheduler:
                     self.note_restore(restored_from, "sync_restored")
             if self.trace is not None:
                 self.trace.request(s, restored_from)
-            self.send("start", s.rid, {"cached": cached})
+            self.send("start", s.rid, {"cached": cached, "zh": {  # (the live zero-hit view, stats.py: at begin, as the trace's req)
+                "agent": s.agent_id or s.agent, "begun": s.begun, "prompt_tokens": len(s.prompt), "cached": cached,
+                "h0": s.head[0] if s.head else None, "h15": s.head[15] if s.head and len(s.head) >= 16 else None,
+                "restore": s.restore_outcome, "restore_tier": s.restore_tier}})
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:

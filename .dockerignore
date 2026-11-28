@@ -5,6 +5,7 @@
 !bench/draft-vocab/
 !engine/
 !frontend/
+!tools/zero_hit.py
 !reference/qwen27b/__init__.py
 !reference/qwen27b/paths.py
 !reference/qwen27b/image_tokens.py

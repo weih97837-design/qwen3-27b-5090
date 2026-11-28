@@ -13,6 +13,7 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 REQUEST_TRACE_ANCHORS=0               # 關閉內容錨點（new_anchors，見下；開啟軌跡時預設開）
 REQUEST_TRACE_ANCHOR_EVERY=128        # 約每幾個 token 一個錨點（預設 128）
 REQUEST_TRACE_ANCHOR_K=32             # 每個錨點雜湊的 token 數（預設 32）
+ZERO_HIT_STATS=0                 # 關閉即時的零命中視圖（/admin/zero_hits 回 404、/metrics 不含；預設開；不影響軌跡檔）
 ```
 
 `REQUEST_TRACE` 未設定時的預設位置（`frontend/request_trace.py` 的 `default_trace_target`）：
@@ -154,3 +155,51 @@ python tools/cache_sim.py trace-copy/*.jsonl --policy legacy,smart
 - `REQUEST_TRACE=0`：整個關閉，不寫檔（磁碟上既有的舊檔不會被刪除）。
 - `REQUEST_TRACE_HASH_AGENTS=1`：agent id 改為短雜湊（機器名稱仍在）。
 - 防火牆／綁定位址：只開放信任的網段到這個連接埠（或讓伺服器只聽 `127.0.0.1`）。
+
+## 零命中請求（zero-hit）
+
+**定義：** `prompt_tokens >= 4096` 且 `cached == 0`（前綴快取一個 token 也沒命中）。`trace_summary.py` 既有的 `long_zero_hit_share`（> 16384 且 cached = 0 的比例）保留；新的指標以 4096 為門檻，另列 >= 16384 的子集。每個零命中請求**恰好歸入一類**，依下列順序判斷，第一個成立者為準：
+
+| 原因 | 條件 | 怎麼看 |
+|---|---|---|
+| `first_seen` | agent 在窗口內沒有更早的請求，且第一個 256-token 區塊的雜湊從未出現 | 全新的 agent 與提示詞：冷快取是正常的 |
+| `agent_returned_after_gap` | agent 的上一個請求距今超過 600 s | 隔了一段時間才回來（每日、隔夜）；快取多半已被淘汰。報告會列出相隔秒數 |
+| `diverged_early` | 600 s 內有上一個請求，但 agent 所有更早請求與它的共同前綴都 < 4096 token | 提示詞開頭就變了（system prompt、工具定義）：不是快取的錯，而是 agent 的前綴不穩定 |
+| `evicted_or_missed` | 與窗口內某個更早的請求共享 >= 4096 token 的前綴，卻 cached = 0 | **快取失效**：這一類才是要追的 bug（見下） |
+| `other` | 以上都不是（例如只有 agent 不同、共同前綴在 4096 以下） | 通常是另一個 agent 的前綴只共享了開頭的區塊 |
+| `window_start` | 窗口開始後 300 s 內、本來會被歸為 `first_seen` 的請求（`totals` 與 `/metrics` 中獨立列出） | 窗口前的歷史未知（離線：軌跡從中途開始；即時：伺服器啟動後）。不計入 `first_seen` |
+
+- **門檻與邊界。** 4096 token 是 16 個區塊。兩個提示詞共享 4096 token 的前綴，等於它們第 16 個區塊的鏈式雜湊相同（每個鏈式雜湊涵蓋它之前的全部 token），所以只比對第 1 與第 16 個區塊。區塊內的共同前綴不足一個區塊的部分不計：共享 4095 token 不算共享 4096。恰為 4096 token 算長；恰為 600 s 不算回頭（> 600 s 才算）。
+- **比對範圍。** 離線（`tools/trace_summary.py`）比對最近 65536 個請求的雜湊；即時視圖（伺服器）比對最近 4096 個（`tools/zero_hit.py` 的 `OFFLINE_CAP`、`CAP`）。每個 agent 的上一個請求時間另有 4096 個 agent 的 LRU。更早的請求不再比對，所以它的共享會被歸為 `other` 或 `first_seen`，而不是 `evicted_or_missed`。
+- **引擎重啟。** 伺服器保留的歷史在引擎重啟（或 `/admin/engine` 卸載、重載）後仍在，但 RAM 裡的快取已空；SSD 分層若保留（預設開啟，見 `docs/tiered-cache.md`），部分前綴還能找回。重啟後與重啟前共享前綴卻 cached = 0 的請求多半會落在 `evicted_or_missed`：先看它的還原結果（`none no_match`、`none not_checked`），再對照引擎的啟動時間（`engine ready` 的紀錄）。這一段不一定是快取的 bug。
+- **agent 的單位是完整的 agent id（`agent/session`）。** 每日或隔夜回來但換了 session id 的 agent，會被當成全新的（`first_seen`）或被當成共享前綴的其他請求（`evicted_or_missed`），不會進入 `agent_returned_after_gap`。要看每日的 agent，請用固定的 agent id。
+- **在途的請求。** 「更早的共享請求」可能仍在進行中（還沒寫入快取），此時 cached = 0 不一定是失效。`evicted_or_missed` 的範例可以用它的 `done` 時間對照。
+- **開始與結束。** 即時與離線都以請求**開始**（begin，與軌跡的 `req` 事件同一時刻）為準：在佇列中就取消、從未開始的請求兩者都不計；開始後出錯的請求兩者都計。
+
+### 怎麼讀 `evicted_or_missed`
+
+離線：`trace_summary.py` 的「零命中分析」列出每類的數量、占比（占零命中請求的比例）、prompt token 合計、prompt 長度中位數與前 5 個 agent。`evicted_or_missed` 另列：
+
+- **還原結果**（`restore_tier restore`，即請求的 `req.restore_tier` 與 `req.restore`，見上面的軌跡欄位）。`none no_match`：分層快取（RAM、SSD）裡沒有那段前綴的條目，典型的淘汰；`none not_checked`：這個請求從未被檢查還原。`ram`／`ssd` 加結果：找到條目，結果說明之後怎麼了。`not_worth_loading`：重算比載入快，所以不載入。`no_kv_room`、`spill_room_refused`：KV 池或分層快取沒有空間。`skipped_busy`：引擎忙，這次不還原。`restored`、`sync_restored`：還原成功，卻仍然 cached = 0，這是需要追查的 bug（條目到了但沒有被用上）。`failed`、`timed_out`、`damaged`、`chunk_missing`、`begin_refused`、`lookup_failed`：還原本身出錯。
+- **前一請求超過 600 s 的筆數**：超過 600 s 多半是淘汰（容量或時間）。600 s 內就失效，比較像寫入或查找的問題，優先看。
+- **範例**（最多 10 筆）：agent、prompt tokens、相隔秒數、還原結果。只有數字與 id，沒有提示詞文字。
+
+即時：`GET /admin/zero_hits` 與狀態頁（`/ui`）的「零命中請求」區塊都以同一套分類計算。
+
+### 即時視圖：端點、指標、狀態頁
+
+引擎行程在請求開始（begin，與軌跡的 `req` 事件同一時刻）時，於 `start` 訊息的 `zh` 欄位送出：agent、開始時間、prompt 長度、cached、前兩個區塊的 hash（第 1 與第 16）、還原決策。伺服器行程的 reader 依序收到這些訊息，在 `frontend/stats.py`（`zero_hit_start`）維護記憶體中的滾動狀態，所以比對順序與軌跡相同，且**與 `REQUEST_TRACE` 無關，預設開啟**；它只保存雜湊與數字，沒有提示詞。引擎在請求開始時只對前 16 個區塊算一次雜湊，每個請求多送的是兩個雜湊與幾個欄位，記憶體與 CPU 都是固定的上限。
+
+| 端點 | 說明 |
+|---|---|
+| `GET /admin/zero_hits[?since=<epoch 秒>]` | JSON：`window_s`（統計自伺服器啟動起的秒數）、`since_ts`、`threshold_tokens`（4096）、`totals`（每個原因的 `count` 與 `tokens`，累計）、`recent`（最近 200 筆零命中請求：`ts`、`agent`、`prompt_tokens`、`reason`、`gap_s`、`earlier_age_s`、`restore`、`restore_tier`）、`agents_top`（零命中最多的 10 個 agent）。`?since=` 只保留 `ts` 大於它的 `recent`。沒有驗證，和 `/ui` 一樣。`REQUEST_TRACE_HTTP=0` 或 `ZERO_HIT_STATS=0` 時 404 |
+| `/metrics` | `q27:zero_hit_requests_total{reason="…"}` 與 `q27:zero_hit_tokens_total{reason="…"}`，每個原因都列出（沒有就是 0），累計自伺服器啟動 |
+
+狀態頁（`/ui`）的「零命中請求」區塊：每個原因的累計筆數與一行說明、最近 10 筆（時間、agent、prompt tokens、原因、還原結果、相隔秒數）；每 10 秒更新一次。`ZERO_HIT_STATS=0` 時隱藏。
+
+```
+curl -s http://HOST:8080/admin/zero_hits | python -m json.tool
+curl -s "http://HOST:8080/admin/zero_hits?since=1767225600"
+curl -s http://HOST:8080/metrics | grep zero_hit
+python tools/trace_summary.py trace-*.jsonl        # 「零命中分析」一節
+```

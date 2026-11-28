@@ -53,6 +53,13 @@ def block_chain(ids, prev=SEED, data=None):
     return out, prev
 
 
+def head_hashes(data, n=16):
+    """The chained hashes of the first n full blocks of int32 bytes `data` (the first n of block_chain: n = 16 is the 4096-token
+    prefix the zero-hit view compares, tools/zero_hit.py). Only that much of the prompt is hashed; the list is shorter for a
+    shorter prompt."""
+    return block_chain(None, data=data[:n * BLOCK * 4])[0]
+
+
 def anchors(data, start, every=ANCHOR_EVERY, k=ANCHOR_K):
     """Content-defined anchors of the tokens at index >= start (int32 bytes in `data`): token i is an anchor when
     ((id * 2654435761) & 0xFFFFFFFF) >> 7) % every == 0 and k tokens (i .. i+k-1) lie inside the prompt. Its hash is the first 6

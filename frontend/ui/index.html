@@ -202,6 +202,10 @@ tr.act td { background: var(--wash); }
 #trace-body a { color: var(--s1); font-size: 13px; }
 #trace-body .kv { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 #trace-body .kv div:nth-child(2) b { white-space: nowrap; }
+#zh-body .zh-list { display: grid; }
+#zh-body .zh-r { display: grid; grid-template-columns: max-content max-content 1fr; gap: 2px 12px; align-items: baseline;
+  padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+#zh-body .zh-r small { grid-column: 1 / -1; color: var(--muted); font-size: 12px; line-height: 1.5; }
 @media (max-width: 600px) {
   .wid { display: none; }
   .nar { display: inline; }
@@ -370,6 +374,15 @@ tr.act td { background: var(--wash); }
       <h2 style="margin:0">追蹤檔</h2>
     </div>
     <div id="trace-body"></div>
+  </section>
+
+  <section class="card" id="zh-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">零命中請求</h2>
+      <span class="muted" id="zh-sum"></span>
+    </div>
+    <div class="sub" style="margin-bottom:8px">prompt ≥ 4096 token 且 cached = 0，自伺服器啟動起計（REQUEST_TRACE 關閉也會計）</div>
+    <div id="zh-body"></div>
   </section>
 
   <section class="card">
@@ -858,6 +871,39 @@ function drawTrace() {
     el("div", { class: "row", style: "margin-top:10px;gap:6px 16px;flex-wrap:wrap" },
       el("a", { href: "/admin/trace", target: "_blank", rel: "noopener" }, "檔案清單（JSON）"),
       el("a", { href: "/admin/trace/all", download: "trace-all.jsonl" }, "下載全部（/admin/trace/all）")));
+}
+// Zero-hit requests (GET /admin/zero_hits, the live view: prompt >= 4096 token with cached = 0, by reason; hidden when it is off)
+const ZH = [
+  ["first_seen", "全新", "全新：agent 在窗口內首次出現，且第一個區塊的雜湊從未出現"],
+  ["agent_returned_after_gap", "回頭的 agent", "回頭的 agent：距上次請求超過 600 秒（每日或隔夜才回來的 agent）"],
+  ["diverged_early", "開頭就變了", "開頭就變了：600 秒內的上一個請求與它的前綴不足 4096 token（system prompt 或工具定義變了）"],
+  ["evicted_or_missed", "快取失效", "快取失效：與先前請求共享 >= 4096 token 的前綴，卻沒有命中（待查：被淘汰或沒有寫入）"],
+  ["other", "其他", "其他：與先前請求的共同前綴不足 4096 token，且不屬於上述情況"],
+  ["window_start", "窗口起點", "窗口起點：窗口開始後 300 秒內的全新 agent，歷史未知，不計入 first_seen"],
+];
+const ZH_NAME = Object.fromEntries(ZH.map(([k, name]) => [k, name]));
+let zhInfo = null;
+async function loadZeroHits() {
+  try { const r = await fetch("/admin/zero_hits", { cache: "no-store" }); zhInfo = r.ok ? await r.json() : null; }
+  catch (e) { zhInfo = null; }
+  drawZeroHits();
+}
+function drawZeroHits() {
+  const z = zhInfo, sec = $("zh-sec"), body = $("zh-body");
+  if (!z || !z.totals) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const count = (k) => z.totals[k] ? z.totals[k].count : 0;
+  $("zh-sum").textContent = `${ZH.reduce((a, [k]) => a + count(k), 0).toLocaleString()} 筆`;
+  const when = (ts) => new Date(ts * 1000).toLocaleTimeString("zh-TW", { hour12: false });
+  const recent = z.recent.slice(-10).reverse();
+  body.replaceChildren(
+    el("div", { class: "zh-list" }, ...ZH.map(([k, name, text]) =>
+      el("div", { class: "zh-r" }, el("b", {}, name), el("span", { class: "num" }, count(k).toLocaleString()), el("small", {}, text)))),
+    el("div", { class: "sub", style: "margin:10px 0 4px" }, "最近 10 筆"),
+    recent.length ? el("div", { class: "zh-list" }, ...recent.map((e) =>
+      el("div", { class: "zh-r" }, el("span", {}, when(e.ts)), el("b", {}, ZH_NAME[e.reason] || e.reason),
+        el("small", {}, wbrText(e.agent), `  ${e.prompt_tokens.toLocaleString()} token  ·  還原 ${e.restore_tier || "none"} ${e.restore || "none"}` +
+          (e.gap_s != null ? `  ·  相隔 ${e.gap_s.toFixed(0)} s` : ""))))) : el("div", { class: "sub" }, "尚無零命中請求"));
 }
 const f2 = (v) => v == null ? "–" : v.toFixed(2);
 const fmtSetting = (v) => v == null ? "–" : typeof v === "number" ? v.toLocaleString() : typeof v === "boolean" ? (v ? "是" : "否") : String(v);
@@ -1510,6 +1556,8 @@ loadUiState();
 setInterval(loadUiState, 10000);
 loadTrace();
 setInterval(loadTrace, 15000);
+loadZeroHits();
+setInterval(loadZeroHits, 10000);
 try { if (localStorage.getItem("q27-launch-open")) showLaunch(true); } catch (e) { /* (no storage) */ }
 connect();
 </script>
