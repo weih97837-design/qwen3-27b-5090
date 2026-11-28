@@ -271,3 +271,12 @@ def test_trace_summary_prints_the_section_and_the_json_block(tmp_path, capsys, m
     assert j["zero_hit"]["zero_hit"] == 2
     assert j["zero_hit"]["reasons"]["evicted_or_missed"]["count"] == 1
     assert j["zero_hit"]["examples"]["evicted_or_missed"][0]["restore_tier"] == "ssd"
+
+
+def test_from_head_maps_the_engine_start_fields():
+    zh_ = {"agent": "a/s1", "begun": 12.5, "prompt_tokens": 5000, "cached": 0, "h0": "x", "h15": "y", "restore": "no_match",
+           "restore_tier": "none"}
+    r = zh.from_head(zh_)
+    assert r == {"ts": 12.5, "agent": "a/s1", "prompt_tokens": 5000, "cached": 0, "h0": "x", "h15": "y", "restore": "no_match",
+                 "restore_tier": "none"}
+    assert zh.from_head({"agent": "a", "begun": 1.0})["h15"] is None   # (a short prompt has no 16th block)

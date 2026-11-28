@@ -167,12 +167,14 @@ python tools/cache_sim.py trace-copy/*.jsonl --policy legacy,smart
 | `diverged_early` | 600 s 內有上一個請求，但 agent 所有更早請求與它的共同前綴都 < 4096 token | 提示詞開頭就變了（system prompt、工具定義）：不是快取的錯，而是 agent 的前綴不穩定 |
 | `evicted_or_missed` | 與窗口內某個更早的請求共享 >= 4096 token 的前綴，卻 cached = 0 | **快取失效**：這一類才是要追的 bug（見下） |
 | `other` | 以上都不是（例如只有 agent 不同、共同前綴在 4096 以下） | 通常是另一個 agent 的前綴只共享了開頭的區塊 |
-| `window_start` | 窗口開始後 300 s 內、本來會被歸為 `first_seen` 的請求 | 窗口前的歷史未知（離線：軌跡從中途開始；即時：伺服器啟動後）。不計入 `first_seen` |
+| `window_start` | 窗口開始後 300 s 內、本來會被歸為 `first_seen` 的請求（`totals` 與 `/metrics` 中獨立列出） | 窗口前的歷史未知（離線：軌跡從中途開始；即時：伺服器啟動後）。不計入 `first_seen` |
 
 - **門檻與邊界。** 4096 token 是 16 個區塊。兩個提示詞共享 4096 token 的前綴，等於它們第 16 個區塊的鏈式雜湊相同（每個鏈式雜湊涵蓋它之前的全部 token），所以只比對第 1 與第 16 個區塊。區塊內的共同前綴不足一個區塊的部分不計：共享 4095 token 不算共享 4096。恰為 4096 token 算長；恰為 600 s 不算回頭（> 600 s 才算）。
 - **比對範圍。** 離線（`tools/trace_summary.py`）比對最近 65536 個請求的雜湊；即時視圖（伺服器）比對最近 4096 個（`tools/zero_hit.py` 的 `OFFLINE_CAP`、`CAP`）。每個 agent 的上一個請求時間另有 4096 個 agent 的 LRU。更早的請求不再比對，所以它的共享會被歸為 `other` 或 `first_seen`，而不是 `evicted_or_missed`。
-- **引擎重啟。** 伺服器保留的歷史在引擎重啟（或 `/admin/engine` 卸載、重載）後仍在，但快取已空。重啟後與重啟前共享前綴的請求，會被算成 `evicted_or_missed`。判讀時先對照引擎的啟動時間（`engine ready` 的紀錄），這一段不是快取的 bug。
-- **錯誤結束的請求。** 即時視圖只計算正常送出 `done` 的請求（引擎內部錯誤的結束不送 `done`）。離線的軌跡有它們的 `req` 事件，所以兩者在這類請求上數字會不同。
+- **引擎重啟。** 伺服器保留的歷史在引擎重啟（或 `/admin/engine` 卸載、重載）後仍在，但 RAM 裡的快取已空；SSD 分層若保留（預設開啟，見 `docs/tiered-cache.md`），部分前綴還能找回。重啟後與重啟前共享前綴卻 cached = 0 的請求多半會落在 `evicted_or_missed`：先看它的還原結果（`none no_match`、`none not_checked`），再對照引擎的啟動時間（`engine ready` 的紀錄）。這一段不一定是快取的 bug。
+- **agent 的單位是完整的 agent id（`agent/session`）。** 每日或隔夜回來但換了 session id 的 agent，會被當成全新的（`first_seen`）或被當成共享前綴的其他請求（`evicted_or_missed`），不會進入 `agent_returned_after_gap`。要看每日的 agent，請用固定的 agent id。
+- **在途的請求。** 「更早的共享請求」可能仍在進行中（還沒寫入快取），此時 cached = 0 不一定是失效。`evicted_or_missed` 的範例可以用它的 `done` 時間對照。
+- **開始與結束。** 即時與離線都以請求**開始**（begin，與軌跡的 `req` 事件同一時刻）為準：在佇列中就取消、從未開始的請求兩者都不計；開始後出錯的請求兩者都計。
 
 ### 怎麼讀 `evicted_or_missed`
 
@@ -186,7 +188,7 @@ python tools/cache_sim.py trace-copy/*.jsonl --policy legacy,smart
 
 ### 即時視圖：端點、指標、狀態頁
 
-引擎行程在每個請求結束時，於 `done` 訊息的 `zh` 欄位送出：agent、開始時間、前兩個區塊的 hash（第 1 與第 16）、還原決策。伺服器行程（`frontend/stats.py`，`HUB.finished`）在記憶體中維護滾動狀態，所以**與 `REQUEST_TRACE` 無關，預設開啟**；它只保存雜湊與數字，沒有提示詞。引擎在請求開始（`begin`）時只對前 16 個區塊算一次雜湊，每個請求多送的是兩個雜湊與幾個欄位，記憶體與 CPU 都是固定的上限。
+引擎行程在請求開始（begin，與軌跡的 `req` 事件同一時刻）時，於 `start` 訊息的 `zh` 欄位送出：agent、開始時間、prompt 長度、cached、前兩個區塊的 hash（第 1 與第 16）、還原決策。伺服器行程的 reader 依序收到這些訊息，在 `frontend/stats.py`（`zero_hit_start`）維護記憶體中的滾動狀態，所以比對順序與軌跡相同，且**與 `REQUEST_TRACE` 無關，預設開啟**；它只保存雜湊與數字，沒有提示詞。引擎在請求開始時只對前 16 個區塊算一次雜湊，每個請求多送的是兩個雜湊與幾個欄位，記憶體與 CPU 都是固定的上限。
 
 | 端點 | 說明 |
 |---|---|

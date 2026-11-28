@@ -26,8 +26,9 @@ import trace_http
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
 try:
     import zero_hit
-except ImportError:  # (a package without tools/: the view is off, the rest runs)
+except ImportError:  # (a build without tools/zero_hit.py: the view is off, the rest runs)
     zero_hit = None
+    print("zero-hit view: tools/zero_hit.py not found; the view is off", file=sys.stderr)
 
 SAMPLE_S = float(os.environ.get("STATS_SAMPLE_S", 1.0))  # s between GPU samples (0: no sampling)
 HISTORY_S = 600   # s of samples kept
@@ -582,9 +583,6 @@ class Hub:
             self.add_log("submit", rid, meta.get("preview") or "", meta=meta)
 
     def finished(self, rid, reason, info):
-        zh = info.pop("zh", None)  # (the live zero-hit view's fields; not part of the log entry)
-        if zh is not None:
-            zero_hit_observe(zh, info.get("prompt_tokens", 0), info.get("cached_tokens", 0))
         with self.lock:
             meta = self.meta.pop(rid, {})
         prompt, cached = info.get("prompt_tokens", 0), info.get("cached_tokens", 0)
@@ -781,19 +779,20 @@ class Hub:
 
 HUB = Hub()
 
-# -- the live zero-hit view (docs/request-trace.md "零命中請求"): the server process keeps it; the engine sends the head hashes of each
-# finished request in its "done" info (worker.py finish: "zh"), so the view works with REQUEST_TRACE off and survives an engine restart.
+# -- the live zero-hit view (docs/request-trace.md "零命中請求"): the server process keeps it. The engine sends each request's begin
+# fields with its "start" message (worker.py begin: "zh"), the same moment and order as the trace's req events, so the view works with
+# REQUEST_TRACE off and needs nothing from the engine's finish.
 ZERO = zero_hit.Live(time.time()) if zero_hit is not None else None
 _zero_warned = False
 
 
-def zero_hit_observe(zh, prompt_tokens, cached):
-    """One finished request that began (zh: worker "zh" info). Off with ZERO_HIT_STATS=0; never raises into the reader thread."""
+def zero_hit_start(zh):
+    """One request that began (zh: the engine's "zh" info). Off with ZERO_HIT_STATS=0; never raises into the reader thread."""
     global _zero_warned
     if ZERO is None or not zero_hit.enabled(os.environ):
         return
     try:
-        ZERO.observe(zero_hit.from_head(zh, prompt_tokens, cached))
+        ZERO.observe(zero_hit.from_head(zh))
     except Exception as e:  # noqa: BLE001 - (the view must never stop the engine's messages from being read)
         if not _zero_warned:
             _zero_warned = True
@@ -811,7 +810,9 @@ def zero_hits_json(raw_path, env=None):
     env = os.environ if env is None else env
     if not trace_http.http_enabled(env):
         raise trace_http.TraceError(404, "the request trace over HTTP is off (REQUEST_TRACE_HTTP=0)", "not_found")
-    if ZERO is None or not zero_hit.enabled(env):
+    if ZERO is None:
+        raise trace_http.TraceError(404, "the zero-hit view is not in this build (tools/zero_hit.py is missing)", "not_found")
+    if not zero_hit.enabled(env):
         raise trace_http.TraceError(404, "the zero-hit view is off (ZERO_HIT_STATS=0)", "not_found")
     since = trace_http._int(trace_http._query(raw_path.partition("?")[2]), "since")
     return ZERO.snapshot(since, now=time.time())

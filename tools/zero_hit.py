@@ -137,10 +137,10 @@ class Classifier:
                     del self.h15[f]
 
 
-def from_head(zh, prompt_tokens, cached):
-    """The record of a finished request from the server's "zh" info (frontend/worker.py finish): the agent, the start time (begin),
-    its first and PREFIX_BLOCKS-th block hashes, and the restore decision."""
-    return {"ts": zh["begun"], "agent": zh["agent"], "prompt_tokens": int(prompt_tokens or 0), "cached": cached,
+def from_head(zh):
+    """The record of a request from the engine's "zh" info (frontend/worker.py, sent with "start" at begin): the agent, the begin
+    time, the prompt length, the cached tokens, its first and PREFIX_BLOCKS-th block hashes, and the restore decision."""
+    return {"ts": zh["begun"], "agent": zh["agent"], "prompt_tokens": int(zh.get("prompt_tokens") or 0), "cached": zh.get("cached"),
             "h0": zh.get("h0"), "h15": zh.get("h15"), "restore": zh.get("restore"), "restore_tier": zh.get("restore_tier")}
 
 

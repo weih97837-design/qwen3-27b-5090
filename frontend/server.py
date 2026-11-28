@@ -398,6 +398,8 @@ class EngineClient:
                         HUB.engine_state_set("stopped", msg[1])
                 else:
                     rid = msg[1]
+                    if kind == "start" and msg[2].get("zh") is not None:  # (the live zero-hit view: at begin, in the trace's order)
+                        stats.zero_hit_start(msg[2]["zh"])
                     if kind == "done":
                         self.update_metrics(msg[3].pop("metrics", {}))
                         HUB.finished(rid, msg[2], msg[3])

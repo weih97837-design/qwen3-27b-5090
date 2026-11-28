@@ -1466,7 +1466,7 @@ class Scheduler:
         s.started, s.fed = True, cached
         if s.cached is None:
             s.cached, s.begun = cached, time.time()
-            s.head = request_trace.head_hashes(s.ids_bytes())  # (the live zero-hit view: finish() sends the first 16 block hashes)
+            s.head = request_trace.head_hashes(s.ids_bytes())  # (the live zero-hit view: the start message carries the first 16)
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.agent_count(s, len(s.prompt), cached)
@@ -1500,7 +1500,10 @@ class Scheduler:
                     self.note_restore(restored_from, "sync_restored")
             if self.trace is not None:
                 self.trace.request(s, restored_from)
-            self.send("start", s.rid, {"cached": cached})
+            self.send("start", s.rid, {"cached": cached, "zh": {  # (the live zero-hit view, stats.py: at begin, as the trace's req)
+                "agent": s.agent_id or s.agent, "begun": s.begun, "prompt_tokens": len(s.prompt), "cached": cached,
+                "h0": s.head[0] if s.head else None, "h15": s.head[15] if s.head and len(s.head) >= 16 else None,
+                "restore": s.restore_outcome, "restore_tier": s.restore_tier}})
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
@@ -1818,10 +1821,6 @@ class Scheduler:
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
                 "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
                 "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id, "client": s.client}
-        if s.begun is not None:  # ("zh": the live zero-hit view, stats.py; a request that never began is not a request of the trace)
-            h = s.head or []
-            info["zh"] = {"agent": s.agent_id or s.agent, "begun": s.begun, "h0": h[0] if h else None,
-                          "h15": h[15] if len(h) >= 16 else None, "restore": s.restore_outcome, "restore_tier": s.restore_tier}
         self.client_count(s, "finish", reason=reason, out=len(s.out))
         if self.trace is not None:
             self.trace.done(s, reason)
