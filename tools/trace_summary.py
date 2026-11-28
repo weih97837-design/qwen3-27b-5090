@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import trace_io  # noqa: E402  (a file path or an http(s):// URL such as http://HOST:8080/admin/trace/all)
+import zero_hit  # noqa: E402  (the zero-hit classification, shared with the server's live view)
 
 BIG = 16384  # "long prompt" for the zero-hit share
 BUCKETS = (0, 1024, 4096, 16384, 32768, 65536, 131072)
@@ -96,6 +97,7 @@ def summarize(reqs, dones=(), snaps=()):
     if rd:
         out["restore_decisions"] = dict(sorted(rd.items(), key=lambda kv: (-kv[1], kv[0])))
     out["anchors"] = anchor_stats(reqs)
+    out["zero_hit"] = zero_hit.summarize(zero_hit.from_req(r) for r in reqs)  # (reqs are in time order: load() sorts them)
     return out
 
 
@@ -215,6 +217,55 @@ def render(s):
     if s.get("restore_decisions"):
         L.append("restore decisions (tier outcome: requests): " + "  ".join(f"{k}: {v}" for k, v in s["restore_decisions"].items()))
     L.append(render_anchors(s.get("anchors")))
+    if s.get("zero_hit"):
+        L.append(render_zero_hit(s["zero_hit"]))
+    return "\n".join(L)
+
+
+REASON_ZH = {  # one line per reason (zh-TW), the same text as the status page's card
+    "first_seen": "全新：agent 在窗口內首次出現，且第一個區塊的雜湊從未出現",
+    "agent_returned_after_gap": "回頭的 agent：距上次請求超過 600 秒（每日或隔夜才回來的 agent）",
+    "diverged_early": "開頭就變了：600 秒內的上一個請求與它的前綴不足 4096 token（system prompt 或工具定義變了）",
+    "evicted_or_missed": "快取失效：與先前請求共享 >= 4096 token 的前綴，卻沒有命中（待查：被淘汰或沒有寫入）",
+    "other": "其他：與先前請求的共同前綴不足 4096 token，且不屬於上述情況",
+    "window_start": "窗口起點：窗口開始後 300 秒內的全新 agent，歷史未知，不計入 first_seen",
+}
+
+
+def render_zero_hit(z):
+    L = ["零命中分析（prompt >= 4096 token 且 cached = 0；分類見 tools/zero_hit.py）"]
+    if not z["zero_hit"]:
+        L.append(f"  請求 {z['requests']}，沒有零命中請求")
+        return "\n".join(L)
+    pc = lambda x: "-" if x is None else f"{100 * x:.1f}%"  # noqa: E731
+    L.append(f"  請求 {z['requests']}，長 prompt（>= {z['threshold_tokens']}）{z['long']}，其中零命中 {z['zero_hit']}（{pc(z['zero_hit_share'])}）；"
+             f">= {z['big_tokens']} 的長 prompt {z['big']}，其中零命中 {z['zero_hit_big']}（{pc(z['zero_hit_big_share'])}）")
+    L.append(f"  窗口起點 ts {z['window_start']:.0f}；比對最近 {z['cap']} 個請求的雜湊（更早的請求不再比對）")
+    L.append("  原因                       數量   占比    prompt token 合計   prompt 中位數   前 5 agent（數量）")
+    R = z["reasons"]
+    for r in zero_hit.REASONS:
+        b = R[r]
+        if not b["count"]:
+            continue
+        agents = ", ".join(f"{a} {c}" for a, c in b["agents"])
+        L.append(f"  {r:<26} {b['count']:>6} {pc(b['share']):>6} {b['tokens']:>18} {b['median_prompt']:>15.0f}   {agents}")
+    for r in zero_hit.REASONS:
+        if R[r]["count"]:
+            L.append(f"  {r}: {REASON_ZH[r]}")
+    e = R["evicted_or_missed"]
+    if e["count"]:
+        L.append(f"  evicted_or_missed: 共享前綴的前一請求超過 600 秒前 {e['over_gap']} 筆（共 {e['count']} 筆）；還原結果（tier outcome: 數量）：")
+        L.append("    " + "  ".join(f"{k}: {v}" for k, v in e["restore"].items()))
+    for r in ("evicted_or_missed", "agent_returned_after_gap"):
+        ex = z["examples"][r]
+        if not ex:
+            continue
+        L.append(f"  {r} 範例（最多 {zero_hit.EXAMPLES} 筆；無 prompt 文字）：")
+        L.append("    agent                          prompt tokens   " + ("前綴前一請求相隔 s" if r == "evicted_or_missed" else "與前次請求相隔 s")
+                 + "   還原結果")
+        for x in ex:
+            gap = "-" if x["gap_s"] is None else f"{x['gap_s']:.1f}"
+            L.append(f"    {x['agent']:<30} {x['prompt_tokens']:>13}   {gap:>20}   {x['restore_tier'] or 'none'} {x['restore'] or 'none'}")
     return "\n".join(L)
 
 

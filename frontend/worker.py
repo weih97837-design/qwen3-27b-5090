@@ -245,6 +245,7 @@ class Seq:
         self.restore_pos = 0     # tokens of its prompt that entry covers (their pages are counted in its need, not as room)
         self.trace_src = None    # where its async restore loaded from ("ram" / "ssd"; the request trace)
         self.restore_outcome = None  # the last restore decision for it (RESTORE_OUTCOMES / RESTORE_NONE_OUTCOMES; the trace's req.restore)
+        self.head = None             # the chained hashes of its first 16 blocks (begin; request_trace.head_hashes; the zero-hit view)
         self.restore_tier = None     # the tier of the entry that decision was about ("ram" / "ssd"; None: no entry)
         self.no_sync = False     # recompute chosen over loading: prefix_begin must not promote a spilled match itself
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
@@ -1465,6 +1466,7 @@ class Scheduler:
         s.started, s.fed = True, cached
         if s.cached is None:
             s.cached, s.begun = cached, time.time()
+            s.head = request_trace.head_hashes(s.ids_bytes())  # (the live zero-hit view: finish() sends the first 16 block hashes)
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.agent_count(s, len(s.prompt), cached)
@@ -1816,6 +1818,10 @@ class Scheduler:
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
                 "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted,
                 "diverged_at": s.diverged_at, "agent": s.agent, "agent_id": s.agent_id, "client": s.client}
+        if s.begun is not None:  # ("zh": the live zero-hit view, stats.py; a request that never began is not a request of the trace)
+            h = s.head or []
+            info["zh"] = {"agent": s.agent_id or s.agent, "begun": s.begun, "h0": h[0] if h else None,
+                          "h15": h[15] if len(h) >= 16 else None, "restore": s.restore_outcome, "restore_tier": s.restore_tier}
         self.client_count(s, "finish", reason=reason, out=len(s.out))
         if self.trace is not None:
             self.trace.done(s, reason)

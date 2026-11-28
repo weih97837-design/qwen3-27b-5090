@@ -4,7 +4,7 @@ SGLang environments (same port, model name, parsers and request options).
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
 /admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
-with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /admin/trace[/<file>|/all] (the request trace files); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /admin/trace[/<file>|/all] (the request trace files); GET /admin/zero_hits (the live zero-hit view, docs/request-trace.md); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
 /ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py); GET /chat (a simple chat page on
 /v1/chat/completions). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
@@ -46,6 +46,7 @@ import structured  # noqa: E402
 import trace_http  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
+import stats  # noqa: E402
 from stats import HUB, media_of, request_meta  # noqa: E402
 from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
@@ -1116,7 +1117,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
-            body = "".join(f"{k} {v}\n" for k, v in sorted(list(self.srv.engine.metrics.items()))).encode()
+            series = {**self.srv.engine.metrics, **stats.zero_hit_metrics()}  # (+ the live zero-hit view: stats.py)
+            body = "".join(f"{k} {v}\n" for k, v in sorted(series.items())).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -1138,6 +1140,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self.srv.engine.config)
         elif path == "/admin/engine":
             self._json(200, self.engine_settings())
+        elif path == "/admin/zero_hits":  # (the live zero-hit view: stats.zero_hits_json, docs/request-trace.md)
+            try:
+                self._json(200, stats.zero_hits_json(self.path))
+            except trace_http.TraceError as e:
+                self._error(e.code, str(e), e.kind)
         elif path == "/admin/trace" or path.startswith("/admin/trace/"):
             try:  # (the request trace files over HTTP: trace_http.py, docs/request-trace.md)
                 trace_http.serve(self, self.path)
