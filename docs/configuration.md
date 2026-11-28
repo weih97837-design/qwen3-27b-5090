@@ -526,13 +526,14 @@ since the engine started).
 
 ## Request trace
 
-Off by default. `REQUEST_TRACE=<directory or file name prefix>` (or `--request-trace`) records one JSON line per request start, request end
+On by default, in the default folder: Windows `%LOCALAPPDATA%\qwen3-27b-5090\trace`, the Docker image `/cache/kv/trace` (the `kvcache` volume), elsewhere `$SPILL_DIR/trace` (when `SPILL_DIR` is set) or `~/.local/state/qwen3-27b-5090/trace`. `REQUEST_TRACE=0` (or `off`, `false`, `no`, `none`, or an empty value) turns it off; `REQUEST_TRACE=<directory or file name prefix>` (or `--request-trace`) writes elsewhere. It records one JSON line per request start, request end
 and every 10 s while busy, with counts and hashes only (no prompt or output text, no token ids), for a trace-driven simulator of the cache's
-eviction policies. `REQUEST_TRACE_HASH_AGENTS=1` replaces agent ids by a short hash; `REQUEST_TRACE_MAX_MIB` (default 512) caps the total
-size of the files (64 MiB each, the oldest are deleted). About 8 KB per request with 50-125K token prompts. Fields, privacy and
+eviction policies. `REQUEST_TRACE_HASH_AGENTS=1` replaces agent ids by a short hash; the files are capped at 512 MiB in all (`REQUEST_TRACE_MAX_MIB`;
+64 MiB per file; the oldest are deleted). About 8 KB per request with 50-125K token prompts. Fields, privacy and
 `tools/trace_summary.py`: [request-trace.md](request-trace.md) (Traditional Chinese).
 `REQUEST_TRACE_HTTP=0` turns off reading the files through the server's port (`GET /admin/trace`, `/admin/trace/<file>`, `/admin/trace/all`; on by default
-when `REQUEST_TRACE` is set, no authentication: anyone who can reach the port can download them, see request-trace.md).
+whenever the trace is on, no authentication: anyone who can reach the port can download them; the files are on the machine's disk, see request-trace.md).
+The files contain only numbers and hashes, no prompt or output text.
 
 ## Chat page
 

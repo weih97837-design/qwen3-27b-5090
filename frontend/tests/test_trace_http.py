@@ -123,14 +123,14 @@ def test_prefix_form(tmp_path, base, monkeypatch):
 
 
 def test_recorder_off(monkeypatch, base):
-    monkeypatch.delenv("REQUEST_TRACE", raising=False)
-    code, _, data = get(base, "/admin/trace")
-    assert code == 200 and json.loads(data) == {"enabled": False}
+    # (on by default: unset is the default folder, so "off" is an explicit off value)
+    for value in ("0", "off", "FALSE", "no", "none", ""):
+        monkeypatch.setenv("REQUEST_TRACE", value)
+        code, _, data = get(base, "/admin/trace")
+        assert code == 200 and json.loads(data) == {"enabled": False}, value
     for p in ("/admin/trace/all", "/admin/trace/trace-20260101-000000.jsonl"):
         code, _, data = get(base, p)
         assert code == 404 and "request trace is off" in json.loads(data)["error"]["message"]
-    monkeypatch.setenv("REQUEST_TRACE", "0")
-    assert json.loads(get(base, "/admin/trace")[2]) == {"enabled": False}
 
 
 def test_http_switch_off(three, base, monkeypatch):
@@ -397,7 +397,7 @@ def test_tools_say_why_a_url_fails(tdir, base, monkeypatch):
         with pytest.raises(SystemExit) as e:
             main([base + "/admin/trace/all"])
         assert who in str(e.value) and "404" in str(e.value) and "REQUEST_TRACE_HTTP=0" in str(e.value)
-        monkeypatch.delenv("REQUEST_TRACE")
+        monkeypatch.setenv("REQUEST_TRACE", "0")  # (unset would be the default folder: on)
         monkeypatch.delenv("REQUEST_TRACE_HTTP")
         with pytest.raises(SystemExit) as e:
             main([base + "/admin/trace/all"])
@@ -488,7 +488,7 @@ def test_fetch_since_and_errors(three, base, tmp_path, monkeypatch):
         trace_fetch.main([base, "--out", str(out)])
     assert "404" in str(e.value)
     monkeypatch.delenv("REQUEST_TRACE_HTTP")
-    monkeypatch.delenv("REQUEST_TRACE")
+    monkeypatch.setenv("REQUEST_TRACE", "0")  # (unset would be the default folder: on)
     with pytest.raises(SystemExit) as e:
         trace_fetch.main([base, "--out", str(out)])
     assert "off" in str(e.value)

@@ -89,6 +89,7 @@ Get-Content .\qwen3-27b-5090-<版本>-windows-x64.zip.sha256
 | 權重（預設 `WEIGHTS=gdnfp4`） | `huggingface\hub\models--juzbox--Qwen3.8-27B-NVFP4-GDN\` |
 | 草稿模型（DFlash2，`SPEC` 不是 `none` 時） | `huggingface\hub\models--incoai--Qwen3.8-27B-DFlash2\` |
 | 分層快取的 SSD 層（預設開啟；`SPILL_SSD_GIB=0` 時不使用） | `%LOCALAPPDATA%\qwen3-27b-5090\kvcache` |
+| 請求軌跡（預設開啟，上限 512 MiB；`REQUEST_TRACE=0` 時不寫，見 `docs/request-trace.md`） | `%LOCALAPPDATA%\qwen3-27b-5090\trace` |
 | 托盤程式的記錄 | `logs\server.log`（舊的為 `server.1.log`） |
 | 設定 | `settings.ini`（資料夾內，需要時才建立） |
 

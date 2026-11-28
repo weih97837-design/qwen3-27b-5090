@@ -408,7 +408,7 @@ class Scheduler:
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
         self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
         self.last_active = time.monotonic()  # the idle backup (touch, backup_due)
-        try:  # (REQUEST_TRACE: docs/request-trace.md; off by default)
+        try:  # (REQUEST_TRACE: docs/request-trace.md; on by default, request_trace.resolve_target)
             pool = int(self.engine.cache_stats().get("pool_pages") or 0)
             self.trace = request_trace.from_env(os.environ, {"PREFILL_CHUNK": cfg["prefill_chunk"], "MAX_SEQS": cfg["max_seqs"],
                                                              "kv_pool_pages": pool, "kv_pool_tokens": pool * PAGE}, log)

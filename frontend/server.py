@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / "frontend"))
 sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
+import request_trace  # noqa: E402
 import structured  # noqa: E402
 import trace_http  # noqa: E402
 import worker  # noqa: E402
@@ -1791,6 +1792,16 @@ class ResponsesOut:
 START_TIME = time.time()
 
 
+def export_request_trace(option=None, env=os.environ):
+    """The request trace's target, resolved once and exported as REQUEST_TRACE: the engine process (spawned below, it copies this
+    environment) and trace_http read the same value. option: --request-trace when given (0 or an off value: off), else the
+    environment's, unset: the default folder (request_trace.resolve_target). Off is exported as "0", never unset (unset means on).
+    Returns the target, None when off."""
+    target = request_trace.resolve_target({"REQUEST_TRACE": option} if option is not None else env)
+    env["REQUEST_TRACE"] = "0" if target is None else target
+    return target
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
@@ -1820,12 +1831,12 @@ def main():
     ap.add_argument("--idle-unload", type=float, default=float(env("ENGINE_IDLE_UNLOAD_S", 0)),
                     help="stop the engine after this many seconds without a request, freeing its VRAM; the next "
                          "request loads it again (0: off, the engine stays ready)")
-    ap.add_argument("--request-trace", default=env("REQUEST_TRACE", ""),
+    ap.add_argument("--request-trace", default=None,
                     help="record a trace of every request (counts and block hashes only, no text) to this directory or file "
-                         "name prefix, for cache simulation (docs/request-trace.md); off by default")
+                         "name prefix, for cache simulation (docs/request-trace.md); on by default in the default folder; "
+                         "0 turns it off")
     args = ap.parse_args()
-    if args.request_trace:
-        os.environ["REQUEST_TRACE"] = args.request_trace  # (the engine process reads it)
+    export_request_trace(args.request_trace)  # (before set_engine_env: its SPILL_DIR default is not the trace's)
 
     from tokenizer import Tokenizer, fingerprint
 

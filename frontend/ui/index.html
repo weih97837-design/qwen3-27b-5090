@@ -837,7 +837,7 @@ const fmtUptime = (s) => {
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
   return d ? `${d} 天 ${h} 小時` : h ? `${h} 小時 ${m} 分鐘` : `${m} 分鐘 ${Math.floor(s % 60)} 秒`;
 };
-// Request trace files (GET /admin/trace; hidden unless REQUEST_TRACE is set and REQUEST_TRACE_HTTP is not 0)
+// Request trace files (GET /admin/trace; hidden unless the trace is on (REQUEST_TRACE not 0) and REQUEST_TRACE_HTTP is not 0)
 let traceInfo = null;
 async function loadTrace() {
   try { const r = await fetch("/admin/trace", { cache: "no-store" }); const j = r.ok ? await r.json() : null; traceInfo = j && j.enabled ? j : null; }

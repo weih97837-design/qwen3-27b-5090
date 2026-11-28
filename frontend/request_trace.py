@@ -1,6 +1,7 @@
 """Request trace recorder (docs/request-trace.md): data for a trace-driven simulator of cache eviction policies.
 
-Off unless REQUEST_TRACE is set (a directory or a file name prefix; `--request-trace` in server.py sets it). It appends one JSON
+On by default (resolve_target): REQUEST_TRACE unset is the default folder, 0/off/false/no/none or an empty value turns it off, any
+other value is a directory or a file name prefix (`--request-trace` in server.py sets it). It appends one JSON
 line per event from the scheduler loop (worker.py): "hdr" at the start of each file, "req" when a request begins, "done" when it
 ends, "snap" every SNAP_S while busy. It writes counts and hashes only: no prompt or output text, no token ids. A prompt is
 described by chained hashes of its 256-token blocks (block_chain), so two prompts with the same prefix have the same first hashes.
@@ -241,10 +242,40 @@ class Recorder:
             self.disable(e)
 
 
+TRACE_OFF = ("0", "off", "false", "no", "none")  # REQUEST_TRACE values that turn the trace off (any case); an empty value too
+
+
+def default_trace_target(platform=os.name, env=os.environ):
+    """The target when REQUEST_TRACE is unset: a file name prefix in a folder of the machine (created by the Recorder, lazily).
+    Windows (the tray app): %LOCALAPPDATA%\\qwen3-27b-5090\\trace\\q27, beside the kvcache folder (launch.spill_dir_default).
+    Elsewhere: <SPILL_DIR>/trace/q27 when SPILL_DIR is set and not empty (the compose volume), else
+    $XDG_STATE_HOME/qwen3-27b-5090/trace/q27 (default ~/.local/state)."""
+    if platform == "nt":
+        return os.path.join(env.get("LOCALAPPDATA") or os.path.expanduser("~"), "qwen3-27b-5090", "trace", "q27")
+    spill = (env.get("SPILL_DIR") or "").strip()
+    if spill:
+        return os.path.join(spill, "trace", "q27")
+    state = (env.get("XDG_STATE_HOME") or "").strip() or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state, "qwen3-27b-5090", "trace", "q27")
+
+
+def resolve_target(env=os.environ):
+    """The trace target every process uses (the engine's Recorder here, trace_http in the server, the server's export to the engine):
+    None when off, else a directory or a file name prefix. REQUEST_TRACE unset: default_trace_target(). Set: its value, stripped,
+    unless it is empty or an off value (TRACE_OFF, any case)."""
+    value = env.get("REQUEST_TRACE")
+    if value is None:
+        return default_trace_target(os.name, env)
+    value = value.strip()
+    if not value or value.lower() in TRACE_OFF:
+        return None
+    return value
+
+
 def from_env(env, header_settings, log=print):
-    """A Recorder when REQUEST_TRACE is set, else None. header_settings: extra settings for the header line."""
-    target = (env.get("REQUEST_TRACE") or "").strip()
-    if not target or target == "0":
+    """A Recorder when the trace is on (resolve_target), else None. header_settings: extra settings for the header line."""
+    target = resolve_target(env)
+    if target is None:
         return None
     try:
         settings = {k: v for k, v in sorted(env.items()) if k.startswith(("SPILL_", "CACHE_")) and v is not None}

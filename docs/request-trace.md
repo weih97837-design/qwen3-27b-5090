@@ -1,20 +1,31 @@
 # 請求軌跡（Request trace）
 
-給「依軌跡重播的快取淘汰模擬器」用的資料：記下每個請求的**大小、命中、時間與前綴雜湊**，之後可在 CPU 上離線比較不同淘汰策略。**預設關閉**，不設定時不寫檔，也沒有額外開銷。
+給「依軌跡重播的快取淘汰模擬器」用的資料：記下每個請求的**大小、命中、時間與前綴雜湊**，之後可在 CPU 上離線比較不同淘汰策略。**預設開啟**：不設定 `REQUEST_TRACE` 就寫到下面的預設資料夾；`REQUEST_TRACE=0` 關閉（關閉時不寫檔，也沒有額外開銷）。檔案只含數字與雜湊，**不含提示詞或輸出文字**。
 
-## 開啟
+## 開啟與關閉
 
 ```
-REQUEST_TRACE=D:\q27-trace            # 目錄（檔名 trace-…jsonl），或檔名前綴 D:\q27-trace\load1
-python frontend/server.py --request-trace D:\q27-trace   # 同義
+REQUEST_TRACE=0                       # 關閉（也可用 off、false、no、none，不分大小寫；空字串也是關閉）
+REQUEST_TRACE=D:\q27-trace            # 改位置：目錄（檔名 trace-…jsonl），或檔名前綴 D:\q27-trace\load1
+python frontend/server.py --request-trace D:\q27-trace   # 同義；--request-trace 0 關閉，蓋過環境變數
 REQUEST_TRACE_HASH_AGENTS=1           # agent 欄位改為穩定的短雜湊
-REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預設 512）
+REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預設 512 MiB）
 REQUEST_TRACE_ANCHORS=0               # 關閉內容錨點（new_anchors，見下；開啟軌跡時預設開）
 REQUEST_TRACE_ANCHOR_EVERY=128        # 約每幾個 token 一個錨點（預設 128）
 REQUEST_TRACE_ANCHOR_K=32             # 每個錨點雜湊的 token 數（預設 32）
 ```
 
-檔名為 `<前綴>-YYYYMMDD-HHMMSS.jsonl`（同一秒內再開新檔會加 `_1`、`_2`）。單檔達 64 MiB 就換新檔；總大小超過上限時刪除最舊的檔。每行寫完立即 flush。寫入發生任何錯誤時，記錄器只記一行 log 並自行停用，不影響服務。
+`REQUEST_TRACE` 未設定時的預設位置（`frontend/request_trace.py` 的 `default_trace_target`）：
+
+| 環境 | 位置 | 檔名 |
+|---|---|---|
+| Windows（托盤程式） | `%LOCALAPPDATA%\qwen3-27b-5090\trace\` | `q27-YYYYMMDD-HHMMSS.jsonl` |
+| Docker（`compose.yaml`） | 具名磁碟區 `kvcache` 內的 `/cache/kv/trace/`（compose 預設 `REQUEST_TRACE=/cache/kv/trace/q27`） | 同上 |
+| 其他（Linux、macOS） | 設了非空的 `SPILL_DIR` 時 `<SPILL_DIR>/trace/`；否則 `$XDG_STATE_HOME/qwen3-27b-5090/trace/`（預設 `~/.local/state/qwen3-27b-5090/trace/`） | 同上 |
+
+伺服器啟動時把解析後的位置寫回環境變數 `REQUEST_TRACE`（關閉時寫 `0`），引擎行程繼承同一個值，狀態頁與 `/admin/trace` 讀的也是同一個位置。資料夾在記錄器開第一個檔時才建立。
+
+檔名為 `<前綴>-YYYYMMDD-HHMMSS.jsonl`（同一秒內再開新檔會加 `_1`、`_2`）。單檔達 64 MiB 就換新檔；總大小超過上限（預設 512 MiB，`REQUEST_TRACE_MAX_MIB`）時刪除最舊的檔。每行寫完立即 flush。寫入發生任何錯誤時，記錄器只記一行 log 並自行停用，不影響服務。
 
 ## 檔案格式（JSON Lines，一行一個事件）
 
@@ -107,7 +118,7 @@ python tools/cache_sim_gen.py synth.jsonl --workload mixed|continuation|divergin
 
 ## 透過連接埠讀取
 
-軌跡檔由**引擎行程**寫入，伺服器行程（`frontend/server.py`）只讀同一個目錄，所以不必登入引擎那台電腦的磁碟：區網上的另一台機器或工具可以直接用 HTTP 取。只有設了 `REQUEST_TRACE` 才有內容；`REQUEST_TRACE_HTTP=0` 關閉這三個端點。
+軌跡檔由**引擎行程**寫入，伺服器行程（`frontend/server.py`）只讀同一個目錄，所以不必登入引擎那台電腦的磁碟：區網上的另一台機器或工具可以直接用 HTTP 取。軌跡開啟（預設）時才有內容；`REQUEST_TRACE=0` 時 `/admin/trace` 回 `{"enabled": false}`。`REQUEST_TRACE_HTTP=0` 關閉這三個端點。
 
 | 端點 | 說明 |
 |---|---|
@@ -137,8 +148,9 @@ python tools/cache_sim.py trace-copy/*.jsonl --policy legacy,smart
 
 ### 存取與隱私
 
-**沒有驗證**，和狀態頁（`/ui`）一樣：任何連得到這個連接埠的人都能下載軌跡，而伺服器可以聽在 `0.0.0.0`。檔案內容是 agent id、機器名稱、長度、時間與雜湊，沒有提示詞或輸出文字（見上面「隱私」），但相同前綴會得到相同雜湊，能看出誰在什麼時候用了多大的提示詞。要限制：
+因為預設開啟，這一節在預設設定下就適用：軌跡檔寫在本機磁碟上，而且**沒有驗證**，和狀態頁（`/ui`）一樣：任何連得到這個連接埠的人都能下載軌跡，而伺服器可以聽在 `0.0.0.0`。檔案內容是 agent id、機器名稱、長度、時間與雜湊，沒有提示詞或輸出文字（見上面「隱私」），但相同前綴會得到相同雜湊，能看出誰在什麼時候用了多大的提示詞。要限制：
 
 - `REQUEST_TRACE_HTTP=0`：關閉端點（記錄照常寫檔，仍可直接讀磁碟）。
+- `REQUEST_TRACE=0`：整個關閉，不寫檔（磁碟上既有的舊檔不會被刪除）。
 - `REQUEST_TRACE_HASH_AGENTS=1`：agent id 改為短雜湊（機器名稱仍在）。
 - 防火牆／綁定位址：只開放信任的網段到這個連接埠（或讓伺服器只聽 `127.0.0.1`）。
