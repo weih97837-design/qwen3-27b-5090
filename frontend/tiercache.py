@@ -43,7 +43,7 @@ engine reports "hits" for, so an engine without the retention fields keeps the o
      (SPILL_PROBATION_GIB, 4: all unproven entries on the SSD together; the oldest unproven one goes first); one of an `auto:` agent
      (no X-Agent-Id: a new id per prompt) is dropped instead. "not_written".
 
-CACHE_POLICY=smart (frontend/cache_policy.py; docs/tiered-cache.md "CACHE_POLICY=smart"; default legacy: everything above unchanged).
+CACHE_POLICY=smart (frontend/cache_policy.py; docs/tiered-cache.md "CACHE_POLICY=smart"; default smart since the owner decision; CACHE_POLICY=legacy: everything above unchanged).
 For the SSD tier: the victim is the minimum GreedyDual priority (stamp + prefill seconds saved over the parent / GiB x (1 + hits) x
 junction x superseded factor) among the SSD leaves, young entries (written < CACHE_MIN_RESIDENT_S ago) protected; no cold-agent step, no
 per-agent step. A superseded entry is written like any other (with its reduced value), never dropped for being superseded. SSD admission
@@ -175,7 +175,7 @@ class TierPolicy:
     def __init__(self, engine, directory, *, ram_retention_s=3600, ssd_gib=300, ssd_min_free_gib=10, ttl_days=7,
                  tick_s=30, clock=time.time, disk_free=None, log=print, backup_idle_s=60, flush_on_stop_s=8,
                  backup_victims=8, ssd_min_tokens=32768, fair_agents=False, unused_ttl_s=0, cold_after_s=600,
-                 cold_first=True, ssd_warm_only=False, probation_gib=4, cache_policy=cp.LEGACY, smart_params=None):
+                 cold_first=True, ssd_warm_only=False, probation_gib=4, cache_policy=cp.DEFAULT, smart_params=None):
         self.engine = engine
         self.cache_policy = cp.policy_of(cache_policy)  # CACHE_POLICY: legacy (the rules above) or smart (cache_policy.py)
         self.smart = self.cache_policy == cp.SMART
@@ -247,7 +247,7 @@ class TierPolicy:
                                   ("SPILL_SSD_WARM_ONLY", "ssd_warm_only", False)):  # (flags: 1 / 0; unset or empty: the default)
             text = os.environ.get(env)
             opts[key] = default if text is None or not text.strip() else text.strip().lower() not in ("0", "false", "no", "off")
-        opts["cache_policy"] = cp.policy_of(os.environ.get("CACHE_POLICY"))  # (ValueError for anything but legacy / smart)
+        opts["cache_policy"] = cp.policy_of(os.environ.get("CACHE_POLICY"))  # (unset or empty: smart; ValueError for anything but legacy / smart)
         opts["smart_params"] = cp.SmartParams.from_env(os.environ)
         if opts["flush_on_stop_s"] > STOP_FLUSH_MAX_S:
             log(f"tiered cache: SPILL_FLUSH_ON_STOP_S {opts['flush_on_stop_s']:g} cut to {STOP_FLUSH_MAX_S:g} s "

@@ -55,9 +55,11 @@ checks the spill counters to show that the intended path was taken.
                       so the spilled entry stays) is reported superseded, and the eviction of that continuation subsumes it instead of
                       writing it. Every restored follow-up (B from RAM, A's from the file) must equal the uncached reference. Prompts
                       are >= 25K tokens (superseded needs more than kKeepShort = 16384).
-                      With CACHE_POLICY=smart in the driver's environment (docs/tiered-cache.md "CACHE_POLICY=smart"; the driver then
-                      also sets CACHE_MIN_RESIDENT_S=0 for k, else every entry would be "young") the legacy order checks are replaced by
-                      the smart ones: the engine reports smart (spill_stats cache_smart, spill_meta parent_pos / desc_tiers / junction),
+                      The checks are those of the policy in force (--cache-policy; the server default is smart): without the option the
+                      driver runs k twice, smart and legacy, so both stay covered; every other scenario runs with the policy given
+                      (default smart). The driver passes CACHE_POLICY to every engine worker explicitly. Under smart (docs/tiered-cache.md
+                      "CACHE_POLICY=smart"; the driver also sets CACHE_MIN_RESIDENT_S=0 for k, else every entry would be "young") the legacy
+                      order checks are replaced by the smart ones: the engine reports smart (spill_stats cache_smart, spill_meta parent_pos / desc_tiers / junction),
                       the cap's victims were leaves of the RAM tier when chosen and are counted (GdTier counters), and evicting A3's
                       continuation keeps A3's superseded entry (nothing subsumed). The restored follow-ups must equal the reference as
                       under legacy (B's and A2's restores may come from RAM or the SSD).
@@ -216,6 +218,18 @@ def require_ssd(ssd_gib, what, spill_dir=True):
 
 
 CACHE_VARS = {"STATE_HOST_CACHE", "KV_POOL_TOKENS", "CHECKPOINT_INTERVAL", "MAX_SEQS", "VRAM_BACKUP_IDLE_S"}
+# CACHE_POLICY (docs/tiered-cache.md "CACHE_POLICY=smart"): the server's default is smart; the engine's own C++ default is legacy, so the
+# driver passes it to every worker explicitly (and, like SPILL_*, clears every CACHE_* variable of its environment first).
+POLICIES = ("smart", "legacy")
+DEFAULT_POLICY = "smart"
+
+
+def policies_for(scen, policy):
+    """The policies a scenario runs with: the one asked for (--cache-policy, or CACHE_POLICY in the environment), else the server default;
+    scenario k, whose checks differ per policy, runs both when none was asked for."""
+    if policy:
+        return [policy]
+    return list(POLICIES) if scen == "k" else [DEFAULT_POLICY]
 
 
 # ---- pure helpers (no GPU, no engine import)
@@ -777,6 +791,10 @@ def scen_k(R, spill_dir):
     smart = bool(R.cache and s0.get("cache_smart") == 1)  # (CACHE_POLICY=smart: the smart checks below instead of the legacy order's)
     if R.cache:
         R.log(f"  scenario k runs with CACHE_POLICY={'smart' if smart else 'legacy'}")
+        want = (os.environ.get("CACHE_POLICY") or "").strip().lower()  # (the driver passes it explicitly: the engine must have got it)
+        if want in POLICIES:
+            R.check(f"the engine runs the CACHE_POLICY the driver passed ({want})", smart == (want == "smart"),
+                    f"engine reports {'smart' if smart else 'legacy'}")
     turn1("A1")
     turn1("B")                       # evicts A1's checkpoint: RAM {A1}
     own(K_OWNER_A)
@@ -1314,6 +1332,11 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
     # (no interval checkpoints: only the explicit ones; the engine needs a multiple of 64)
     set_env = {"KV_POOL_TOKENS": str(pool), "CHECKPOINT_INTERVAL": str(-(-2 * max_tokens // 64) * 64)}
     set_env.update(SCEN_ENV_ALL.get(scen, {}))  # (both modes)
+    policy = getattr(a, "cache_policy", None) or DEFAULT_POLICY
+    set_env["CACHE_POLICY"] = policy  # (always explicit: the engine's own default is legacy; run_worker clears the inherited CACHE_* first)
+    for k, v in os.environ.items():  # (the constants of the policy the user set themselves: passed on visibly, not inherited unseen)
+        if k.startswith("CACHE_") and k != "CACHE_POLICY" and v.strip():
+            set_env[k] = v
     if mode == "ref":
         set_env["STATE_HOST_CACHE"] = "0"
     else:
@@ -1322,7 +1345,7 @@ def worker_invocation(a, scen, mode, phase, spill_dir, out, prior=None):
         set_env.update(SCEN_ENV.get(scen, {}))
         if scen == "k" and phase == "run":
             set_env["SPILL_RAM_GIB"] = k_ram_gib(prior, a.ram_gib)
-        if scen == "k" and (os.environ.get("CACHE_POLICY") or "").strip().lower() == "smart" and not os.environ.get("CACHE_MIN_RESIDENT_S"):
+        if scen == "k" and policy == "smart" and not os.environ.get("CACHE_MIN_RESIDENT_S"):
             set_env["CACHE_MIN_RESIDENT_S"] = "0"  # (smart: the scenario's entries are seconds old; the residency guard would decide all)
     # -u and faulthandler: the output is not buffered, and a crash (e.g. a Windows access violation) dumps the stack
     cmd = [sys.executable, "-u", "-X", "faulthandler", str(pathlib.Path(__file__).resolve()), "--worker",
@@ -1358,7 +1381,7 @@ def show_invocation(title, set_env, cmd):
 def run_worker(a, scen, mode, phase, spill_dir, out, prior=None):
     set_env, cmd = worker_invocation(a, scen, mode, phase, spill_dir, out, prior)
     env = dict(os.environ)
-    for k in [k for k in env if k.startswith("SPILL_") or k in CACHE_VARS]:
+    for k in [k for k in env if k.startswith(("SPILL_", "CACHE_")) or k in CACHE_VARS]:
         del env[k]
     env.update(set_env)
     env.update(PYTHONFAULTHANDLER="1", PYTHONUNBUFFERED="1")
@@ -1402,6 +1425,9 @@ def main():
                     help="KV_POOL_TOKENS (default: one conversation + its checkpoint + 1K; with it, --prompt-len is kept)")
     ap.add_argument("--spec", choices=SPEC_CHOICES,
                     help="draft model of every engine (default: the server's: $SPEC, else dspine if downloaded, else dflash2, else none)")
+    ap.add_argument("--cache-policy", choices=POLICIES, default=None,
+                    help="CACHE_POLICY of every engine worker (default: the server's, smart; the environment's CACHE_POLICY counts as this option). "
+                         "Scenario k checks the policy in force: without this option it runs twice, smart and legacy")
     ap.add_argument("--scenarios", default="a,b,c,d,e,f,g,h,i,j,k,l", help="a,b,c,d,e,f,g,h,i,j,k,l")
     ap.add_argument("--keep-dir", help="keep the files (the SSD tier and the results) here; default: a temp dir")
     ap.add_argument("--worker-cmd", metavar="SCENARIO",
@@ -1419,6 +1445,11 @@ def main():
     if a.worker:
         return worker(a)
     a.spec = a.spec or default_spec()
+    if a.cache_policy is None and (os.environ.get("CACHE_POLICY") or "").strip():
+        a.cache_policy = "".join(os.environ["CACHE_POLICY"].split()).lower()
+        if a.cache_policy not in POLICIES:
+            ap.error(f"CACHE_POLICY={os.environ['CACHE_POLICY']!r} must be smart or legacy")
+    say(f"cache policy: {a.cache_policy or DEFAULT_POLICY + ' (the server default; scenario k also runs legacy)'}", flush=True)
     say(f"draft model: {a.spec}" + ("" if a.spec == "none" else f" ({draft_path_or_missing(a.spec)})"), flush=True)
 
     chosen = [s.strip() for s in a.scenarios.split(",") if s.strip()]
@@ -1450,29 +1481,37 @@ def main():
         say(f"worker commands of scenario {s_} ({SCENARIOS[s_][0]}), as the driver runs them; the other SPILL_* and cache")
         say("variables of your environment are unset. Windows cmd: set each NAME=VALUE first. Replace KEEP_DIR if needed.")
         a = scen_args(a, s_)
-        set_env, cmd = worker_invocation(a, s_, "ref", "full", "", base / f"ref_{s_}.json")
-        show_invocation("reference (cache off)", set_env, cmd)
-        prior = None
-        for ph in SCENARIOS[s_][1]:
-            out = base / f"tiered_{s_}_{ph}.json"
-            set_env, cmd = worker_invocation(a, s_, "tiered", ph, base / f"spill_{s_}", out, prior)
-            show_invocation(f"tiered, phase {ph}" + (f" (after {prior.name})" if prior else ""), set_env, cmd)
-            prior = out
+        for pol in policies_for(s_, a.cache_policy):
+            ap_ = argparse.Namespace(**dict(vars(a), cache_policy=pol))
+            set_env, cmd = worker_invocation(ap_, s_, "ref", "full", "", base / f"ref_{s_}.json")
+            show_invocation(f"reference (cache off), CACHE_POLICY={pol}", set_env, cmd)
+            prior = None
+            for ph in SCENARIOS[s_][1]:
+                out = base / f"tiered_{s_}_{ph}.json"
+                set_env, cmd = worker_invocation(ap_, s_, "tiered", ph, base / f"spill_{s_}", out, prior)
+                show_invocation(f"tiered, phase {ph}, CACHE_POLICY={pol}" + (f" (after {prior.name})" if prior else ""), set_env, cmd)
+                prior = out
         sys.exit(0)
     work = pathlib.Path(a.keep_dir or tempfile.mkdtemp(prefix="tiered_cache_test_")).resolve()
     work.mkdir(parents=True, exist_ok=True)
     fails = 0
-    for s in chosen:
+    plan = [(s, pol) for s in chosen for pol in policies_for(s, a.cache_policy)]
+    refs = {}  # (the reference does not depend on the policy: one per scenario)
+    for s, pol in plan:
         name, phases = SCENARIOS[s]
-        say(f"\n== {s}: {name} ==", flush=True)
-        spill_dir = work / f"spill_{s}"
+        multi = len(policies_for(s, a.cache_policy)) > 1
+        tag = f"{s}_{pol}" if multi else s  # (file names)
+        say(f"\n== {s}: {name} [CACHE_POLICY={pol}] ==", flush=True)
+        spill_dir = work / f"spill_{tag}"
         shutil.rmtree(spill_dir, ignore_errors=True)
         spill_dir.mkdir(parents=True)
-        sa = scen_args(a, s)
-        if sa is not a:
+        sa = argparse.Namespace(**dict(vars(scen_args(a, s)), cache_policy=pol))
+        if sa.prompt_len != a.prompt_len:
             say(f"prompt-len {a.prompt_len} -> {sa.prompt_len} for scenario {s} " +
                 ("(a text prefix, the video and a question)" if s == "l" else f"(a prefix of {H_PREFIX} shared tokens + tails)"))
-        ref = run_worker(sa, s, "ref", "full", "", work / f"ref_{s}.json")
+        if s not in refs:
+            refs[s] = run_worker(sa, s, "ref", "full", "", work / f"ref_{s}.json")
+        ref = refs[s]
         if "error" in ref:
             say(f"FAIL {s}: the reference run exited {fmt_rc(ref['error'])}", flush=True)
             fails += 1
@@ -1482,7 +1521,7 @@ def main():
             continue
         outs, checks, stats, prior, err, skip, ctl = {}, [], [], None, None, None, None
         for ph in phases:
-            r = run_worker(sa, s, "tiered", ph, spill_dir, work / f"tiered_{s}_{ph}.json", prior)
+            r = run_worker(sa, s, "tiered", ph, spill_dir, work / f"tiered_{tag}_{ph}.json", prior)
             if "error" in r and ph == "ctl":  # (info only: a crash of the controls does not fail the scenario)
                 say(f"  ctl: the control run exited {fmt_rc(r['error'])}; its lines are missing", flush=True)
                 shutil.rmtree(spill_dir, ignore_errors=True)
@@ -1502,12 +1541,12 @@ def main():
             outs.update(r["outs"])
             checks += r["checks"]
             stats += r["stats"]
-            prior = work / f"tiered_{s}_{ph}.json"
+            prior = work / f"tiered_{tag}_{ph}.json"
         if skip:
             say(f"SKIP {s}: {skip}", flush=True)
             continue
         if err:
-            say(f"FAIL {s}: {err}", flush=True)
+            say(f"FAIL {s} [{pol}]: {err}", flush=True)
             fails += 1
             continue
         relaxed = False
@@ -1537,7 +1576,7 @@ def main():
                   f"{sum(len(v) for v in ref['outs'].values())} tokens")
         ok = not (mism or extra or bad)
         fails += not ok
-        say(f"{'PASS' if ok else 'FAIL'} {s}: {name}", flush=True)
+        say(f"{'PASS' if ok else 'FAIL'} {s}: {name} [CACHE_POLICY={pol}]", flush=True)
     say(f"\n{'all passed' if not fails else f'{fails} scenario(s) FAILED'}; files in {work}")
     if not a.keep_dir:
         shutil.rmtree(work, ignore_errors=True)

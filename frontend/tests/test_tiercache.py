@@ -96,7 +96,7 @@ def env(tmp_path):
     d = tmp_path / "spill"
     tier = TierPolicy(eng, str(d), ram_retention_s=3600, ssd_gib=1000 * B, ssd_min_free_gib=100 * B,
                       ttl_days=7, tick_s=0, clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append,
-                      ssd_min_tokens=8192)
+                      ssd_min_tokens=8192, cache_policy="legacy")  # (the legacy rules: the default is smart, test_tiercache_smart.py)
     tier.start()  # (the worker does this first: it makes the directory)
     eng.lists = 0
     return types.SimpleNamespace(eng=eng, tier=tier, dir=d, clock=clock, free=free, logs=logs)
@@ -681,7 +681,8 @@ def denv(tmp_path):
     d = tmp_path / "spill"
     # budget 1500 bytes
     tier = TierPolicy(eng, str(d), ram_retention_s=0, ssd_gib=1500 * B, ssd_min_free_gib=100 * B, ttl_days=7, tick_s=0,
-                      clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append, ssd_min_tokens=8192)
+                      clock=clock, disk_free=lambda _d: free["bytes"], log=logs.append, ssd_min_tokens=8192,
+                      cache_policy="legacy")
     return types.SimpleNamespace(eng=eng, tier=tier, dir=d, clock=clock, free=free, logs=logs)
 
 

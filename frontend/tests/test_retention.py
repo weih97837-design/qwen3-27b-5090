@@ -63,6 +63,7 @@ def make(tmp_path, budget=1000, fair=True, retention=0, **kw):
         kw.setdefault(off, 0 if off == "unused_ttl_s" else 600 if off == "cold_after_s" else 4)
     kw.setdefault("cold_first", False)
     kw.setdefault("ssd_warm_only", False)
+    kw.setdefault("cache_policy", "legacy")  # (these tests are about the legacy rules; the default is smart: test_tiercache_smart.py)
     tier = TierPolicy(eng, str(d), ram_retention_s=retention, ssd_gib=budget * B, ssd_min_free_gib=0, ttl_days=7, tick_s=0, clock=clock,
                       disk_free=lambda _d: 10 ** 12, log=lambda _m: None, ssd_min_tokens=8192, fair_agents=fair, **kw)
     tier.start()
@@ -312,7 +313,8 @@ def test_dedup_layout_make_room_applies_the_retention_order(tmp_path):
     eng.dir = tmp_path / "spill" / "entries"
     clock = Clock()
     tier = TierPolicy(eng, str(tmp_path / "spill"), ram_retention_s=0, ssd_gib=10_000 * B, ssd_min_free_gib=0, ttl_days=7, tick_s=0,
-                      clock=clock, disk_free=lambda _d: 10 ** 12, log=lambda _m: None, fair_agents=True)
+                      clock=clock, disk_free=lambda _d: 10 ** 12, log=lambda _m: None, fair_agents=True,
+                      cache_policy="legacy")
     tier.start()
     eng.dir.mkdir(parents=True, exist_ok=True)
     big_hit = eng.add_disk(1, hits=4)

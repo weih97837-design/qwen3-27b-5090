@@ -5,6 +5,8 @@ rem The image and video API test is the other way round (the server must be runn
 rem Stop the server first (tray: Stop server, or Ctrl+C in start.cmd's window): the test loads its own engine.
 rem The server's SSD tier defaults to 300 GiB (SPILL_SSD_GIB=300); the scenarios that use it (and the bench) run with --ssd-gib 10, a 10 GiB cap for this
 rem run, and --ssd-gib 0 (SSD tier off) makes them fail instead of passing without the SSD. Your own --ssd-gib later in the arguments wins.
+rem The retention policy: the server default is CACHE_POLICY=smart, and every engine of the test gets CACHE_POLICY explicitly. Without --cache-policy the
+rem scenarios run with smart and scenario k runs twice, smart and legacy (so both stay covered); --cache-policy legacy runs everything, k included, with the old rules.
 setlocal
 set "PYTHONUTF8=1"
 cd /d "%~dp0"

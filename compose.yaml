@@ -108,7 +108,7 @@ services:
       SPILL_COLD_AFTER_S: ${SPILL_COLD_AFTER_S:-600}  # an agent with no hit in a tier whose newest entry there is this old is "cold"
       SPILL_COLD_FIRST: ${SPILL_COLD_FIRST:-1}  # cold agents' entries are evicted first (0: off)
       SPILL_SSD_WARM_ONLY: ${SPILL_SSD_WARM_ONLY:-0}  # [SSD tier on only] 1: never-hit entries of agents without any hit are not written to the SSD (auto: agents: never; agents with an id: within SPILL_PROBATION_GIB); 0 (default): write everything
-      CACHE_POLICY: ${CACHE_POLICY:-legacy}  # retention of the RAM / SSD tiers and the VRAM checkpoints: legacy (default, the SPILL_* rules) | smart (value based, docs/tiered-cache.md "CACHE_POLICY=smart"; validate with tools/cache_sim.py first)
+      CACHE_POLICY: ${CACHE_POLICY:-smart}  # retention of the RAM / SSD tiers and the VRAM checkpoints: smart (default: value based, best on the synthetic simulator traces, not yet validated on real traces or the GPU suite; docs/tiered-cache.md "CACHE_POLICY=smart"; it ignores SPILL_FAIR_AGENTS / COLD_FIRST / SSD_WARM_ONLY / PROBATION) | legacy (the SPILL_* rules, as before)
       CACHE_PREFILL_T0_US: ${CACHE_PREFILL_T0_US:-54}  # [smart] prefill microseconds per token at depth 0 (RTX 5090 default)
       CACHE_PREFILL_K_US: ${CACHE_PREFILL_K_US:-0.31}  # [smart] more microseconds per token per 1,000 tokens of depth
       CACHE_SUPERSEDED_FACTOR: ${CACHE_SUPERSEDED_FACTOR:-0.25}  # [smart] value of a checkpoint a deeper one of its chain stands in for

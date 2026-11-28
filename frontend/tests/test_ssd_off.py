@@ -264,8 +264,10 @@ def test_tiers_block_of_an_off_ssd(tmp_path):
 
 def test_deploy_info_shows_the_new_defaults():
     out = stats.deploy_info(0.0, "ready", environ={})
-    assert stats.DEPLOY_DEFAULTS == {"SPILL_SSD_GIB": "300", "SPILL_FAIR_AGENTS": "0", "SPILL_SSD_WARM_ONLY": "0", "SPILL_UNUSED_TTL_S": "0"}
-    assert [out["settings"][k] for k in stats.DEPLOY_DEFAULTS] == ["300", "0", "0", "0"]
+    assert stats.DEPLOY_DEFAULTS == {"SPILL_SSD_GIB": "300", "SPILL_FAIR_AGENTS": "0", "SPILL_SSD_WARM_ONLY": "0", "SPILL_UNUSED_TTL_S": "0",
+                                     "CACHE_POLICY": "smart"}
+    assert [out["settings"][k] for k in stats.DEPLOY_DEFAULTS] == ["300", "0", "0", "0", "smart"]
+    assert stats.deploy_info(0.0, "ready", environ={"CACHE_POLICY": "legacy"})["settings"]["CACHE_POLICY"] == "legacy"
     out = stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": "200", "SPILL_FAIR_AGENTS": "0", "SPILL_UNUSED_TTL_S": "900"})
     assert out["settings"]["SPILL_SSD_GIB"] == "200" and out["settings"]["SPILL_FAIR_AGENTS"] == "0" and out["settings"]["SPILL_UNUSED_TTL_S"] == "900"
     assert stats.deploy_info(0.0, "ready", environ={"SPILL_SSD_GIB": ""})["settings"]["SPILL_SSD_GIB"] == "300"
@@ -293,3 +295,38 @@ def test_fair_agents_is_off_when_nothing_is_set(monkeypatch):
     assert re.search(r"^\s+SPILL_FAIR_AGENTS: \$\{SPILL_FAIR_AGENTS:-0\}", compose, re.M)
     # explicitly on: the per-agent step is back
     assert launch.tier_env(dict(default_settings(), spill_fair_agents=True))["SPILL_FAIR_AGENTS"] == "1"
+
+
+def test_cache_policy_defaults_to_smart_on_every_path(monkeypatch, tmp_path):
+    """CACHE_POLICY=smart (owner decision) on every path: TierPolicy (constructor and from_env), launch settings and env, the stats page,
+    compose, settings.ini through start_package; an explicit legacy wins everywhere."""
+    import cache_policy
+    monkeypatch.delenv("CACHE_POLICY", raising=False)
+    monkeypatch.setenv("SPILL_RAM_GIB", "4")
+    monkeypatch.setenv("SPILL_DIR", "/cache/kv")
+    assert TierPolicy.from_env(FakeEngine(), log=LOG).cache_policy == "smart"
+    assert TierPolicy(FakeEngine(), "/x").cache_policy == "smart"
+    assert cache_policy.DEFAULT == "smart" and cache_policy.policy_of(None) == "smart"
+    assert launch.TIER_SETTINGS["cache_policy"][1] == "smart"
+    assert launch.env_settings()["cache_policy"] == "smart"
+    assert launch.tier_env(default_settings())["CACHE_POLICY"] == "smart"
+    assert stats.DEPLOY_DEFAULTS["CACHE_POLICY"] == "smart"
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    assert re.search(r"^\s+CACHE_POLICY: \$\{CACHE_POLICY:-smart\}", compose, re.M)
+    ini = (ROOT / "scripts/windows/settings.example.ini").read_text(encoding="utf-8")
+    assert ";CACHE_POLICY=smart" in ini
+    # explicit legacy: TierPolicy, launch (the environment, then the engine's), start_package (settings.ini beats the environment)
+    monkeypatch.setenv("CACHE_POLICY", "legacy")
+    assert TierPolicy.from_env(FakeEngine(), log=LOG).cache_policy == "legacy"
+    assert launch.tier_env(launch.env_settings())["CACHE_POLICY"] == "legacy"
+    sys.path.insert(0, str(ROOT / "scripts/windows"))
+    import start_package
+    ini_file = tmp_path / "settings.ini"
+    ini_file.write_text("[env]\nCACHE_POLICY=legacy\n", encoding="utf-8")
+    monkeypatch.setenv("CACHE_POLICY", "smart")
+    env, _ = start_package.server_env({"CACHE_POLICY": "smart"}, start_package.read_settings(ini_file), tmp_path)
+    assert env["CACHE_POLICY"] == "legacy"  # (settings.ini wins over the environment)
+    monkeypatch.setenv("CACHE_POLICY", env["CACHE_POLICY"])
+    assert launch.tier_env(launch.env_settings())["CACHE_POLICY"] == "legacy"
+    env, _ = start_package.server_env({}, {}, tmp_path)
+    assert "CACHE_POLICY" not in env  # (start_package adds none: the server's settings pass it)

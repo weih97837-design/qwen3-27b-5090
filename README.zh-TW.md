@@ -20,7 +20,7 @@
 
 | 項目 | 白話說明 |
 | --- | --- |
-| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；SSD 層預設開啟，上限 300 GiB，`SPILL_SSD_GIB=0` 關閉），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；空間不足時可依 Agent 公平淘汰（用量最大的先被清，`SPILL_FAIR_AGENTS=1`，預設關閉）；從未被重用過的先於重用過的被清。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
+| 分層快取 | KV 快取放不下 VRAM 時，依序放到 RAM、再到 SSD（VRAM → RAM → SSD；SSD 層預設開啟，上限 300 GiB，`SPILL_SSD_GIB=0` 關閉），回來時不必重算。RAM 與 SSD 層會去除重複內容；引擎閒置時先備份；保留策略預設為 `CACHE_POLICY=smart`（價值導向逐出；它在合成軌跡的模擬器上最好，尚未在真實軌跡與 GPU 測試上驗證；`CACHE_POLICY=legacy` 回到舊規則，可用 `tools/cache_sim.py` 在自己的軌跡上比較）；舊規則（legacy）下空間不足時可依 Agent 公平淘汰（用量最大的先被清，`SPILL_FAIR_AGENTS=1`，預設關閉），smart 下不作用。細節：[docs/tiered-cache.md](docs/tiered-cache.md)（繁體中文） |
 | 多機器計數 | 多台電腦共用一台伺服器時，請求可帶 `X-Client-Id`（或伺服器設定 `CLIENT_NAMES` 對照 IP），監控頁看得到誰在用。**只計數，不限制**，排隊方式不變 |
 | Agent 識別 | 請求可帶 `X-Agent-Id`，監控頁與快取淘汰以此分辨不同的代理 |
 | 影片輸入整合 | 影片設定可調（預設一支影片最多 131,072 token、2,048 張畫面）；影片結尾存檔點，同一支影片換問題時不重算影片 |
@@ -217,7 +217,7 @@ curl -s http://127.0.0.1:46320/v1/chat/completions -H 'Content-Type: application
 ## 測試
 
 Windows 程式包的真機測試在資料夾內：先停止伺服器，再執行 `test.cmd`（分層快取的精確性測試，每個情境的輸出 token 必須與關閉快取的參考完全相同）。
-`test.cmd --scenarios a,c` 只跑指定情境；`bench.cmd` 量測耗時。細節見 [docs/deploy-windows.md](docs/deploy-windows.md) 第 7 節。
+`test.cmd --scenarios a,c` 只跑指定情境；`test.cmd` 預設涵蓋 `CACHE_POLICY=smart`（情境 k 兩種策略各跑一次），`test.cmd --cache-policy legacy` 涵蓋舊規則；`bench.cmd` 量測耗時。細節見 [docs/deploy-windows.md](docs/deploy-windows.md) 第 7 節。
 
 開發者的單元測試（需要 Python 與 pytest）：`python -m pytest frontend/tests tools/tests -q`。
 
