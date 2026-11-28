@@ -145,3 +145,39 @@ def test_gd_tier_matches_the_header_semantics():
     st = gd.stats()
     assert (st["evictions_leaf"], st["evictions_non_leaf"], st["evictions_young"], st["young_skipped"]) == (1, 1, 1, 1)
     assert st["victim_priority_mean"] == pytest.approx(11.5 / 3) and st["watermark"] == 7.5
+
+
+def test_ssd_verdict_agrees_with_the_engine(cli):
+    """cache_policy.ssd_verdict (what TierPolicy pushes the engine to decide) against engine/src/ssd_gate.h SsdGate::verdict, on random
+    gates (min tokens, watermark, stamp records from a GdTier) and entries, equal-priority cases included."""
+    rng = random.Random(23)
+    queries, expect = [], []
+    for _ in range(300):
+        p = cp.SmartParams(t0_us=rng.choice([54.0, 40.0]), k_us=rng.choice([0.31, 0.0, 1.2]),
+                           superseded_factor=rng.choice([0.25, 0.0, 1.0]), junction_factor=rng.choice([2.0, 1.0, 4.0]),
+                           hit_weight=rng.choice([0.0, 1.0, 0.5]))
+        gd = cp.GdTier()
+        clock = 0
+        for _ in range(rng.choice([0, 0, 1, 5, 40])):
+            clock += rng.randint(0, 3)
+            gd.evicted(cp.Pick(0, rng.choice([0.0, rng.random() * 8, rng.random() * 3000])), clock)
+        min_tokens = rng.choice([0, 32768, 8192])
+        L = gd.L if rng.random() < 0.9 else rng.choice([0.0, -1.0])
+        ents = []
+        for _ in range(rng.randint(1, 12)):
+            depth = rng.choice([4000, 8192, 20000, 32767, 32768, 50000, 125000])
+            parent = rng.choice([0, 0, depth // 2, depth])  # (parent == depth: value 0, priority = the stamp alone)
+            ents.append((depth, float(rng.choice([0, 1 << 20, 300 << 20, 1 << 30, 3 << 30])), float(parent), rng.choice([0, 1, 4]),
+                         rng.random() < 0.2, rng.random() < 0.3, rng.randint(0, clock + 2), rng.random() < 0.8))
+        lines = [f"admit {p.t0_us!r} {p.k_us!r} {p.superseded_factor!r} {p.junction_factor!r} {p.hit_weight!r} {min_tokens} {L!r} "
+                 f"{gd.floor!r} {len(gd.clocks)} {len(ents)}"]
+        lines += [f"{c} {v!r}" for c, v in zip(gd.clocks, gd.values)]
+        for (depth, nbytes, parent, hits, junction, sup, last_use, smart) in ents:
+            lines.append(f"{depth} {nbytes!r} {parent!r} {hits} {int(junction)} {int(sup)} {last_use} {int(smart)}")
+            expect.append(cp.ssd_verdict(p, min_tokens, L, gd.stamp_at, depth, smart,
+                                         lambda: (nbytes, parent, hits, junction, sup, last_use)))
+        queries.append("\n".join(lines))
+    out = cli("\n".join(queries) + "\n")
+    assert len(out) == len(expect)
+    assert [int(line.split()[1]) for line in out] == expect
+    assert set(expect) == {cp.SSD_ADMIT, cp.SSD_SHORT, cp.SSD_BELOW_WATERMARK}

@@ -63,6 +63,7 @@ SIGNATURES = {
     "q27_spill_restore_poll": ([P, P, P, I, P], I),
     "q27_spill_release": ([P, ctypes.c_uint64, P], I),
     "q27_spill_sync_lookup": ([P, I], I),
+    "q27_spill_set_ssd_gate": ([P, I, I64, ctypes.c_double, ctypes.c_double, P, P, I], I),
     "q27_set_owner": ([P, ctypes.c_uint64], I),
     "q27_spill_meta": ([P, ctypes.c_char_p, I], I),
     "q27_spill_agents": ([P, ctypes.c_char_p, I], I),
@@ -632,7 +633,7 @@ class Engine:
         return out.value
 
     def spill_stats(self):
-        out = (ctypes.c_int64 * 41)(*([-1] * 41))  # (an older engine writes the first 20 / 28 and leaves the rest -1)
+        out = (ctypes.c_int64 * 49)(*([-1] * 49))  # (an older engine writes the first 20 / 28 / 41 and leaves the rest -1)
         self._check(lib().q27_spill_stats(self.h, out, len(out)), "q27_spill_stats")
         keys = ("entries", "in_ram", "on_disk", "ram_bytes", "spilled", "restored", "written", "dropped", "subsumed",
                 "failed", "backed_up", "pinned_bytes", "pinned_used", "pin_hits", "pin_misses",
@@ -648,7 +649,13 @@ class Engine:
                 # and watermark x1000)
                 "cache_smart", *(f"{t}_smart_{k}" for t in ("ram", "vram") for k in (
                     "evictions_leaf", "evictions_non_leaf", "evictions_young", "young_skipped", "victim_priority_mean_milli",
-                    "watermark_milli")))
+                    "watermark_milli")),
+                # the SSD gate (engine/src/ssd_gate.h, spill_set_ssd_gate): 1 when pushed and on, RAM-cap victims rejected before they were
+                # written (all / too short / below the SSD's watermark; dropped, also in "dropped"), victims it judged
+                "ssd_gate_on", "ssd_gate_rejected", "ssd_gate_rejected_short", "ssd_gate_rejected_watermark", "ssd_gate_checked",
+                # spill_restore_begin's refusals: busy (unknown / live / busy / already restoring), no room in the KV pool (spill_room),
+                # dropped because a chunk file of its manifest is missing (also in failed / restore_failed)
+                "restore_refused_busy", "restore_refused_room", "restore_dropped_missing")
         # An engine built before RAM dedup never writes the last six: absent, not a misleading 0 (callers use .get()).
         return {k: v for k, v in zip(keys, out) if v != -1}
 
@@ -690,6 +697,24 @@ class Engine:
         out = ctypes.c_int()
         self._check(lib().q27_spill_release(self.h, entry_id, ctypes.byref(out)), "q27_spill_release")
         return bool(out.value)
+
+    @property
+    def has_ssd_gate(self):
+        """The library has q27_spill_set_ssd_gate (an older one writes every RAM-cap victim to the SSD and lets the frontend judge it)."""
+        return hasattr(lib(), "q27_spill_set_ssd_gate")
+
+    def spill_set_ssd_gate(self, on, min_tokens=0, watermark=0.0, floor=0.0, clocks=(), values=()):
+        """The SSD admission the engine applies before its RAM cap writes a victim (engine/src/ssd_gate.h): on (False: off, the state of an
+        engine nobody pushed to), SPILL_SSD_MIN_TOKENS, and under CACHE_POLICY=smart the SSD tier's watermark L and stamp record
+        (cache_policy.GdTier floor / clocks / values; L <= 0: no watermark test). False with a library without the call (nothing done)."""
+        if not self.has_ssd_gate:
+            return False
+        n = min(len(clocks), len(values))
+        c = (ctypes.c_uint64 * max(n, 1))(*[int(x) for x in list(clocks)[:n]])
+        v = (ctypes.c_double * max(n, 1))(*[float(x) for x in list(values)[:n]])
+        self._check(lib().q27_spill_set_ssd_gate(self.h, int(bool(on)), int(min_tokens), float(watermark), float(floor), c, v, n),
+                    "q27_spill_set_ssd_gate")
+        return True
 
     def spill_sync_lookup(self, on):
         """False: prefix_begin does not promote a spilled match synchronously (the scheduler chose to compute it)."""

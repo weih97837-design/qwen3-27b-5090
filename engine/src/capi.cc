@@ -487,11 +487,11 @@ int q27_spill_import(void* m, const char* path, uint64_t* id) {
   return guard([&] { *id = static_cast<Model*>(m)->spill_import(path); });
 }
 
-// Writes min(n, 26) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
+// Writes min(n, Model::kSpillStats) values to out (n = the caller's array length, so a caller built for fewer values never overruns):
 // entries, in memory, on disk, memory bytes, spilled, restored, written, dropped, subsumed, failed, backed_up,
 // pinned pool bytes, pinned bytes in use, entries given pinned memory, entries that fell back to pageable memory,
 // restores in progress, async restores finished, async restores failed, their wall time (ms) and bytes, then (RAM dedup)
-// logical bytes, physical bytes, shared chunks, chunk hits, chunk misses, dedup_saved_bytes.
+// logical bytes, physical bytes, shared chunks, chunk hits, chunk misses, dedup_saved_bytes, then the later appends (model.h).
 int q27_spill_stats(void* m, int64_t* out, int n) {
   return guard([&] { static_cast<Model*>(m)->spill_stats(out, n); });
 }
@@ -520,6 +520,16 @@ int q27_spill_release(void* m, uint64_t id, int* released) {
 // on = 0: prefix_begin does not promote a spilled match synchronously (until on = 1).
 int q27_spill_sync_lookup(void* m, int on) {
   return guard([&] { static_cast<Model*>(m)->spill_set_sync_lookup(on != 0); });
+}
+
+// The SSD gate (ssd_gate.h): the frontend's SSD admission, applied before the RAM cap writes a victim. on = 0: off (also the state of an
+// engine nobody pushed to: every victim is written as before). min_tokens: SPILL_SSD_MIN_TOKENS (0: off); watermark, floor, clocks[0..n),
+// values[0..n): the SSD tier's GreedyDual L and stamp record (CACHE_POLICY=smart; L <= 0: no watermark test).
+int q27_spill_set_ssd_gate(void* m, int on, int64_t min_tokens, double watermark, double floor, const uint64_t* clocks,
+                           const double* values, int n) {
+  return guard([&] {
+    static_cast<Model*>(m)->spill_set_ssd_gate(on != 0, min_tokens, watermark, floor, clocks, values, size_t(n > 0 ? n : 0));
+  });
 }
 
 // *added: slabs of pinned host memory added to the spill pool (0: full, or off). Idle only: pinning is slow.

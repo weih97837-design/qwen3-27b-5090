@@ -187,6 +187,25 @@ class GdTier:
                 "young_skipped": self.young_skipped, "victim_priority_mean": self.prio_sum / n if n else None, "watermark": self.L}
 
 
+# engine/src/ssd_gate.h SsdVerdict: what the engine's RAM cap does with a victim before writing it to the SSD (the frontend pushes the
+# inputs: TierPolicy._push_gate).
+SSD_ADMIT, SSD_SHORT, SSD_BELOW_WATERMARK = 0, 1, 2
+
+
+def ssd_verdict(p, min_tokens, L, stamp_at, tokens, smart, inputs):
+    """ssd_gate.h SsdGate::verdict (frontend/tests/test_cache_policy.py runs both): SSD_SHORT when tokens < min_tokens (> 0); under smart
+    with L > 0 SSD_BELOW_WATERMARK when stamp_at(last_use) + smart_value <= L; else SSD_ADMIT. inputs(): (bytes, parent_depth, hits,
+    junction, superseded, last_use), asked only when the watermark test runs. The same rule as TierPolicy._short and _smart_admit."""
+    if min_tokens > 0 and tokens < min_tokens:
+        return SSD_SHORT
+    if not smart or not L > 0:
+        return SSD_ADMIT
+    nbytes, parent, hits, junction, superseded, last_use = inputs()
+    c = Cand(depth=tokens, parent_depth=parent, bytes=nbytes, hits=hits, junction=junction, superseded=superseded,
+             stamp=stamp_at(last_use))
+    return SSD_ADMIT if smart_priority(p, c) > L else SSD_BELOW_WATERMARK
+
+
 def engine_counters(sp):
     """The engine's smart counters (q27lib spill_stats: cache_smart, ram_smart_*, vram_smart_*) as {tier: GdTier.stats()-like dict}; {}
     from an engine without them."""

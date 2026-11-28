@@ -14,6 +14,7 @@
 #include "memory.h"
 #include "prefix_cache.h"
 #include "retention.h"
+#include "ssd_gate.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -218,7 +219,10 @@ class Model {
   uint64_t spill_import(const std::string& path);
   // out[28..40] (appended): CACHE_POLICY (0 legacy, 1 smart), then GdTier::stats of the RAM tier and of the VRAM checkpoints (6 each:
   // evictions of a leaf / a non-leaf / a young entry, picks that passed over a young entry, mean victim priority x1000, watermark x1000).
-  static constexpr int kSpillStats = 41;
+  // out[41..48] (appended): the SSD gate (ssd_gate.h): 1 when pushed and on, victims rejected (all), of them too short / below the
+  // watermark, victims judged; then spill_restore_begin's refusals: busy (unknown / live / busy / already restoring), no room
+  // (spill_room), dropped because a chunk file of its manifest is missing (also in failed / restore_failed).
+  static constexpr int kSpillStats = 49;
   void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
@@ -248,6 +252,9 @@ class Model {
   int spill_release(uint64_t id);
   // false: prefix_begin does not promote a spilled match synchronously (the frontend decided to compute it instead).
   void spill_set_sync_lookup(bool on) { spill_sync_lookup_ = on; }
+  // The SSD gate (ssd_gate.h SsdGate::set): the frontend's SSD admission, applied by spill_enforce_ram before it writes a victim.
+  void spill_set_ssd_gate(bool on, int64_t min_tokens, double watermark, double floor, const uint64_t* clocks, const double* values,
+                          size_t n) { ssd_gate_.set(on, min_tokens, watermark, floor, clocks, values, n); }
   // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
   // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
   // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
@@ -352,6 +359,7 @@ class Model {
   mutable uint64_t sup_key_ = ~uint64_t(0);
   uint64_t owner_next_ = 0, seq_owner_ = 0;  // set_owner; the running sequence's owner
   uint32_t seq_hits_ = 0;                    // reuse count inherited from the checkpoint it resumed from (retention.h inherited_hits)
+  SsdGate ssd_gate_;                         // the frontend's SSD admission (q27_spill_set_ssd_gate; off until pushed)
   GdTier gd_ram_, gd_vram_;                  // CACHE_POLICY=smart: the watermarks / stamps / counters of the RAM tier and the pool
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)

@@ -944,6 +944,7 @@ int Model::spill_restore_begin(uint64_t id) {
   if (it == spill_.end() || it->second.live || it->second.busy || restoring_.count(id)) {
     log("tiered cache: restore of entry %llu refused: %s", (unsigned long long)id,
         it == spill_.end() ? "unknown entry" : it->second.live ? "live backup" : it->second.busy ? "busy" : "already restoring");
+    sstats_.restore_refused_busy++;
     return 0;
   }
   Spilled& s = it->second;
@@ -959,6 +960,7 @@ int Model::spill_restore_begin(uint64_t id) {
   if (!spill_room(npages)) {  // (nothing changed; checked again when a file read ends)
     log("tiered cache: restore of entry %llu refused: no room (freeable < needed %d pages; %d free now, the rest is held by sequences)",
         (unsigned long long)id, npages, pool_.free_pages());
+    sstats_.restore_refused_room++;
     return 0;
   }
   if (!s.in_ram() && s.path.empty()) {
@@ -970,6 +972,7 @@ int Model::spill_restore_begin(uint64_t id) {
     spill_erase(it, true);
     sstats_.failed++;
     sstats_.restore_failed++;
+    sstats_.restore_dropped_missing++;
     return 0;
   }
   // (G) every allocation that can throw comes before any state changes or thread starts.
@@ -1355,9 +1358,10 @@ void Model::spill_enforce_ram() {
     // then superseded entries, never-hit before hit ones, and the old "frees the most / least recently used".
     auto victim = spill_.end();
     bool victim_sup_durable = false;
+    ChainInfo victim_ci;  // (smart: the victim's chain, for the SSD gate's priority)
     if (opt_.cache_smart) {  // CACHE_POLICY=smart (retention.h smart_ram_victim): a superseded victim is written like any other
       victim = smart_ram_victim(spill_, ckpts_, opt_.smart, gd_ram_, ret_now_s(), use_clock_, [&](const Spilled& s) { return spill_freed(s); },
-                                [&](uint64_t id) { return spill_superseded(id); });
+                                [&](uint64_t id) { return spill_superseded(id); }, nullptr, &victim_ci);
     } else {
       std::vector<VictimCand> cand[2];  // [0] the idle backups, [1] the sole copies
       std::vector<std::map<uint64_t, Spilled>::iterator> its[2];
@@ -1393,8 +1397,14 @@ void Model::spill_enforce_ram() {
       continue;
     }
     // An entry superseded by a deeper one that is already on the SSD is not written (dropped, as the frontend's retention does); one
-    // whose deeper checkpoint is only in the pool / RAM is written: that one may not survive a restart.
-    if (!opt_.spill_dir.empty() && !victim_sup_durable) {
+    // whose deeper checkpoint is only in the pool / RAM is written: that one may not survive a restart. The SSD gate (ssd_gate.h, pushed
+    // by the frontend; off unless pushed) rejects a victim before it is written: it is dropped below, as without an SSD tier.
+    if (!opt_.spill_dir.empty() && !victim_sup_durable &&
+        ssd_gate_.admit(victim->second.pos(), opt_.cache_smart, opt_.smart, [&] {
+          const Spilled& v = victim->second;
+          return SsdGateIn{double(spill_new_disk(v)), double(victim_ci.parent_depth), v.hits, victim_ci.junction(),
+                           spill_superseded(victim->first), v.last_use};
+        })) {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::system_clock::now().time_since_epoch()).count();
       const std::string path =
@@ -1696,6 +1706,9 @@ void Model::spill_stats(int64_t* out, int n) const {
   out[26] = sstats_.restored_ram, out[27] = sstats_.restored_disk;
   out[28] = opt_.cache_smart ? 1 : 0;
   gd_ram_.stats(out + 29), gd_vram_.stats(out + 35);
+  out[41] = ssd_gate_.on() ? 1 : 0, out[42] = ssd_gate_.rejected(), out[43] = ssd_gate_.rejected_short();
+  out[44] = ssd_gate_.rejected_watermark(), out[45] = ssd_gate_.checked();
+  out[46] = sstats_.restore_refused_busy, out[47] = sstats_.restore_refused_room, out[48] = sstats_.restore_dropped_missing;
   for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 

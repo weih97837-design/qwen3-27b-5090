@@ -52,6 +52,14 @@ replaces SPILL_SSD_WARM_ONLY / the probation quota: an entry goes to the SSD onl
 engine's RAM cap wrote is checked at the first tick that sees it on the SSD (and dropped when it fails). The per-entry numbers come from
 the engine's spill_meta (parent_pos, desc_tiers, junction, appended under smart); SPILL_SSD_MIN_TOKENS and rule A still apply.
 
+SSD gate (engine/src/ssd_gate.h; docs/tiered-cache.md). The engine's RAM cap (spill_enforce_ram) writes its victims to the SSD by itself,
+between ticks. start() and every tick() push this policy's admission state to the engine (engine.spill_set_ssd_gate): SPILL_SSD_MIN_TOKENS
+and, under smart, the SSD's watermark L with its stamp record. The engine then applies the same test (too short; priority not above L)
+BEFORE writing a victim, and drops the rejected one instead (its spill_stats "ssd_gate_rejected"). Nothing is pushed without an SSD tier,
+and an engine nobody pushed to (an older frontend) writes as before. The checks here after the fact (_admit_fresh, the probation quota)
+stay as a safety net: they catch what an older engine still writes. SPILL_SSD_WARM_ONLY / the probation quota (legacy) are not pushed:
+they stay here only.
+
 Everything runs on the caller's thread: the engine is not thread-safe.
 """
 
@@ -182,6 +190,8 @@ class TierPolicy:
         self.smart_params = smart_params or cp.SmartParams()
         self.gd = cp.GdTier()                           # smart: the SSD's watermark, stamps and counters
         self.not_admitted = 0                           # smart: entries refused by the SSD admission (below the watermark)
+        self.gate = None                                # the SSD gate last pushed to the engine (_push_gate), None: never / not supported
+        self.gate_pushes = 0
         self._pick = None                               # smart: (entry id, Pick) of the last victim chosen, until its drop succeeds
         self.budget = float(ssd_gib) * GiB
         # None: no SSD tier. Also when the cap is 0 (set explicitly): "0 GiB" means off, not "a zero budget that deletes what the engine writes".
@@ -347,6 +357,28 @@ class TierPolicy:
                 self._error(f"sweep: {e}")
             self.usage = self._read_usage()
         self.listed = self.engine.spill_list()
+        self._push_gate()
+
+    def _push_gate(self):
+        """Pushes the SSD admission to the engine (engine/src/ssd_gate.h), so its RAM cap rejects before writing what this policy would
+        reject after: SPILL_SSD_MIN_TOKENS and, under smart, the SSD's watermark L and its stamp record (GdTier floor / clocks / values).
+        Nothing without an SSD tier, or with an engine without the call. Never raises (a failure leaves the last gate the engine has)."""
+        if self.directory is None:
+            return
+        fn = getattr(self.engine, "spill_set_ssd_gate", None)
+        if fn is None:
+            return
+        gd = self.gd
+        L, floor, clocks, values = (gd.L, gd.floor, list(gd.clocks), list(gd.values)) if self.smart else (0.0, 0.0, [], [])
+        try:
+            ok = fn(True, self.ssd_min_tokens, L, floor, clocks, values)
+        except Exception as e:  # noqa: BLE001 - the safety net below still judges what the engine writes
+            self._error(f"spill_set_ssd_gate: {e}")
+            return
+        if ok is False:  # (a library without the call)
+            return
+        self.gate_pushes += 1
+        self.gate = {"min_tokens": self.ssd_min_tokens, "watermark": L, "steps": len(clocks), "smart": self.smart}
 
     # ------------------------------------------------------------ periodic work
 
@@ -437,6 +469,7 @@ class TierPolicy:
             self.make_room(0)
         except RuntimeError as ex:
             self._error(f"SSD budget: {ex}")
+        self._push_gate()  # (the watermark may have moved: the engine's RAM cap judges with it until the next tick)
         if self.dedup:
             self.usage = self._read_usage()
             if self.usage and self.usage.get("pending_files"):  # chunk files whose deletion failed (a lock): the engine retries
@@ -607,6 +640,7 @@ class TierPolicy:
             result["left"] = skipped
         self.log(f"tiered cache: stop flush wrote {result['written']} of {len(ram)} RAM entries "
                  f"({result['left']} left in RAM)")
+        self._push_gate()
         return result
 
     def make_room(self, incoming, entry_id=None):
@@ -878,4 +912,5 @@ class TierPolicy:
                 "ssd_budget_bytes": int(self.budget) if self.directory is not None else 0, "ssd_min_tokens": self.ssd_min_tokens,
                 "ssd_skipped_short": self.skipped_short, "last_error": self.last_error,
                 "cache_policy": self.cache_policy, "ssd_not_admitted": self.not_admitted,
+                "ssd_gate": dict(self.gate) if self.gate else None,
                 **{f"ssd_smart_{k}": v for k, v in self.gd.stats().items()}}
