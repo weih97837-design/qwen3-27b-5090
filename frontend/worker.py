@@ -336,6 +336,9 @@ class Scheduler:
         # SSD tier off (SPILL_SSD_GIB=0 set explicitly): the engine gets SPILL_DIR="" and drops the victims of a full RAM tier instead of
         # writing files the policy would delete (docs/tiered-cache.md). Before the engine is made: it reads SPILL_DIR then.
         ssd_off_env(os.environ)
+        # CACHE_POLICY always explicit for the engine: its own C++ default is legacy, the server's is smart (launch.tier_env passes it; this
+        # covers an engine started by any other path, so the engine and TierPolicy.from_env never disagree)
+        os.environ["CACHE_POLICY"] = cache_policy.policy_of(os.environ.get("CACHE_POLICY"))
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         from tiercache import TierPolicy  # (tiered cache: SPILL_RAM_GIB; the frontend dir is on sys.path)

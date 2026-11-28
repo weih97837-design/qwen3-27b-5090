@@ -566,3 +566,19 @@ def test_cold_agent_and_probation_settings(monkeypatch):
     monkeypatch.setenv("SPILL_UNUSED_TTL_S", "1800")
     s = launch.env_settings()
     assert s["spill_ssd_warm_only"] is True and s["spill_unused_ttl_s"] == 1800
+
+
+def test_cache_policy_setting_is_smart_by_default_and_always_passed(monkeypatch):
+    """CACHE_POLICY (the owner decision: smart is the default, legacy stays available): like SPILL_FAIR_AGENTS, the engine always gets it
+    explicitly (its own C++ default is legacy), and an explicit legacy wins."""
+    assert launch.TIER_SETTINGS["cache_policy"][:3] == ("CACHE_POLICY", "smart", "choice")
+    assert launch.ENV_NAMES["cache_policy"] == "CACHE_POLICY"
+    monkeypatch.delenv("CACHE_POLICY", raising=False)
+    assert launch.env_settings()["cache_policy"] == "smart"
+    monkeypatch.setenv("CACHE_POLICY", "")
+    assert launch.env_settings()["cache_policy"] == "smart"
+    monkeypatch.setenv("CACHE_POLICY", " Legacy ")
+    assert launch.env_settings()["cache_policy"] == "legacy"
+    s = {k: (launch.spill_dir_default() if v[2] == "path" else v[1]) for k, v in launch.TIER_SETTINGS.items()}
+    assert launch.tier_env(s)["CACHE_POLICY"] == "smart"
+    assert launch.tier_env(dict(s, cache_policy="legacy"))["CACHE_POLICY"] == "legacy"

@@ -126,6 +126,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | `SPILL_PINNED_GIB` | `8` | pinned 記憶體（GiB）；`0` 關閉（v0.3.2 起預設 8） |
 | `SPILL_ASYNC_IO` | `1` | 非同步 I/O；`0` 關閉（v0.3.2 起預設開啟） |
 | `SPILL_ASYNC_PROMOTE` | `1` | 非同步還原（delay hit）；`0` 關閉（v0.3.2 起預設開啟） |
+| `CACHE_POLICY` | `smart` | 保留策略。預設 `smart`（價值導向；在合成軌跡的模擬器上最好，尚未在真實軌跡與 GPU 測試上驗證）；`legacy` 回到舊規則。明確寫在 `settings.ini` 的值永遠優先。smart 下 `SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_SSD_WARM_ONLY`、`SPILL_PROBATION_GIB` 不作用。見 `docs/tiered-cache.md` |
 | `SPILL_FAIR_AGENTS` | `0` | 預設 `0`：RAM／SSD 層滿時整層一起排序（一位使用者的工作負載上，`0` 的 RAM 重用率約 30%、`1` 約 6%，早期數字）。`1`：先從用量最大的 agent 挑逐出對象（多個租戶共用同一個引擎時用） |
 | `SPILL_COLD_FIRST` | `1` | 冷 agent（在該層沒有命中、最新 entry 超過 `SPILL_COLD_AFTER_S`）的 entry 先被逐出；`0` 關閉 |
 | `SPILL_COLD_AFTER_S` | `600` | 冷 agent 的門檻（秒） |
@@ -146,6 +147,7 @@ Windows 原生執行時的預設值（來自 `frontend/launch.py` 與 `frontend/
 | --- | --- |
 | `test.cmd` | 精確性測試：全部情境（a–l）執行 |
 | `test.cmd --scenarios a,c` | 只執行指定情境 |
+| `test.cmd --cache-policy legacy` | 用舊規則（`CACHE_POLICY=legacy`）執行。不加時預設為伺服器的預設 smart，且情境 k 會 smart 與 legacy 各跑一次；`bench.cmd` 也有 `--cache-policy`（預設 smart） |
 | `test.cmd --scenarios l` | 只執行情境 l（影片輸入：同一支影片的前綴命中、溢出到 RAM 與 SSD 後還原；需要視覺塔與 NVDEC） |
 | `python\python.exe app\scripts\vision_api_test.py --base-url http://127.0.0.1:8080` | 對**執行中**的伺服器測試圖片與影片請求（見下）。埠換成 `settings.ini` 的 `PORT`（預設 `46320`；本文件的範例伺服器用 `8080`） |
 | `bench.cmd` | 耗時：32K、128K、256K token 的 checkpoint |

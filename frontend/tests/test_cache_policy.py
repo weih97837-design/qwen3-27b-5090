@@ -30,7 +30,8 @@ def cli(tmp_path_factory):
 
 
 def test_policy_and_params_from_env():
-    assert cp.policy_of(None) == "legacy" and cp.policy_of("") == "legacy" and cp.policy_of(" Smart\n") == "smart"
+    assert cp.policy_of(None) == "smart" and cp.policy_of("") == "smart" and cp.DEFAULT == "smart"  # (the server default)
+    assert cp.policy_of(" Smart\n") == "smart" and cp.policy_of("LEGACY") == "legacy"
     with pytest.raises(ValueError, match="legacy or smart"):
         cp.policy_of("lru")
     p = cp.SmartParams.from_env({"CACHE_PREFILL_T0_US": "60", "CACHE_PREFILL_K_US": "x", "CACHE_SUPERSEDED_FACTOR": "-1",

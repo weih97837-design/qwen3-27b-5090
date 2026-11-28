@@ -63,10 +63,9 @@ TIER_SETTINGS = {
     "spill_cold_first": ("SPILL_COLD_FIRST", True, "flag"),
     "spill_ssd_warm_only": ("SPILL_SSD_WARM_ONLY", False, "flag"),
     "spill_probation_gib": ("SPILL_PROBATION_GIB", 4, "num"),
-    # the retention policy of the tiers and the VRAM checkpoints (docs/tiered-cache.md "CACHE_POLICY=smart"): legacy (the rules above) or
-    # smart (value based; read by the engine for RAM / VRAM and by TierPolicy for the SSD). Its constants (CACHE_PREFILL_T0_US, ...) are
+    # the retention policy of the tiers and the VRAM checkpoints (docs/tiered-cache.md "CACHE_POLICY=smart"): smart (the default; value based; read by the engine for RAM / VRAM and by TierPolicy for the SSD) or legacy (the rules above). Its constants (CACHE_PREFILL_T0_US, ...) are
     # plain variables, not settings here.
-    "cache_policy": ("CACHE_POLICY", "legacy", "choice"),
+    "cache_policy": ("CACHE_POLICY", "smart", "choice"),  # default smart (the best of tools/cache_sim.py on the synthetic traces); CACHE_POLICY=legacy: the rules above, as before. Always passed to the engine explicitly (its C++ default is legacy)
     "spill_dir": ("SPILL_DIR", None, "path"),                      # None: spill_dir_default(); "": no SSD tier (it also is, whatever the folder, when spill_ssd_gib is 0)
 }
 TIER_INTEGER = frozenset({"spill_ssd_min_tokens"})  # numbers that count whole things: a fraction is rounded down

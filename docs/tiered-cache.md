@@ -8,6 +8,10 @@
 > （伺服器把引擎的 `SPILL_DIR` 設成空字串，`TierPolicy` 沒有目錄）。
 > 關閉的代價：引擎重新啟動後 RAM／VRAM 快取是冷的，因為沒有東西留在磁碟上。`settings.ini`、`.env` 等明確設過的值照舊有效（設過 `SPILL_SSD_GIB=0` 的人 SSD 層仍是關的）。
 > 其他預設：`SPILL_FAIR_AGENTS=0`（不做「用量最大的 agent 先被逐出」這一步；設為 `1` 開啟）、`SPILL_SSD_WARM_ONLY=0`（不限制寫入 SSD 的 entry；`SPILL_PROBATION_GIB` 只在 `SPILL_SSD_WARM_ONLY=1` 時有作用）、`SPILL_UNUSED_TTL_S=0`（不因為沒被命中而丟棄）。
+> **保留策略預設為 `CACHE_POLICY=smart`**（價值導向逐出，見下方「CACHE_POLICY=smart」）；`CACHE_POLICY=legacy` 回到舊規則（逐位元組與先前的預設相同）。smart 沒有依 agent、冷 agent、
+> 只寫暖 agent、試用額度的步驟，所以在預設的 smart 下 `SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_COLD_AFTER_S`、`SPILL_SSD_WARM_ONLY`、`SPILL_PROBATION_GIB` 都被忽略（它們只在 `legacy` 下作用；
+> `SPILL_UNUSED_TTL_S` 與 `SPILL_SSD_MIN_TOKENS` 照舊）。smart 之所以是預設，是因為它在**合成軌跡的模擬器**上表現最好（下方的表，`CACHE_HIT_WEIGHT=0`）；它**尚未**在真實軌跡或 GPU 測試套件上驗證。
+> 請用 `tools/cache_sim.py` 在自己的軌跡上比較兩種策略；有疑慮就設 `CACHE_POLICY=legacy`。
 > 說明見 [configuration.md](configuration.md#the-ssd-tier-on-by-default-how-to-turn-it-off)。
 
 ## 概要
@@ -82,7 +86,7 @@ checkpoint 保留在 VRAM**（`engine.spill_backup_one`）。每次只複製一�
 | `SPILL_UNUSED_TTL_S` | `0` | 設為正數時：entry 從建立（進 RAM）或寫入 SSD 起，這麼多秒都沒有被命中，就由 tick 從 RAM 與 SSD 丟棄，不管空間夠不夠（一次性 agent 不該佔著快取）。有命中過的 entry 照原規則；共用的短前綴（≤ 16,384 token）、閒置備份、還原中的 entry 不受影響。`0`（預設）：關閉，不會因為沒被命中而丟棄。計入計數器 `expired`（`q27:tier_expired`） |
 | `SPILL_SSD_WARM_ONLY` | `0` | `1`：（只在 SSD 層開啟時有作用）RAM → SSD 時，從未命中、且其 agent 也沒有任何命中的 entry（「未證明」）不寫入：沒有明確 id 的 `auto:` agent 直接丟棄，有明確 id 的只能在試用額度內寫入。`0`（預設）：全部照常寫入。計入 `not_written`（`q27:tier_not_written`） |
 | `SPILL_PROBATION_GIB` | `4` | （只在 SSD 層開啟且 `SPILL_SSD_WARM_ONLY=1` 時有作用）所有「未證明」entry 在 SSD 上合計最多佔用的容量（邏輯 GiB）；滿了先丟最舊的未證明 entry。warm agent 的 entry 不計入 |
-| `CACHE_POLICY` | `legacy` | 保留策略：`legacy`（預設，本表的 `SPILL_*` 規則）或 `smart`（價值導向；`CACHE_PREFILL_T0_US`、`CACHE_PREFILL_K_US`、`CACHE_SUPERSEDED_FACTOR`、`CACHE_JUNCTION_FACTOR`、`CACHE_HIT_WEIGHT`、`CACHE_MIN_RESIDENT_S` 為其常數）。見「CACHE_POLICY=smart」 |
+| `CACHE_POLICY` | `smart` | 保留策略：`smart`（預設，價值導向；`CACHE_HIT_WEIGHT=0`；`CACHE_PREFILL_T0_US`、`CACHE_PREFILL_K_US`、`CACHE_SUPERSEDED_FACTOR`、`CACHE_JUNCTION_FACTOR`、`CACHE_HIT_WEIGHT`、`CACHE_MIN_RESIDENT_S` 為其常數；在合成軌跡的模擬器上最好，尚未在真實軌跡與 GPU 測試上驗證；smart 下 `SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_SSD_WARM_ONLY`、`SPILL_PROBATION_GIB` 不作用）或 `legacy`（舊規則，本表的 `SPILL_*` 規則）。見「CACHE_POLICY=smart」 |
 | `SPILL_DEDUP` | `1` | `0` 關閉 RAM 層的 chunk 去重（每個 entry 各存完整 KV）。見「RAM 層去重」 |
 | `SPILL_TICK_S` | `30` | 分層維護程序的執行間隔（秒） |
 | `VRAM_BACKUP_VICTIMS` | `8` | 閒置備份只複製「下一批會被逐出」的前 N 個 checkpoint（`0`：全部）。只能用環境變數設定 |
@@ -348,7 +352,7 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 
 ## 保留策略（價值導向逐出）
 
-（本節是 `CACHE_POLICY=legacy`，即預設的規則；另一個選項見下一節「CACHE_POLICY=smart」。）
+（本節是 `CACHE_POLICY=legacy`，即舊規則，現在要設 `CACHE_POLICY=legacy` 才會使用；預設是下一節的 `CACHE_POLICY=smart`，其中 `SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_SSD_WARM_ONLY`、`SPILL_PROBATION_GIB` 等本節的步驟都不作用。）
 
 實測（v0.3.1，無去重）：RAM 層 64 GiB 全滿、175 筆；SSD 200 GiB 全滿、624 筆（平均約 320 MB，一半是約 150–190 MiB 的遞迴狀態）；962 筆溢出到 RAM、只有
 45 筆被還原（< 5%）。快取留住的大多是不會再用的 entry。因此 RAM 與 SSD 兩層用**同一條**逐出規則（實作：`engine/src/retention.h`、`chunk_store.h` 的
@@ -406,9 +410,9 @@ token id，指紋字典有上限、重啟即空。）統計頁的「Agents」表
 `ram_reuse_rate` = 從 RAM 還原／溢出數、`ssd_reuse_rate` = 從 SSD 還原／寫出數（引擎計數器 `restored_ram`、`restored_disk`）；`agents` 區塊的 `ram_bytes`、`ssd_bytes`
 （及 `ram_entries`、`ssd_entries`）有值，/ui 的 Agents 表與分層快取面板顯示。
 
-## CACHE_POLICY=smart（價值導向保留，預設關閉）
+## CACHE_POLICY=smart（價值導向保留，預設）
 
-`CACHE_POLICY=legacy`（預設）時，上一節的規則完全不變（引擎與 frontend 的 legacy 程式路徑一行都沒有改動行為）。`CACHE_POLICY=smart` 改用一條以「還原能省下多少 prefill 秒數」為準的
+`CACHE_POLICY=smart` 是預設（`CACHE_HIT_WEIGHT=0`，其他常數見下表）。`CACHE_POLICY=legacy` 時，上一節的規則完全不變（引擎與 frontend 的 legacy 程式路徑一行都沒有改動行為）。伺服器的每條啟動路徑（`launch.py` 的設定 → 引擎環境變數、`worker.py`／`tiercache.from_env`、`compose.yaml`、`settings.ini` 經 `start_package.py`／托盤）都明確傳 `CACHE_POLICY`，引擎自己的 C++ 預設仍是 legacy，所以不會讀到不一致的值；`settings.ini` 或環境裡明確設的 `CACHE_POLICY=legacy` 永遠優先。smart 使用一條以「還原能省下多少 prefill 秒數」為準的
 GreedyDual 順序（綜合 SGLang 的 StateCost、Marconi 的效用與 vLLM／TRT-LLM 的「尾端先」），套用在 **RAM 層**（引擎 `spill_enforce_ram`）、**SSD 層**（`frontend/tiercache.py`）與
 **VRAM 檢查點的淘汰**（`Model::evict_checkpoint`）。在引擎啟動時讀取（與 `SPILL_FAIR_AGENTS` 一樣，`capi.cc`），frontend 的 `TierPolicy.from_env` 也讀同一個變數。
 其他值（例如 `lru`）：引擎啟動失敗、frontend 拋 `ValueError`（設定錯誤要看得到）；設定頁與 `launch.py` 只接受 `legacy`／`smart`。
@@ -467,6 +471,10 @@ t0、k 取自實機 log（RTX 5090、DFlash2、NVFP4 KV）：30K prompt（平均
 4. legacy 的 warm agent 旗標是黏著的；smart 用准入規則取代。
 5. legacy 的 VRAM 檢查點頁是純 LRU；smart 依同一個 priority，且只在「只有它持有」的頁上計價（正在執行序列的頁不會被動到：淘汰檢查點只是減引用）。
 
+**為什麼 smart 是預設，以及它還沒驗證的部分**：業主決定把模擬器上最好的組合（`CACHE_POLICY=smart`、`CACHE_HIT_WEIGHT=0`，其他常數不變）設成預設，依據只有下方**合成軌跡**的表（`smart w=0` 那一列）。
+它**沒有**在真實軌跡上驗證，也**還沒**跑過 GPU 測試套件的 smart 版（情境 k 的 smart 檢查在預設的 `test.cmd` 才第一次成為預設路徑）。模擬器的 legacy 也沒有對準實機。
+回到舊行為：`CACHE_POLICY=legacy`（`settings.ini`、環境變數、`compose.yaml`、設定頁的「保留策略」）。用 `tools/cache_sim.py` 在自己的 `REQUEST_TRACE` 軌跡上比較兩種策略再決定是否保留預設。
+
 **模擬（翻轉預設前的驗證方式）**：`tools/cache_sim.py`（說明與近似寫在檔案開頭；`docs/request-trace.md`「模擬器」）重播 `REQUEST_TRACE` 軌跡，比較
 `legacy`（含 `legacy-nofair`）、`smart`、`lru`、`sglang_statecost`、`marconi_utility`（依公式重寫，未複製 Marconi 的 CC BY-NC 程式碼）與 `ideal`：
 
@@ -480,7 +488,7 @@ python tools/cache_sim_gen.py synth.jsonl --workload diverging --churn 0.08     
 重用率、浪費的 prefill 秒數（同一個 t0／k 模型）。`--smart-admit`、`--smart-variant`（nohits、nobytes、nojunction、nosup、noleaf）只在模擬器裡，用來拆解各項的貢獻。
 注意 reusable 只看最近 64 段歷史，所以 cached 可以超過 reusable（命中更舊的內容）；**recomputed 才是總量**，missed 是相對於 reusable 的指標，兩者要一起看。
 
-**合成軌跡上的結果**（`tools/cache_sim_gen.py`；預設容量 RAM 64 GiB、SSD 200 GiB、VRAM 8,207 頁、43 槽；legacy = 今日預設 `SPILL_FAIR_AGENTS=1`、`SPILL_COLD_FIRST=1`）：
+**合成軌跡上的結果**（`tools/cache_sim_gen.py`；預設容量 RAM 64 GiB、SSD 200 GiB、VRAM 8,207 頁、43 槽；legacy = 模擬器的舊規則，`--fair-agents 1`、`--cold-first 1`；注意伺服器的 legacy 預設其實是 `SPILL_FAIR_AGENTS=0`，對應表中的 legacy-nofair）：
 
 *mixed（9,000 請求、60 agent、75% 重 agent、13% 分岔、22 小時）*
 
@@ -536,17 +544,19 @@ python tools/cache_sim_gen.py synth.jsonl --workload diverging --churn 0.08     
 
 解讀：
 
-- 有分岔與重 agent 的負載：smart 的 missed 與浪費的 prefill 秒數都低於今日預設的 legacy（5.83% → 3.23%；有 churn 時 9.16% → 1.68%）。但沒有 churn 時，smart（`CACHE_HIT_WEIGHT=1`）的 **recomputed** 反而比 legacy 多（42.5M 對 39.8M）：它多命中 reusable 之內的部分，卻失去比最近 64 段歷史更舊的命中。
+- 有分岔與重 agent 的負載：smart 的 missed 與浪費的 prefill 秒數都低於 legacy（5.83% → 3.23%；有 churn 時 9.16% → 1.68%）。但沒有 churn 時，smart（`CACHE_HIT_WEIGHT=1`）的 **recomputed** 反而比 legacy 多（42.5M 對 39.8M）：它多命中 reusable 之內的部分，卻失去比最近 64 段歷史更舊的命中。
 - `CACHE_HIT_WEIGHT=0` 在四組資料都最好或接近最好（mixed：24.6M，ideal 20.3M 以外最低）。拆解（`--smart-variant`，mixed，recomputed）：原式 42.5M、nohits 24.6M、noleaf 32.6M、nohits+noleaf 23.6M、nobytes 37.2M、nojunction 42.0M、nosup 49.0M。hits 項是最大的損失，葉優先是第二大；被取代因子與 junction 有幫助。SSD 准入拒收（19,601 筆）大多是 hits 推高水位的副作用（w=0 時 10,841 筆，且整體不比「一律寫入」差）。
-- 純延續、沒有任何淘汰時，各策略完全相同（`tools/tests/test_cache_sim.py`）。預設容量（有 VRAM 壓力）下 legacy 0.21% 優於 smart w=1 的 0.81%，w=0 為 0.03%。高壓力時今日預設的 legacy 很差（52%），`legacy-nofair` 與 smart 相近。
+- 純延續、沒有任何淘汰時，各策略完全相同（`tools/tests/test_cache_sim.py`）。預設容量（有 VRAM 壓力）下 legacy 0.21% 優於 smart w=1 的 0.81%，w=0 為 0.03%。高壓力時模擬器的 legacy（fair 開）很差（52%），`legacy-nofair` 與 smart 相近。
 - 模擬器的 legacy 只有在加了 churn（一次性／休眠 agent）後，fair 開／關的方向才與實機一致（實機：關掉後 RAM 重用率 6% → 30%）；RAM 重用率（30–40%）仍高於實機的 6%。
 
 **模擬器沒有計入的**：smart 溢出的次數約是 legacy 的 2.5–3 倍（legacy 把被取代者直接丟掉），每次溢出都要 D2H 複製並佔用一個約 190 MiB 的狀態；模擬器不計複製時間與頻寬，
 也不模擬閒置備份、RAM 保留時間的 tick、TTL、重啟、還原的頻寬與 worth-loading 判斷。合成軌跡的 legacy 也沒有對準實機（RAM 重用率 30–40%，實機 6%），所以表中 smart 與 legacy 的差距
 只能當方向參考，**要在實機的軌跡上重跑**再決定是否翻轉預設。
 
-**實機測試**：`test.cmd --scenarios k`（或 `python scripts/tiered_cache_test.py --scenarios k`）在環境裡有 `CACHE_POLICY=smart` 時跑 smart 版的情境 k
-（driver 會為 k 設 `CACHE_MIN_RESIDENT_S=0`，否則情境裡的 entry 都只有幾秒、全部算新進）；預設的 `test.cmd` 仍是 legacy。Windows：`set CACHE_POLICY=smart` 後執行 `test.cmd --scenarios k`。
+**實機測試**：`tiered_cache_test.py`（`test.cmd`）與 `tiered_cache_bench.py`（`bench.cmd`）有 `--cache-policy smart|legacy`，預設是伺服器的預設（smart），並且明確把 `CACHE_POLICY`
+傳給每個引擎行程（driver 也會清掉環境裡繼承來的 `CACHE_*`）。預設的 `test.cmd` 因此涵蓋 **smart**；情境 k（保留）檢查的是當下策略的行為，沒有指定 `--cache-policy` 時**跑兩次，smart 與 legacy 各一次**，
+所以兩套檢查都有覆蓋（smart 版 driver 會設 `CACHE_MIN_RESIDENT_S=0`，否則情境裡的 entry 都只有幾秒、全部算新進）；`test.cmd --cache-policy legacy` 則用舊規則跑全部情境。
+Windows：`test.cmd --scenarios k` 或 `test.cmd --cache-policy legacy`。環境裡的 `CACHE_POLICY` 等同於這個選項。
 
 ## WSL2 注意事項
 
@@ -604,6 +614,9 @@ docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
 docker compose --profile dev run --rm -v qwen3-27b-5090_kvcache:/cache/kv dev \
     python scripts/tiered_cache_bench.py --spill-dir /cache/kv/bench \
     --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
+
+# 保留策略：預設 smart；--cache-policy legacy 用舊規則（情境 k 沒指定時兩種都跑）
+docker compose --profile dev run --rm dev python scripts/tiered_cache_test.py --scenarios k --cache-policy legacy
 ```
 
 `tiered_cache_test.py` 有十二個情境（a–l），各自在獨立的行程中執行（環境變數在引擎建立時讀取）。SSD 情境（b、c、f、g、h、i、j、k、l）需要 SSD 層開啟：測試用 `--ssd-gib`（預設 10）明確設定 `SPILL_SSD_GIB` 與 `SPILL_DIR`；若設成 `0`，這些情境會直接失敗（不會在 SSD 關閉的情況下默默通過）。`tiered_cache_bench.py` 同樣有 `--ssd-gib`（預設 10）。下表是各情境：

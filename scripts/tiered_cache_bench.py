@@ -18,6 +18,9 @@ time.perf_counter(). Engines get the server's draft model (--spec, default as th
 and the run still works. Compare variants in one command:
 
     python scripts/tiered_cache_bench.py --compare "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8"
+    python scripts/tiered_cache_bench.py --compare "CACHE_POLICY=smart" "CACHE_POLICY=legacy"
+
+--cache-policy smart|legacy (default smart, the server's default) is passed to the engines as CACHE_POLICY explicitly.
     python scripts/tiered_cache_bench.py --compare "SPILL_PINNED_GIB=0 SPILL_ASYNC_IO=0" \\
         "SPILL_PINNED_GIB=8 SPILL_ASYNC_IO=1" "SPILL_PINNED_GIB=8 SPILL_PINNED_SLAB_MIB=256 SPILL_ASYNC_IO=1"
     (pinned entries are segmented: one entry may span several slabs; SPILL_ASYNC_IO only overlaps the CPU for pinned entries)
@@ -191,6 +194,7 @@ def run_once(args):
     # (SPILL_SSD_GIB=300; 0 turns it off), and here it is set explicitly (--ssd-gib, default 10): a bench with it off exits instead of timing nothing.
     require_ssd(args.ssd_gib, "the bench (export_ssd, import_ssd, promote_ssd)")
     os.environ["SPILL_SSD_GIB"] = f"{float(args.ssd_gib):g}"
+    os.environ["CACHE_POLICY"] = args.cache_policy  # (always explicit: the engine's own default is legacy, the server's is smart)
     docs = load_docs(1)
     own = args.spill_dir is None
     spill_dir = args.spill_dir or tempfile.mkdtemp(prefix="tiered_cache_bench_")
@@ -206,7 +210,7 @@ def run_once(args):
     finally:
         if own:
             shutil.rmtree(spill_dir, ignore_errors=True)
-    env = {k: os.environ[k] for k in sorted(os.environ) if k.startswith(("SPILL_", "STATE_", "KV_", "CHECKPOINT_", "VRAM_"))}
+    env = {k: os.environ[k] for k in sorted(os.environ) if k.startswith(("SPILL_", "STATE_", "KV_", "CHECKPOINT_", "VRAM_", "CACHE_"))}
     return {"env": env, "rows": rows, "info": info}
 
 
@@ -252,6 +256,9 @@ def main():
     ap.add_argument("--ssd-gib", type=float, default=10.0,
                     help="SPILL_SSD_GIB (default 10). The bench measures the SSD tier (the server's default cap is 300; 0 turns it off): "
                          "0 makes the bench exit with an error. A variant of --compare may set SPILL_SSD_GIB itself")
+    ap.add_argument("--cache-policy", choices=("smart", "legacy"), default="smart",
+                    help="CACHE_POLICY of the engines (default smart, the server's default; legacy: the old rules). A variant of --compare may set "
+                         "CACHE_POLICY itself")
     ap.add_argument("--json", help="also write the results here")
     ap.add_argument("--compare", nargs="+", metavar="ENV",
                     help='run once per variant, each a list of NAME=VALUE (e.g. "SPILL_PINNED_GIB=0" "SPILL_PINNED_GIB=8")')
@@ -273,7 +280,8 @@ def main():
                 cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), "--child-json", out,
                        "--sizes", ",".join(map(str, args.sizes)), "--weights", args.weights,
                        "--kv-dtype", args.kv_dtype, "--spec", args.spec,
-                       "--ssd-gib", str(parse_env(variant).get("SPILL_SSD_GIB", args.ssd_gib))]
+                       "--ssd-gib", str(parse_env(variant).get("SPILL_SSD_GIB", args.ssd_gib)),
+                       "--cache-policy", parse_env(variant).get("CACHE_POLICY", args.cache_policy).strip().lower()]
                 if args.spill_dir:
                     cmd += ["--spill-dir", args.spill_dir]
                 print(f"\n# variant {i + 1}: {variant or '(no change)'}", flush=True)
