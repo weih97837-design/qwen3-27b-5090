@@ -42,9 +42,10 @@ def http_enabled(env=None):
 
 
 def resolve(env=None):
-    """(directory, file name prefix incl. the "-") for REQUEST_TRACE (the same rules as request_trace.Recorder), or None when off."""
-    t = ((env if env is not None else os.environ).get("REQUEST_TRACE") or "").strip()
-    if not t or t == "0":
+    """(directory, file name prefix incl. the "-") of the trace target (request_trace.resolve_target, the recorder's own), or None when
+    off. Only strings: no folder is created here."""
+    t = request_trace.resolve_target(env if env is not None else os.environ)
+    if t is None:
         return None
     if os.path.isdir(t) or t.endswith(("/", "\\")):
         t = os.path.join(t, "trace")

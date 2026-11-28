@@ -104,8 +104,11 @@ def files(tmp_path):
     return sorted(pathlib.Path(tmp_path).glob("trace-*.jsonl"))
 
 
-def test_off_by_default(tmp_path):
-    assert rt.from_env({}, {}) is None and rt.from_env({"REQUEST_TRACE": ""}, {}) is None
+def test_off_values_turn_it_off(tmp_path):
+    """REQUEST_TRACE=0 / off / false / no / none (any case) or empty: no recorder and no file (unset is ON: see below)."""
+    for v in ("0", "off", "false", "no", "none", "", "  ", "OFF", "False", " No ", "None"):
+        assert rt.from_env({"REQUEST_TRACE": v}, {}) is None, repr(v)
+        assert rt.resolve_target({"REQUEST_TRACE": v}) is None, repr(v)
     s = sched(tmp_path, env=False)
     assert s.trace is None
     s.submit("r1", req(P, agent_id="m/t"))
@@ -227,6 +230,93 @@ def test_self_disables_on_a_write_error(tmp_path):
     s.begin(r)                                  # (the scheduler goes on)
     s.finish(r, "stop", save=False)
     assert len(read(files(tmp_path)[0])) == 2   # (hdr + the first snap)
+
+
+def test_unset_is_on_in_the_default_folder(tmp_path, monkeypatch):
+    """REQUEST_TRACE unset: the default folder (XDG_STATE_HOME here; the folder is created only when the recorder opens a file)."""
+    import trace_http
+    state = tmp_path / "state"
+    env = {"XDG_STATE_HOME": str(state), "LOCALAPPDATA": str(state)}
+    want = rt.default_trace_target(os.name, env)
+    assert rt.resolve_target(env) == want and rt.resolve_target({**env, "REQUEST_TRACE": ""}) is None
+    assert not (state / "qwen3-27b-5090").exists()  # (resolving creates nothing)
+    assert trace_http.resolve(env) == (os.path.dirname(want), "q27-")
+    r = rt.from_env(env, {}, lambda m: None)
+    try:
+        assert r is not None and os.path.dirname(r.path) == os.path.dirname(want)
+        assert os.path.basename(r.path).startswith("q27-") and r.path.endswith(".jsonl")
+    finally:
+        r.f.close()
+    assert os.path.basename(os.path.dirname(want)) == "trace"  # (the status page's directory_name is "trace")
+
+
+def test_default_target_by_platform():
+    nt = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "SPILL_DIR": "/x"}
+    assert rt.default_trace_target("nt", nt) == os.path.join(r"C:\Users\u\AppData\Local", "qwen3-27b-5090", "trace", "q27")
+    assert rt.default_trace_target("nt", {}) == os.path.join(os.path.expanduser("~"), "qwen3-27b-5090", "trace", "q27")
+    assert rt.default_trace_target("posix", {"SPILL_DIR": "/cache/kv"}) == os.path.join("/cache/kv", "trace", "q27")
+    assert rt.default_trace_target("posix", {"SPILL_DIR": "  "}) == rt.default_trace_target("posix", {})
+    assert rt.default_trace_target("posix", {"XDG_STATE_HOME": "/st"}) == os.path.join("/st", "qwen3-27b-5090", "trace", "q27")
+    assert rt.default_trace_target("posix", {"XDG_STATE_HOME": ""}) == os.path.join(
+        os.path.expanduser("~"), ".local", "state", "qwen3-27b-5090", "trace", "q27")
+    assert rt.default_trace_target("posix", {}) == os.path.join(
+        os.path.expanduser("~"), ".local", "state", "qwen3-27b-5090", "trace", "q27")
+
+
+def test_resolve_target_values():
+    assert rt.resolve_target({"REQUEST_TRACE": "/tmp/x/load1"}) == "/tmp/x/load1"
+    assert rt.resolve_target({"REQUEST_TRACE": " D:/q27 "}) == "D:/q27"
+    assert rt.resolve_target({"REQUEST_TRACE": "1"}) == "1"  # (any other value is a path, as before)
+    assert rt.resolve_target({"SPILL_DIR": "/cache/kv"}) == rt.default_trace_target(os.name, {"SPILL_DIR": "/cache/kv"})
+    assert rt.default_trace_target("posix", {"SPILL_DIR": "/cache/kv"}) == os.path.join("/cache/kv", "trace", "q27")
+
+
+def test_compose_default_is_the_default_folder_in_the_kvcache_volume():
+    import re
+    compose = (pathlib.Path(__file__).resolve().parents[2] / "compose.yaml").read_text()
+    m = re.search(r"^\s+REQUEST_TRACE: \$\{REQUEST_TRACE:-([^}]*)\}", compose, re.M)
+    assert m and m.group(1) == "/cache/kv/trace/q27" == rt.default_trace_target("posix", {"SPILL_DIR": "/cache/kv"})
+
+
+def test_worker_and_trace_http_both_resolve_through_resolve_target(tmp_path, monkeypatch):
+    import inspect
+    import trace_http
+    seen = []
+    real = rt.resolve_target
+
+    def spy(env=os.environ):
+        seen.append(True)
+        return real(env)
+
+    monkeypatch.setattr(rt, "resolve_target", spy)
+    trace_http.resolve({"REQUEST_TRACE": str(tmp_path)})
+    assert seen
+    seen.clear()
+    r = rt.from_env({"REQUEST_TRACE": str(tmp_path)}, {}, lambda m: None)  # (the engine's recorder: worker.py calls from_env)
+    assert seen and r is not None
+    r.f.close()
+    assert "request_trace.from_env(os.environ" in inspect.getsource(worker)
+
+
+def test_server_exports_the_resolved_target_to_the_engine(tmp_path):
+    """server.export_request_trace: the value the engine process inherits (it copies the environment) is the resolved target, once;
+    off is exported as "0"; --request-trace overrides the environment, and 0 turns it off."""
+    import server
+    env = {}
+    assert server.export_request_trace(None, env) == rt.default_trace_target(os.name, {})
+    assert env["REQUEST_TRACE"] == rt.default_trace_target(os.name, {})
+    env = {"XDG_STATE_HOME": str(tmp_path)}  # (unset in env: the default folder, exported with the rest of the environment)
+    want = rt.default_trace_target(os.name, env)
+    assert server.export_request_trace(None, env) == want and env["REQUEST_TRACE"] == want
+    env = {"REQUEST_TRACE": str(tmp_path / "a")}
+    assert server.export_request_trace(None, env) == str(tmp_path / "a") and env["REQUEST_TRACE"] == str(tmp_path / "a")
+    env = {"REQUEST_TRACE": str(tmp_path / "a")}
+    assert server.export_request_trace("0", env) is None and env["REQUEST_TRACE"] == "0"
+    env = {"REQUEST_TRACE": "0"}
+    assert server.export_request_trace(str(tmp_path / "b"), env) == str(tmp_path / "b")
+    assert env["REQUEST_TRACE"] == str(tmp_path / "b")
+    env = {}
+    assert server.export_request_trace("", env) is None and env["REQUEST_TRACE"] == "0"
 
 
 def test_unwritable_target_starts_without_trace(tmp_path):

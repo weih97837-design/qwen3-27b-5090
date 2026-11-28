@@ -102,6 +102,7 @@ services:
       SPILL_FAIR_AGENTS: ${SPILL_FAIR_AGENTS:-0}  # 0 (default): when a tier is full the victim is chosen over the whole tier (superseded, never-reused, oldest; one user measured RAM reuse ~30% instead of ~6% with 1, early numbers); 1: the agent using the most of the tier is the first victim (for many tenants sharing one engine). docs/tiered-cache.md "Retention"
       SPILL_DEDUP: ${SPILL_DEDUP:-1}  # RAM tier: spilled entries that share a prefix share its 4096-token chunks in RAM (0: every entry keeps its whole KV; docs/tiered-cache.md)
       SPILL_DIR: ${SPILL_DIR:-/cache/kv}           # where spilled checkpoints are written (the kvcache volume above); only used when SPILL_SSD_GIB > 0 (the server gives the engine an empty SPILL_DIR when you set SPILL_SSD_GIB=0)
+      REQUEST_TRACE: ${REQUEST_TRACE:-/cache/kv/trace/q27}  # request trace (docs/request-trace.md): on by default in the kvcache volume; 0 turns it off, a path changes the place
       SPILL_RAM_RETENTION_S: ${SPILL_RAM_RETENTION_S:-3600}  # [SSD tier on only] seconds a checkpoint stays in RAM before it is written to SSD (idle time)
       SPILL_SSD_GIB: ${SPILL_SSD_GIB:-300}         # SSD tier cap, GiB; the oldest files are deleted first (SPILL_SSD_MIN_FREE_GIB protects the disk). 0: no SSD tier, RAM victims are dropped, nothing is written to SPILL_DIR and nothing survives an engine restart
       SPILL_SSD_MIN_FREE_GIB: ${SPILL_SSD_MIN_FREE_GIB:-10}  # [SSD tier on only] never fill the disk below this much free space
