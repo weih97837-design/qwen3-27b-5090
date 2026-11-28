@@ -43,7 +43,10 @@ def test_from_env_reads_the_policy_and_its_constants(monkeypatch):
     for v in ("CACHE_POLICY", "CACHE_MIN_RESIDENT_S", "CACHE_HIT_WEIGHT"):
         monkeypatch.delenv(v, raising=False)
     t = TierPolicy.from_env(FakeEngine(), log=lambda _m: None)
-    assert t.cache_policy == "legacy" and not t.smart  # (the default)
+    assert t.cache_policy == "smart" and t.smart  # (the default)
+    monkeypatch.setenv("CACHE_POLICY", "legacy")
+    t = TierPolicy.from_env(FakeEngine(), log=lambda _m: None)
+    assert t.cache_policy == "legacy" and not t.smart  # (explicit legacy wins)
     monkeypatch.setenv("CACHE_POLICY", "Smart")
     monkeypatch.setenv("CACHE_MIN_RESIDENT_S", "60")
     monkeypatch.setenv("CACHE_HIT_WEIGHT", "0")

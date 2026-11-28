@@ -18,6 +18,7 @@ import os
 
 LEGACY, SMART = "legacy", "smart"
 POLICIES = (LEGACY, SMART)
+DEFAULT = SMART                  # the server default (docs/tiered-cache.md); the engine's own C++ default stays legacy, which is why every start path passes it
 GIB = float(1 << 30)
 MIN_BYTES = float(1 << 20)       # retention.h kSmartMinBytes
 TIER_VRAM, TIER_RAM, TIER_SSD = 1, 2, 4
@@ -36,12 +37,13 @@ ENV_NAMES = ("CACHE_POLICY",) + tuple(p[0] for p in PARAMS)
 
 
 def policy_of(text):
-    """CACHE_POLICY: "legacy" (unset, empty or legacy) or "smart"; ValueError for anything else (retention.h cache_policy_of: -1)."""
+    """CACHE_POLICY: DEFAULT (smart) when unset or empty, else "legacy" or "smart"; ValueError for anything else (the engine's own
+    cache_policy_of reads unset as legacy, which is why the server always passes the value explicitly)."""
     s = "".join((text or "").split()).lower()
-    if s in ("", LEGACY):
-        return LEGACY
-    if s == SMART:
-        return SMART
+    if s == "":
+        return DEFAULT
+    if s in POLICIES:
+        return s
     raise ValueError(f"CACHE_POLICY must be legacy or smart, got {text!r}")
 
 

@@ -7,7 +7,7 @@
 Replays the JSONL request traces of frontend/request_trace.py (docs/request-trace.md; tools/cache_sim_gen.py writes synthetic ones)
 and reports per policy how much of the reusable prefix the cache supplied. The policies (docs/tiered-cache.md "CACHE_POLICY=smart"):
 
-  legacy           today's rules: VRAM plain LRU for pages, covered-first then LRU for a state slot; a checkpoint a deeper one covers
+  legacy           the rules before smart became the default (CACHE_POLICY=legacy): VRAM plain LRU for pages, covered-first then LRU for a state slot; a checkpoint a deeper one covers
                    (> 16K tokens) is DROPPED when the pool evicts it (subsumed), and spilling a deeper one erases its spilled shallower
                    ones; RAM / SSD victims: cold agents first (--cold-first), the agent using the most bytes (--fair-agents), then
                    superseded, never-hit, the old rule (RAM: frees the most, LRU within 2x; SSD: mostly-shared last, oldest written).

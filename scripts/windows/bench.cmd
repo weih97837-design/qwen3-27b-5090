@@ -5,6 +5,7 @@ rem there). Arguments are added: --sizes 32768 for one size, or --compare "SPILL
 rem variants (docs/deploy-windows.md). Stop the server first.
 rem The server's SSD tier defaults to 300 GiB (SPILL_SSD_GIB=300); the scenarios that use it (and the bench) run with --ssd-gib 10, a 10 GiB cap for this
 rem run, and --ssd-gib 0 (SSD tier off) makes them fail instead of passing without the SSD. Your own --ssd-gib later in the arguments wins.
+rem The bench runs the server's default retention policy (--cache-policy smart); --cache-policy legacy runs the old rules.
 setlocal
 set "PYTHONUTF8=1"
 cd /d "%~dp0"

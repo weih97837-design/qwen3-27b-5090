@@ -1,6 +1,9 @@
 """Pure helpers of scripts/tiered_cache_test.py (scenario l's plan and chunk arithmetic); no GPU, no torch."""
 import importlib.util
 import pathlib
+import subprocess
+import sys
+import types
 
 PATH = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "tiered_cache_test.py"
 spec = importlib.util.spec_from_file_location("tiered_cache_test_under_test", PATH)
@@ -73,7 +76,6 @@ def test_the_ssd_scenarios_are_the_ones_that_use_spill_dir():
 
 
 def _args(**kw):
-    import types
     base = dict(prompt_len=3665, tokens=48, pool_tokens=0, kv_dtype="nvfp4", weights="nvidia", ram_gib=2.0, spec="none", ssd_gib=10.0)
     return types.SimpleNamespace(**dict(base, **kw))
 
@@ -108,14 +110,55 @@ def test_the_windows_scripts_turn_the_ssd_on_explicitly():
 
 
 def test_scenario_k_under_smart_turns_the_residency_guard_off(tmp_path, monkeypatch):
-    monkeypatch.setenv("CACHE_POLICY", "smart")
+    monkeypatch.delenv("CACHE_POLICY", raising=False)
     monkeypatch.delenv("CACHE_MIN_RESIDENT_S", raising=False)
-    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
-    assert env["CACHE_MIN_RESIDENT_S"] == "0" and env["SPILL_FAIR_AGENTS"] == "1"
-    monkeypatch.setenv("CACHE_MIN_RESIDENT_S", "30")  # (an explicit value is the user's)
-    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
-    assert "CACHE_MIN_RESIDENT_S" not in env
-    monkeypatch.setenv("CACHE_POLICY", "legacy")
+    env, _ = t.worker_invocation(_args(cache_policy="smart"), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert env["CACHE_MIN_RESIDENT_S"] == "0" and env["SPILL_FAIR_AGENTS"] == "1" and env["CACHE_POLICY"] == "smart"
+    monkeypatch.setenv("CACHE_MIN_RESIDENT_S", "30")  # (an explicit value is the user's: passed on visibly)
+    env, _ = t.worker_invocation(_args(cache_policy="smart"), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert env["CACHE_MIN_RESIDENT_S"] == "30"
     monkeypatch.delenv("CACHE_MIN_RESIDENT_S")
-    env, _ = t.worker_invocation(_args(), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
-    assert "CACHE_MIN_RESIDENT_S" not in env  # (the default run: legacy, unchanged)
+    env, _ = t.worker_invocation(_args(cache_policy="legacy"), "k", "tiered", "run", tmp_path / "spill", tmp_path / "o.json")
+    assert "CACHE_MIN_RESIDENT_S" not in env and env["CACHE_POLICY"] == "legacy"
+
+
+def test_every_worker_gets_cache_policy_explicitly_default_smart(tmp_path, monkeypatch):
+    monkeypatch.delenv("CACHE_POLICY", raising=False)
+    for scen in "abcdefghijkl":
+        for mode in ("ref", "tiered"):
+            env, _ = t.worker_invocation(_args(), scen, mode, "full", tmp_path / "spill", tmp_path / "o.json")
+            assert env["CACHE_POLICY"] == "smart", (scen, mode)  # (the server default; not left to the engine's C++ default, legacy)
+            env, _ = t.worker_invocation(_args(cache_policy="legacy"), scen, mode, "full", tmp_path / "spill", tmp_path / "o.json")
+            assert env["CACHE_POLICY"] == "legacy", (scen, mode)
+
+
+def test_the_driver_clears_the_inherited_cache_variables_and_scenario_k_runs_both_policies(tmp_path, monkeypatch):
+    assert t.policies_for("k", None) == ["smart", "legacy"]
+    assert t.policies_for("k", "legacy") == ["legacy"] and t.policies_for("k", "smart") == ["smart"]
+    assert t.policies_for("a", None) == ["smart"] and t.policies_for("l", "legacy") == ["legacy"]
+    seen = {}
+
+    def fake_run(cmd, env=None, **_kw):
+        seen.update(env)
+        out = cmd[cmd.index("--out") + 1]
+        pathlib.Path(out).write_text("{}")
+        return types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr(t.subprocess, "run", fake_run)
+    monkeypatch.setenv("CACHE_POLICY", "legacy")  # (inherited: the explicit value of the worker wins)
+    monkeypatch.setenv("CACHE_PREFILL_T0_US", "99")
+    monkeypatch.setenv("SPILL_FAIR_AGENTS", "0")
+    monkeypatch.delenv("CACHE_MIN_RESIDENT_S", raising=False)
+    t.run_worker(_args(cache_policy="smart"), "a", "tiered", "full", tmp_path / "spill", tmp_path / "o.json")
+    assert seen["CACHE_POLICY"] == "smart" and seen["CACHE_PREFILL_T0_US"] == "99"  # (passed on by worker_invocation, not inherited)
+    assert "SPILL_FAIR_AGENTS" not in seen
+
+
+def test_the_cache_policy_option_and_the_windows_scripts_document_it():
+    root = PATH.parents[1]
+    for script in ("tiered_cache_test.py", "tiered_cache_bench.py"):
+        text = (root / "scripts" / script).read_text(encoding="utf-8")
+        assert '"--cache-policy"' in text and "smart" in text and "legacy" in text, script
+    r = subprocess.run([sys.executable, str(PATH), "--help"], capture_output=True, text=True, timeout=60)
+    assert "--cache-policy" in r.stdout
+    for name in ("test.cmd", "bench.cmd"):
+        assert "--cache-policy" in (root / "scripts/windows" / name).read_text(encoding="utf-8"), name

@@ -78,4 +78,4 @@ python tools/cache_sim.py trace-*.jsonl --policy legacy,legacy-nofair,smart,lru,
 python tools/cache_sim_gen.py synth.jsonl --workload mixed|continuation|diverging [--churn 0.08]   # 合成軌跡
 ```
 
-把軌跡重播過 VRAM 檢查點（槽與頁）、RAM 層、SSD 層的模型，比較各保留策略；說明與近似見 `docs/tiered-cache.md`「CACHE_POLICY=smart」與 `tools/cache_sim.py` 開頭。
+把軌跡重播過 VRAM 檢查點（槽與頁）、RAM 層、SSD 層的模型，比較各保留策略（預設 `CACHE_POLICY=smart`，在真實軌跡上驗證預設就是用這個工具；`legacy` 是舊規則）；說明與近似見 `docs/tiered-cache.md`「CACHE_POLICY=smart」與 `tools/cache_sim.py` 開頭。
