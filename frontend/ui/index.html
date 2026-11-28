@@ -1011,6 +1011,9 @@ function drawTiers() {
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 份`),
     ...(t.restoring || t.restored_async ? [kvRow("載回中", `${n(t.restoring)} 份`),
       kvRow("載回速度", t.restore_gbps == null ? "–" : `${t.restore_gbps.toFixed(1)} GB/s`)] : []),
+    // the pure speeds timed by the engine (0 until one was timed: "–")
+    ...(ssdOff || t.ssd_read_gbps == null ? [] : [kvRow("SSD 讀取速度", t.ssd_read_gbps > 0 ? `${t.ssd_read_gbps.toFixed(1)} GB/s` : "–")]),
+    ...(t.h2d_gbps == null ? [] : [kvRow("GPU 複製速度", t.h2d_gbps > 0 ? `${t.h2d_gbps.toFixed(1)} GB/s` : "–")]),
     ...(ssdOff ? [] : [kvRow("TTL", t.ttl_days ? `${t.ttl_days} 天` : "關閉")])));
   if (t.dir) kids.push(el("div", { class: "muted mono", style: "margin-top:8px;overflow-wrap:anywhere" }, t.dir));
   if (t.last_error) kids.push(warnBox("最後錯誤", t.last_error));

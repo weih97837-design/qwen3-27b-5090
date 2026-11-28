@@ -50,7 +50,8 @@
 //      refused by spill_export / spill_drop (frontend/tiercache.py also skips them: spill_list reports busy).
 //  (B) DISK entries: begin allocates the entry's HostKv + state on the engine thread (spill_alloc_kv, may be pinned),
 //      then ONE thread per entry (DiskRead, spill_files.h) only fread()s the entry's manifest and chunk files into those
-//      buffers (and checksums them). It touches nothing else (no spill_, ckpts_, pool_, PinnedPool bookkeeping, disk_ (the
+//      buffers (and checksums them; with SPILL_READ_THREADS > 1 the chunk files are read by up to that many threads that
+//      DiskRead starts and joins itself, under the same rules). It touches nothing else (no spill_, ckpts_, pool_, PinnedPool bookkeeping, disk_ (the
 //      chunk index), ChunkStore, CUDA: it gets copies of the paths, ids and names), and the engine thread does not touch the buffers
 //      until it has read DiskRead::st with acquire (poll) and joined the thread. The destructor joins before anything
 //      is freed (restoring_.clear() first). The buffers' pool regions are released only by the engine thread.
@@ -320,7 +321,7 @@ cudaEvent_t Model::spill_event() {
     return e;
   }
   cudaEvent_t e;
-  Q27_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+  Q27_CUDA(cudaEventCreate(&e));  // (timing enabled: the H2D counters of spill_loading_done take the elapsed time of two of them)
   return e;
 }
 
@@ -1008,6 +1009,7 @@ int Model::spill_restore_begin(uint64_t id) {
   }
   // Only on disk: the buffers here (a private entry: P), the reads of the manifest and its chunk files on a thread (B).
   auto d = std::make_unique<DiskRead>();
+  d->threads = opt_.spill_read_threads;
   try {
     s.state.reset(new char[s.state_bytes]);
     s.kv = spill_alloc_kv(s.kv_bytes);
@@ -1043,12 +1045,13 @@ int Model::spill_restore_issue(uint64_t id) {
   int slot = -1;
   std::vector<int32_t> pages;
   if (!spill_acquire(npages, &slot, &pages)) return 0;
-  cudaEvent_t ev = nullptr;
+  cudaEvent_t ev = nullptr, t0 = nullptr;  // (ev: the copy's end, t0: its start on io_s_, async only)
   // A throw from here to the checkpoint's registration (a CUDA error): the pages and slot go back, after the copies that
   // may write them finished, and the load event is recycled.
   Undo undo_acq([&] {
     spill_unacquire(pages, slot);
     if (ev) spill_event_put(ev);  // (complete: spill_unacquire waited for the stream)
+    if (t0) spill_event_put(t0);
   });
   try {  // (G) parking capacity for the tail, after the acquire (evicting checkpoints can run spill_reap, which replaces
          // retired_). The chunks stay listed (4: held until the restore completes); one freed later parks itself.
@@ -1066,6 +1069,8 @@ int Model::spill_restore_issue(uint64_t id) {
     Q27_CUDA(cudaStreamSynchronize(s_));
   } else {
     io_begin();  // (1)
+    t0 = spill_event();  // (the H2D timing: the copy's start on io_s_, read against load_ev when the copy is complete)
+    Q27_CUDA(cudaEventRecord(t0, io_s_));
     spill_h2d(s, pages, io_s_, true);
     if (!s.done) s.done = spill_event();
     Q27_CUDA(cudaEventRecord(s.done, io_s_));
@@ -1085,7 +1090,7 @@ int Model::spill_restore_issue(uint64_t id) {
   ck.owner = s.owner, ck.hits = s.hits, ck.last_hit = s.last_hit;
   ck.last_use = ++use_clock_;
   ck.load_id = id;
-  if (ev) ck.loading = true, ck.load_ev = ev;
+  if (ev) ck.loading = true, ck.load_ev = ev, ck.h2d_t0 = t0, ck.h2d_bytes = s.kv_bytes + s.state_bytes;
   else ck.held = !restoring_.at(id).orphan;  // (F) complete already
   ckpts_.push_back(std::move(ck));  // (capacity reserved above: no throw)
   ret_gen_++;
@@ -1128,6 +1133,14 @@ void Model::spill_loading_done(Checkpoint& c) {
   c.loading = false;
   c.held = r == restoring_.end() || !r->second.orphan;
   c.last_use = ++use_clock_;  // (fresh: not the next victim before the request that waited for it is admitted)
+  if (c.h2d_t0) {  // (the copy is complete: its time on io_s_, if CUDA reports one; a failed query counts nothing)
+    float ms = 0;
+    if (cudaEventElapsedTime(&ms, c.h2d_t0, c.load_ev) == cudaSuccess && ms > 0)
+      sstats_.h2d_ns += int64_t(double(ms) * 1e6), sstats_.h2d_bytes += int64_t(c.h2d_bytes);
+    cudaGetLastError();  // (clears a failed query, if any)
+    spill_event_put(c.h2d_t0);
+    c.h2d_t0 = nullptr;
+  }
   spill_event_put(c.load_ev);
   c.load_ev = nullptr;
   restore_results_.emplace_back(id, true);  // (capacity reserved at begin (G))
@@ -1168,6 +1181,7 @@ int Model::spill_restore_poll(int64_t* done_ids, int32_t* done_ok, int cap) {
     Restore& r = rit->second;
     r.disk->join();
     const bool ok = r.disk->state_now() > 0;
+    if (ok) sstats_.ssd_read_ns += r.disk->ns.load(), sstats_.ssd_read_bytes += int64_t(r.bytes);  // (SSD speed: spill_stats 49, 50)
     const int bad = r.disk->bad.load();  // (the chunk file that failed verification or is missing; -1: the manifest, or an I/O error)
     const bool io_error = r.disk->io_error.load();
     r.disk.reset();
@@ -1559,6 +1573,7 @@ int Model::spill_load(Spilled& s) {
   const size_t npages = size_t(ceil_div(s.pos(), kPageTokens));
   if (s.state_bytes != ckpt_bytes_ || s.kv_bytes != npages * kKvSlices * kv_page_bytes_ || !spill_disk_ready(s)) return 0;
   DiskRead d;
+  d.threads = opt_.spill_read_threads;
   try {
     spill_reap();
     s.state.reset(new char[s.state_bytes]);
@@ -1577,6 +1592,7 @@ int Model::spill_load(Spilled& s) {
   }
   spill_ram_ += s.own_bytes();  // (a private entry: all its pages in kv)
   s.io_fails = 0;               // (a good read ends the run of I/O errors: kMaxIoFails counts failures IN A ROW)
+  sstats_.ssd_read_ns += d.ns.load(), sstats_.ssd_read_bytes += int64_t(s.kv_bytes + s.state_bytes);  // (SSD speed: spill_stats 49, 50)
   return 1;
 }
 
@@ -1709,6 +1725,7 @@ void Model::spill_stats(int64_t* out, int n) const {
   out[41] = ssd_gate_.on() ? 1 : 0, out[42] = ssd_gate_.rejected(), out[43] = ssd_gate_.rejected_short();
   out[44] = ssd_gate_.rejected_watermark(), out[45] = ssd_gate_.checked();
   out[46] = sstats_.restore_refused_busy, out[47] = sstats_.restore_refused_room, out[48] = sstats_.restore_dropped_missing;
+  out[49] = sstats_.ssd_read_ns, out[50] = sstats_.ssd_read_bytes, out[51] = sstats_.h2d_ns, out[52] = sstats_.h2d_bytes;
   for (int i = 0; i < n && i < kSpillStats; i++) dst[i] = v[i];  // (an older caller's shorter buffer is never overrun)
 }
 

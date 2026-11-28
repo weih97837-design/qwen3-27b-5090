@@ -181,6 +181,7 @@ $SPILL_DIR/
 | --- | --- | --- |
 | `SPILL_PINNED_GIB` | `8` | spill entry 可使用的 pinned（page-locked）主機記憶體上限（GiB）。0 表示關閉（v0.3.2 起預設 8） |
 | `SPILL_ASYNC_IO` | `1` | `1`：KV 頁在專用的 I/O stream 上搬移，不再暫停運算 stream 與引擎執行緒 |
+| `SPILL_READ_THREADS` | `4` | 讀取一個 SSD entry 的 chunk 檔所用的執行緒數（1–16；`1` 即逐一讀取，與舊版相同）。見「SSD 讀取速度與估計」 |
 | `SPILL_ASYNC_PROMOTE` | `1` | `1`：命中已 spill 的 checkpoint 時，請求進入「載回快取」狀態，由引擎在背景載入，其他請求照常執行（delay hit） |
 | `SPILL_PINNED_SLAB_MIB` | `1024` | 每次 pin 的區塊大小（MiB）：閒置時每輪只 pin 一個區塊，所以也是單次停頓的上限；一般不需調整 |
 
@@ -220,8 +221,9 @@ $SPILL_DIR/
 
   **載入還是重算（load-vs-recompute）。** 只有在 `估計載入時間 < 0.8 × 估計重算時間` 時才載入；否則放行請求讓 prefill 重算，
   並關閉這一次 `prefix_begin` 的同步 promote（否則引擎仍會照樣停頓去載入）。
-  估計載入時間 ＝ entry 大小（KV＋state）÷ 載入速度 ＋ 0.05 秒；載入速度先用預設值（RAM pinned 12 GB/s、pageable 6 GB/s、SSD 2 GB/s），
-  有完成的載入之後改用實測值（以預設值的 0.25–4 倍為界，避免一次偏慢的量測讓之後都不載入）。
+  估計載入時間 ＝ entry 大小（KV＋state）÷ 載入速度 ＋ 0.05 秒；載入速度先用預設值（RAM pinned 40 GB/s、pageable 12 GB/s、SSD 3 GB/s），
+  之後改用引擎自己計時的實測值：SSD 讀檔用 `ssd_read_*`，RAM 的 H2D 複製用 `h2d_*`（見下節「SSD 讀取速度與估計」；不再用牆鐘時間，
+  因為排程器只在引擎步之間輪詢，牆鐘會偏低）。實測值以預設值的 0.25–4 倍為界，避免一次偏慢的量測讓之後都不載入。
   估計重算時間 ＝ 命中的 token 數 ÷ 實測的 prefill 速度（排程器每個 prefill chunk 量測；尚無量測時用 8000 tok/s，介於
   architecture.md 量到的 19K 11,295 tok/s 與 194K 5,875 tok/s 之間）。門檻都是 `frontend/worker.py` 開頭的常數
   （`RESTORE_MARGIN`、`RESTORE_TIMEOUT_S`、`RESTORE_BW_*`、`PREFILL_TPS_DEFAULT`）。
@@ -629,6 +631,29 @@ int q27_spill_set_ssd_gate(void* m, int on, int64_t min_tokens, double watermark
 **輸出**：`/metrics` 的 `q27:restore_decisions_total{tier,outcome}`、`q27:restore_not_worth_bytes_total{tier}`、`q27:restore_not_worth_load_seconds_total{tier}`、
 `q27:restore_not_worth_recompute_seconds_total{tier}`、`q27:tier_restore_refused_*`；統計快照的 `restore_decisions`（`counts`、`not_worth`；也放在 tiers 區塊內），
 狀態頁分層快取面板可展開的「還原決策」小表；請求軌跡 `req` 的 `restore` 與 `restore_tier`（`docs/request-trace.md`），`tools/trace_summary.py` 會印一行彙總。
+
+## SSD 讀取速度與估計
+
+載入一個 SSD 上的 checkpoint 時，引擎的讀檔（manifest 與 chunk 檔，逐檔驗證）與 H2D 複製分開計時，兩個數字都在 `/stats` 的 tiers 區塊與狀態頁分層快取面板的「SSD 讀取速度」、「GPU 複製速度」：
+
+- **`ssd_read_gbps`**（「SSD 讀取速度」）＝ 讀檔位元組數 ÷ 讀檔的純時間（GB/s，10⁹ bytes）。時間只含讀檔（`DiskRead` 的 `ns`，成功的讀取才計），不含排程器等待、也不含 GPU 複製；位元組數是 entry 的 KV＋state（與還原的 `bytes` 相同，檔頭不計）。引擎的 `spill_stats` 第 49、50 個值（`ssd_read_ns`、`ssd_read_bytes`）是累計值。
+- **`h2d_gbps`**（「GPU 複製速度」）＝ 非同步載回（`SPILL_ASYNC_PROMOTE=1`）的 host → device 複製時間（CUDA event，開始事件記在 I/O stream 上，複製完成時讀取 elapsed）÷ 位元組數。第 51、52 個值（`h2d_ns`、`h2d_bytes`）。同步的載回不計。
+- 0 表示尚未量到。兩者都是引擎的計時，不是牆鐘，所以不受排程器輪詢的延遲影響。
+- 排程器以這些累計值的差（每次至少 64 MiB 才學習，之後指數平滑 0.3）更新載入速度的估計（`frontend/worker.py` 的 `learn_speeds`）。引擎重新啟動時計數器歸零，排程器會重新設定基準。
+
+**SPILL_READ_THREADS**（預設 4，範圍 1–16）：一個還原的 chunk 檔由這麼多執行緒平行讀取（每個執行緒自己的檔案、自己的雜湊；`bad` 仍是驗證失敗的最小 chunk 索引）。`1` 與舊版行為相同。在 Linux 上讀檔前還會呼叫 `posix_fadvise(SEQUENTIAL)`。單一執行緒的讀取佇列深度只有 1，所以預設不是 1（實際最佳值請用 `tools/ssd_bench.py` 在本機量）。
+
+**量測磁碟本身**：`tools/ssd_bench.py`（只用標準函式庫，Python 3.9+）：
+
+```
+python tools/ssd_bench.py --dir D:\kvcache [--gib 4] [--threads 1,2,4,8] [--block-mib 32]
+```
+
+它在 `--dir` 寫入 `--gib` 的隨機資料（`q27_ssd_bench_*.bin`，寫完 fsync），然後印出順序讀取（單一執行緒）與各執行緒數的牆鐘 GB/s，最後一定刪除這些檔案（錯誤或 Ctrl-C 也一樣）。注意：
+
+- 快取會讓數字偏高。Linux 上每次讀取前以 `posix_fadvise(DONTNEED)` 丟棄快取（盡力而為）；Windows 上工具無法丟棄快取，寫入後的第一次讀取可能來自快取，要公平的數字請讓 `--gib` 大於可用 RAM。
+- 數字只含檔案讀取，不含 GPU 複製，所以是還原載入速度的上限。
+- 引擎的 `ssd_read_gbps` 是 `SPILL_READ_THREADS` 與實際負載下的數字；要比較磁碟與設定，用 `ssd_bench.py` 試 `--threads` 找到最快的執行緒數，再設 `SPILL_READ_THREADS`。
 
 ## WSL2 注意事項
 

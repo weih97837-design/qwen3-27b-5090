@@ -155,6 +155,8 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   // SPILL_ASYNC_PROMOTE (1: the frontend may restore a spilled checkpoint in the background while other requests run;
   // off by default, then spill_match / spill_restore_* do nothing).
   if (const char* e = getenv("SPILL_ASYNC_PROMOTE")) o.spill_async_promote = atoi(e) != 0;
+  // SPILL_READ_THREADS (1..16, default 4): threads that read an SSD entry's chunk files in one restore (spill_files.h DiskRead).
+  if (const char* e = getenv("SPILL_READ_THREADS")) o.spill_read_threads = std::min(16, std::max(1, atoi(e)));
   // SPILL_DEDUP (default 1): spilled entries share identical 4096-token chunks in RAM; 0 keeps every entry's KV whole.
   if (const char* e = getenv("SPILL_DEDUP")) o.spill_dedup = atoi(e) != 0;
   // SPILL_FAIR_AGENTS (default 1): the RAM tier's victim comes from the agent using the most RAM (retention.h); 0: no per-agent step.
