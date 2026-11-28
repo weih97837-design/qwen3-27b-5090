@@ -104,3 +104,41 @@ python tools/cache_sim_gen.py synth.jsonl --workload mixed|continuation|divergin
 ```
 
 把軌跡重播過 VRAM 檢查點（槽與頁）、RAM 層、SSD 層的模型，比較各保留策略（預設 `CACHE_POLICY=smart`，在真實軌跡上驗證預設就是用這個工具；`legacy` 是舊規則）；說明與近似見 `docs/tiered-cache.md`「CACHE_POLICY=smart」與 `tools/cache_sim.py` 開頭。
+
+## 透過連接埠讀取
+
+軌跡檔由**引擎行程**寫入，伺服器行程（`frontend/server.py`）只讀同一個目錄，所以不必登入引擎那台電腦的磁碟：區網上的另一台機器或工具可以直接用 HTTP 取。只有設了 `REQUEST_TRACE` 才有內容；`REQUEST_TRACE_HTTP=0` 關閉這三個端點。
+
+| 端點 | 說明 |
+|---|---|
+| `GET /admin/trace` | JSON：`enabled`、`directory_name`（只有資料夾名稱，不含完整路徑）、`files`（每個檔的 `name`、`size`、`mtime`、`first_ts`、`last_ts`、`complete`、`complete_bytes`）、`total_bytes`、`max_bytes`（`REQUEST_TRACE_MAX_MIB`）。沒開軌跡時回 200 與 `{"enabled": false}` |
+| `GET /admin/trace/<檔名>` | 該檔，`application/x-ndjson`，串流輸出。檔名必須與清單中的某個名稱完全相同（含 `..`、斜線、編碼過的路徑、符號連結一律是 400／404）。支援 `Range: bytes=a-b`（206）與 `?from=<位元組位移>`；標頭 `X-Trace-Offset` 是已送出的最後一個完整行之後的位移，下次輪詢用 `?from=` 接續 |
+| `GET /admin/trace/all[?since=<epoch 秒>]` | 全部的檔，由舊到新串接，串流輸出；`since` 會略過 `last_ts` 小於它的檔（用 `?since=` 取最近一段） |
+
+- **只送完整的行。** 最新的檔正被引擎附加；每個回應都在最後一個換行處截斷，寫到一半的行不會出現，`X-Trace-Offset`（也是 `complete_bytes`）就是那個位置。`Range` 的總長也以此為準，所以不會讀到半行。`Range` 的 `X-Trace-Offset` 是 `end + 1`（位元組位移，不保證在行界）。
+- **`from`：** 位移等於目前的完整長度時回 200 與空內容（沒有新資料）；超過時回 416，`X-Trace-Offset` 與 `Content-Range: bytes */<長度>` 給出實際長度（檔案被換掉或截短了，從 0 重來）。`from` 與 `Range` 不能同時用（400）。
+- **`complete`：** 該檔已封存（不是最新的一個，之後不會再被附加）。最新的檔一律 `false`。`first_ts`／`last_ts` 取自第一行與最後一個完整行的 `ts`，只讀檔頭與檔尾，並以 `(size, mtime)` 快取。
+- **壓縮：** 沒有 `Range` 時，請求帶 `Accept-Encoding: gzip` 就以 gzip 串流回應（`Transfer-Encoding: chunked`）。全部都是分塊讀寫（256 KiB），伺服器的記憶體用量與檔案大小無關。`/admin/trace/all` 一律分塊傳輸，沒有 `Content-Length`。
+- **輪詢：** 檔案換檔或刪除（超過總上限時最舊的被刪）時，`/admin/trace/<檔名>` 變成 404，改看清單。
+
+```
+curl -s http://HOST:8080/admin/trace
+curl -s --compressed http://HOST:8080/admin/trace/all -o trace-all.jsonl
+curl -s -D- "http://HOST:8080/admin/trace/trace-20260101-000000.jsonl?from=1048576" -o new.jsonl     # 看 X-Trace-Offset
+curl -s -r 0-1048575 http://HOST:8080/admin/trace/trace-20260101-000000.jsonl -o head.jsonl
+
+python tools/cache_sim.py http://HOST:8080/admin/trace/all --policy legacy,smart
+python tools/trace_summary.py "http://HOST:8080/admin/trace/all?since=1767225600"
+python tools/trace_fetch.py http://HOST:8080 --out trace-copy [--since TS] [--follow 60]   # 增量下載到本機
+python tools/cache_sim.py trace-copy/*.jsonl --policy legacy,smart
+```
+
+`tools/trace_summary.py` 與 `tools/cache_sim.py` 的輸入可以混用檔案路徑與 `http://`／`https://` 網址（逐行串流讀取，gzip，不會把整個檔載入記憶體；`cache_sim` 本來就把請求事件放在記憶體中重播）。網址回 404 時會說明原因（軌跡沒開，或 `REQUEST_TRACE_HTTP=0`）。`trace_fetch.py` 把每個檔以原名存到 `--out`，狀態檔 `.trace_fetch.json` 記錄各檔已取得的位移，重跑或 `--follow SECONDS`（每隔幾秒輪詢，Ctrl-C 結束）只取新的位元組，只寫入完整的行；伺服器已輪替刪除的檔，本機副本保留；伺服器上的同名檔變短（被換掉）則從頭重抓。狀態頁（`/ui`）在軌跡開啟時多一個「追蹤檔」區塊：檔案數、總大小／上限、最新檔名，以及上述兩個連結。
+
+### 存取與隱私
+
+**沒有驗證**，和狀態頁（`/ui`）一樣：任何連得到這個連接埠的人都能下載軌跡，而伺服器可以聽在 `0.0.0.0`。檔案內容是 agent id、機器名稱、長度、時間與雜湊，沒有提示詞或輸出文字（見上面「隱私」），但相同前綴會得到相同雜湊，能看出誰在什麼時候用了多大的提示詞。要限制：
+
+- `REQUEST_TRACE_HTTP=0`：關閉端點（記錄照常寫檔，仍可直接讀磁碟）。
+- `REQUEST_TRACE_HASH_AGENTS=1`：agent id 改為短雜湊（機器名稱仍在）。
+- 防火牆／綁定位址：只開放信任的網段到這個連接埠（或讓伺服器只聽 `127.0.0.1`）。

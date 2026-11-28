@@ -529,6 +529,8 @@ and every 10 s while busy, with counts and hashes only (no prompt or output text
 eviction policies. `REQUEST_TRACE_HASH_AGENTS=1` replaces agent ids by a short hash; `REQUEST_TRACE_MAX_MIB` (default 512) caps the total
 size of the files (64 MiB each, the oldest are deleted). About 8 KB per request with 50-125K token prompts. Fields, privacy and
 `tools/trace_summary.py`: [request-trace.md](request-trace.md) (Traditional Chinese).
+`REQUEST_TRACE_HTTP=0` turns off reading the files through the server's port (`GET /admin/trace`, `/admin/trace/<file>`, `/admin/trace/all`; on by default
+when `REQUEST_TRACE` is set, no authentication: anyone who can reach the port can download them, see request-trace.md).
 
 ## Prefix cache
 
