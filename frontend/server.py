@@ -4,7 +4,7 @@ SGLang environments (same port, model name, parsers and request options).
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
 /admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
-with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /admin/trace[/<file>|/all] (the request trace files); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
 /ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images and videos (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import structured  # noqa: E402
+import trace_http  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, media_of, request_meta  # noqa: E402
@@ -1134,6 +1135,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self.srv.engine.config)
         elif path == "/admin/engine":
             self._json(200, self.engine_settings())
+        elif path == "/admin/trace" or path.startswith("/admin/trace/"):
+            try:  # (the request trace files over HTTP: trace_http.py, docs/request-trace.md)
+                trace_http.serve(self, self.path)
+            except trace_http.TraceError as e:
+                self._error(e.code, str(e), e.kind)
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
         elif path == "/ui":

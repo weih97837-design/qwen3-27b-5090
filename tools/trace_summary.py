@@ -8,6 +8,11 @@ import argparse
 import json
 import statistics
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import trace_io  # noqa: E402  (a file path or an http(s):// URL such as http://HOST:8080/admin/trace/all)
 
 BIG = 16384  # "long prompt" for the zero-hit share
 BUCKETS = (0, 1024, 4096, 16384, 32768, 65536, 131072)
@@ -16,7 +21,7 @@ BUCKETS = (0, 1024, 4096, 16384, 32768, 65536, 131072)
 def load(paths):
     reqs, dones, snaps = [], [], []
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with trace_io.open_lines(p) as f:
             for line in f:
                 try:
                     r = json.loads(line)
@@ -208,7 +213,10 @@ def main(argv=None):
     ap.add_argument("files", nargs="+")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    s = summarize(*load(a.files))
+    try:
+        s = summarize(*load(a.files))
+    except trace_io.TraceSourceError as e:
+        sys.exit(f"trace_summary: {e}")
     print(json.dumps(s, indent=1) if a.json else render(s))
     return 0
 
