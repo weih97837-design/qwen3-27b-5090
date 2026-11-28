@@ -93,7 +93,7 @@ the port opens without a firewall rule and those tools' rules do not close it. T
 
 **On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:46320/v1` (Anthropic
 clients: `http://<address>:46320`) and the stats page at `http://<address>:46320/ui`. With another `PORT`, change the port
-everywhere above.
+everywhere above. The chat page is at `http://<address>:46320/chat`.
 
 ## Serving
 
@@ -113,14 +113,16 @@ everywhere above.
 | `SCHED_QUANTUM_MS` | 50 | Length of a decode turn (with `BATCH_DECODE=0`, the interval between requests' turns; a switch costs about 1 ms) |
 | `BATCH_DECODE` | 1 | 1: requests in decode advance together in one batched speculative step (P6-10; about 2.3x aggregate at 4 requests; each request's tokens are the same as alone). 0: requests take turns |
 | `PREFILL_CHUNK` | 2048 | Prefill chunk in tokens (8,192 is only 2.5% faster at 32K and needs 4x the activations, P5-4) |
-| `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
+| `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV, both measured with the one-term `lm_head`); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or another NVFP4 checkpoint of Qwen3.8-27B on the Hugging Face Hub, e.g. a fine-tune: `ORG/NAME` (its main branch) or `ORG/NAME@REVISION`, downloaded with `scripts/download_weights.py --weights ORG/NAME` (which first checks that the engine takes it) or `scripts/download-weights.sh --repo ORG/NAME` (see [Other checkpoints](#other-checkpoints)). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
 | `SPEC` | `dspine` | `dspine` (speculative decoding with the DSpine draft, `tencent/Qwen3.8-27B-DSpine-b16`: blocks of up to 16, adaptive width), `dflash2` (the DFlash2 draft, blocks of 8) or `none`. Unset with only DFlash2 downloaded (a checkout from before DSpine became the default), the server uses DFlash2 and logs a warning; `scripts/download-weights.sh` gets DSpine |
 | `Q27_DRAFT_BLOCK` | `16` | DSpine: rows of a single sequence's draft block (the last token and the drafted ones), 2..16 (DSpine was trained on 16; fewer rows verify faster). Batched steps (several sequences decoding) always draft 8 per sequence |
 | `Q27_DRAFT_WINDOW` | `2048` | DSpine: the draft's context window (its attention and context ring), 256..8192. DSpine was trained with 8,192, but at a 32K context that accepted no more tokens than 2,048 and made each step 0.2-0.3 ms longer; its ring takes 160 MiB per sequence at 8,192, 40 MiB at 2,048 (as DFlash2's) |
 | `Q27_SPEC_ADAPT` | `1` | Adaptive verify width when the draft's block is longer than 8 (DSpine): a sequence verifies `Q27_SPEC_ADAPT_LOW` (8) rows while the moving average of its tokens per step (`Q27_SPEC_ADAPT_ALPHA`, 0.125) is below `Q27_SPEC_ADAPT_DOWN` (4.0), and the full block again once it reaches `Q27_SPEC_ADAPT_UP` (4.5). Only past steps decide the width, so the output distribution is unchanged. `0`: always the full block |
 | `Q27_SPEC_ADAPT_BATCH` | `1` | DSpine, requests that step together: each verifies 4, 8, 12 or 16 rows, chosen from its own tokens per batched step at the rows it ran (a moving average per width; untried widths are extrapolated) and a model of the step's time (the GEMMs step up every 16 rows of the total), within the row budget (8 per request of `MAX_SEQS`). Masked (structured output) requests keep 8. Only past steps decide the rows, so the output distribution is unchanged. Needs `Q27_SPEC_ADAPT`. `0`: 8 rows each |
-| `Q27_SPEC_ADAPT_HYST` | `0.01` | `Q27_SPEC_ADAPT_BATCH`: a lane's rows change only when that raises the step's expected tokens per ms by more than this fraction (each new split of the rows re-captures the step's CUDA graph, about 1.2 ms) |
+| `Q27_SPEC_CUT` | `1` | DSpine, batched steps of 2 or more requests without a grammar mask: after the draft, each request verifies only the prefix of its drafted rows (4, 8, .. or all) that maximizes the step's expected tokens per ms. The expected tokens come from the draft's own 16 x 16 tables (a calibrated per-position accept model, marginalized over the selector's draws), before any draw is looked at, so the output distribution is unchanged. Costs a host round trip between the draft and the verify (about 0.1 ms). `0`: every request verifies all the rows it drafted |
+| `Q27_BATCH_DEV_ROWS` | `1` | Batched steps: the kernels read the requests' row layout from device memory (written by the step's CUDA graph from a host buffer), so one graph serves every split of the same shape (requests, total rows, longest request's rows) and a new split costs nothing. Outputs are the same as with `0`. In-process against `0` (the graph re-captured and updated for each new split, about 0.55 ms): four / eight requests greedy +2.0% / +0.5%, sampled +1.4% / +1.7%; four requests at a 16K context +1.3% / +1.0% (greedy / sampled). `0`: the layout is in the kernels' arguments |
+| `Q27_SPEC_ADAPT_HYST` | `0.01` | `Q27_SPEC_ADAPT_BATCH`: a lane's rows change only when that raises the step's expected tokens per ms by more than this fraction (with `Q27_BATCH_DEV_ROWS=0`, each new split of the rows re-captures the step's CUDA graph, about 1.2 ms) |
 | `Q27_SPEC_ADAPT_PERIOD` | `8` | `Q27_SPEC_ADAPT_BATCH`: batched steps between the decisions (between them the rows stay) |
 | `Q27_SPEC_ADAPT_BATCH_ALPHA` | `0.03125` | `Q27_SPEC_ADAPT_BATCH`: rate of the lanes' moving averages. Slower than a single request's (`Q27_SPEC_ADAPT_ALPHA`) because the rule compares lanes: with 1/8, requests of one kind looked different by chance and traded rows at a loss (four sampled reasoning requests 5% slower) |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
@@ -532,6 +534,33 @@ size of the files (64 MiB each, the oldest are deleted). About 8 KB per request 
 `REQUEST_TRACE_HTTP=0` turns off reading the files through the server's port (`GET /admin/trace`, `/admin/trace/<file>`, `/admin/trace/all`; on by default
 when `REQUEST_TRACE` is set, no authentication: anyone who can reach the port can download them, see request-trace.md).
 
+## Chat page
+
+`http://localhost:8000/chat` is a simple chat page, to try the model in a browser without installing a client (like
+llama.cpp's `llama-server`). It is one file with no external resources, served by the server itself, and calls
+`/v1/chat/completions` from the same origin, so it needs no CORS or `TRUSTED_ORIGINS`.
+
+- Streaming, the reasoning folded away (open while the model thinks), Markdown with tables and code blocks (with a
+  copy button), and each reply's tokens, decode rate, prompt and cached tokens and accepted drafts (from `timings`).
+- Images and videos: the attach button, paste or drop. They are sent as data URLs.
+- Thinking: off (`chat_template_kwargs.enable_thinking: false`) or the reasoning effort, `low`, `medium` or `xhigh`
+  (the default; `chat_template_kwargs.reasoning_effort`). It is one setting for all chats and can change within a
+  conversation, from the next reply. The chat template puts the effort's instruction at the head of the prompt (none
+  for `medium` and off, which therefore share a head), so a change to another head reads the conversation again
+  unless the prefix cache still holds it from an earlier use of that setting.
+- A system prompt, temperature, top-p and max tokens (empty: the server's defaults).
+- The earlier replies' reasoning is sent back (`reasoning_content`), as the chat template expects, so it stays in the
+  model's context and counts toward it.
+- Stop (closing the stream cancels the request), regenerate the last reply, edit a message (the conversation is cut
+  there).
+- Conversations are kept in the browser's `localStorage`, on that browser only. Videos are not kept, and when the
+  storage is full the images of the oldest conversations are dropped first; the text stays.
+- The browser's tabs share the conversations: a save or a delete shows in the others. When two tabs change the same
+  conversation at the same time, the one that finishes later is kept as a copy ("(copy)" after the title).
+
+It is meant for trying the server and light use. For more (accounts, several models, documents, tools, conversations
+on the server), use a full client such as Open WebUI with `http://<address>:8000/v1` as an OpenAI connection.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from
@@ -545,7 +574,8 @@ the chat template renders it.
 takes the layouts it already reads: the modelopt one of NVIDIA's checkpoint (projections in FP8 or NVFP4) and the
 compressed-tensors one of QUASAR, with NVFP4 activations (W4A4) and the model's dimensions. A BF16 `lm_head` (kept by
 QUASAR and its fine-tunes) is quantized to NVFP4 at load, with the block scales chosen for the smallest error (on
-QUASAR: KL to the BF16 model 0.0473, against 0.0471 with NVIDIA's NVFP4 `lm_head`). The compressed-tensors
+QUASAR: KL to the BF16 model 0.0469, against 0.0462 with NVIDIA's NVFP4 `lm_head`). An NVFP4 `lm_head`, either kind,
+takes its activations in two terms (`Q27_LM_HEAD_A4X2`). The compressed-tensors
 "mixed-precision" layout of unsloth's and Red Hat's checkpoints loads as well: FP8 weights with per-output-channel
 scales (the GDN and attention projections, the last eight MLPs, unsloth's `lm_head`) run as they are, with the
 activations quantized per token at run time as the checkpoint specifies (`gemm_fp8_scaled`, `skinny_fp8_scaled`);
@@ -697,10 +727,12 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_KV_BLOCK=N` | Pages per block of the KV pool (P7-13; default the smallest count whose slice is >= 2 MiB: 57 for NVFP4, 32 for FP8, 16 for BF16). 1 lays pages out one by one (long-context decode 1.5% slower). Read at startup |
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_KV_VMM=0` | Allocate the KV pool in one `cudaMalloc` instead of through CUDA's virtual memory management: then no KV pool memory is lent to video decoding, and NVDEC's surfaces are taken beyond the VRAM budget. Read at startup |
+| `Q27_NVDEC_WAKE=0` / `1` | Before a video decode, wake the idle GPU by creating and destroying a CUDA context (about 0.1 s and, for that long, 0.5 GiB of device memory; no clock or power setting is changed; at most once in 2 s). Default: on under WSL2 only, where an NVDEC decode starting on a GPU idled down to P8 could hang until Windows reset it, which ends the engine process. 0: never. 1: also elsewhere. Read at the first decode |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
 | `Q27_GDN_CHUNK=0` / `1` | GDN in prefill: 0 = sequential (static); 1 = the chunk prep writes W and U (P5-2, read per call). Default 2: the prep writes only (I + L)^-1 and the chunk kernel forms delta itself (P5-14, prefill +1.9% at 19K) |
 | `Q27_AB_TC=1` | Prefill in_proj_a / b (T > 8): one block per 32 tokens over all of K (before P5-16, read per call). Default: K split in 4 over a cluster, partial sums added in order (prompts of 128 / 512 tokens +7.4 / +6.4%) |
 | `Q27_AB_NORM=0` | Prefill: the input RMSNorm writes its fp32 rows for in_proj_a / b (before P5-17, read per call). Default: it writes only 1 / rms per token and in_proj_a / b normalizes the residual itself (bit-identical; 19K +0.5%) |
+| `Q27_LM_HEAD_A4X2=0` | The NVFP4 `lm_head` with one-term NVFP4 activations (W4A4), as the published reference recordings of NVIDIA's checkpoint. Default 1: two terms (W4A4x2, `skinny_a4x2.cu`: the quantization of the activations plus that of what it left): same weights and memory, the same speed within measurement noise, as good as BF16 activations on that head (PQ-21). No effect on a checkpoint with an FP8 `lm_head` |
 | `Q27_MLP_FUSED=0` | Prefill MLP: gate \| up as a BF16-output GEMM, then SiLU and NVFP4 quantization in a separate kernel. Default 1: one GEMM (`gemm_mma.cu`) whose epilogue writes silu(gate) * up as the down GEMM's NVFP4 activations (prefill +2% at 19K / 73K, P5-12) |
 | `Q27_MLP_BF16=0` | With `Q27_MLP_FUSED=0`: fp32 outputs for the prefill MLP's gate \| up |
 | `Q27_SPEC_PATHS=K` | Paths of tree verification (default 1 = a chain; 2 / 4 accept more but take longer and break even) |

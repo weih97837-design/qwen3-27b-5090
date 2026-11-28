@@ -103,7 +103,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | MLP (gate, up, down) | NVFP4, W4A4 (16-element blocks, FP8 block scales) | 8.96 | yes |
 | GDN projections (qkv, z, out; a and b) | NVFP4, W4A4 (a and b: BF16) | 2.94 | yes |
 | Attention projections (q, k, v, o) | FP8, W8A8 (per-tensor scales) | 1.56 | yes |
-| lm_head | NVFP4 | 0.67 | yes |
+| lm_head | NVFP4, W4A4x2 (the activations in two NVFP4 terms) | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
 | Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
@@ -113,6 +113,11 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   the GPU into the kernels' layouts; there is no converted copy on disk. The attention projections stay FP8
   because quantizing them costs parallel tool calls; [decisions.md](decisions.md#weights) has the measurements.
   `scripts/build-gdnfp4.sh` rebuilds it (it needs the BF16 original and a few hours).
+- **The lm_head's activations take two terms** (`engine/src/skinny_a4x2.cu`): q0 is the usual NVFP4 quantization of
+  the normalized activations x, q1 that of x - q0 with the same global scale. The kernel reads the weights once and
+  runs an FP4 MMA on each term: the input's error drops from 9.3% to 0.9% and the logits are as good as with BF16
+  activations, at the one-term kernel's speed, since reading the weights bounds the step. An FP8 lm_head is not
+  affected. `Q27_LM_HEAD_A4X2=0` gives one term.
 - **Fused projections.** GDN's `qkv | z`, attention's `q (+gate) | k | v` and the MLP's `gate | up` each run as one
   GEMM. Their activation scales are equal in every layer of the checkpoint, so fusing does not change the
   activation quantization.
@@ -215,7 +220,14 @@ below walks that table. A sequence verifies 16 rows while its tokens per step st
 the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
 lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
 the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
-every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
+every 16 rows). The kernels read the split from device memory (`Q27_BATCH_DEV_ROWS`): the step's graph copies it
+from a host buffer the engine fills before each launch, and is cached per shape (requests, total rows, longest
+request's rows), so a new split runs in the same graph. After the draft, each lane may verify
+fewer rows than it drafted (`Q27_SPEC_CUT`): a small kernel turns each lane's table into its expected tokens at every
+width (a logistic accept model per position, on the largest probability and the entropy of the row, carried through
+the walk's distribution), the host picks the prefixes that maximize the expected tokens minus the recent tokens per ms
+times the verify's time (a DP over the total rows), and the verify runs on those rows. The draft and the verify are two
+CUDA graphs. `SPEC=dflash2` selects DFlash2, described next.
 
 The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
@@ -416,6 +428,12 @@ over the temporal patch instead of one image twice; attention, position embeddin
   resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
   `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
   vision tower's input path.
+- Under WSL2 a decode first wakes the GPU (`wake_gpu`): a CUDA context created and destroyed at once raises it to
+  P1 for about 6 s, without a clock or power setting. It costs about 0.1 s and, for that long, 0.5 GiB of device
+  memory, at most once in 2 s (`Q27_NVDEC_WAKE`; not part of the decode times below). Without it a decode starting
+  in P8 could hang until Windows reset the engine (TDR), and the process lost its CUDA context. A decode that loses
+  the context all the same returns -4 (`videoproc.DeviceLost`): the engine process exits, the request gets HTTP 503
+  (not the 400 of a broken video) and the server starts a new engine.
 - One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
   closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
   of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,
@@ -471,6 +489,8 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
   the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
   process: it holds all the VRAM, the server none.
+- `/chat` is a chat page (`frontend/ui/chat.html`, one file with no external resources) that calls
+  `/v1/chat/completions` from the same origin and keeps conversations in the browser's `localStorage`.
 - Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
   `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
   planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
@@ -495,6 +515,9 @@ and computes plainly.
   instead of a BF16 KV cache, differs from itself by a mean KL of 0.036 and 89% top-1 agreement over the golden
   positions. The engine is accepted when its distance to the reference is of the same size: mean KL <= 0.05, top-1
   >= 88%, positions with KL > 0.5 <= 1% (`reference/golden.py`, [benchmarks.md](benchmarks.md)).
+  Engine and reference must run the same number of lm_head terms: both take two by default (KL 0.028 between them),
+  while the published recordings of NVIDIA's checkpoint have one, as do the floor and the limits above
+  (`Q27_LM_HEAD_A4X2=0`, `golden ref --lm-head-terms 1`).
 - **Invariants that are tested bit for bit** (they keep the tests simple and catch logic errors that the noise
   above would hide):
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),

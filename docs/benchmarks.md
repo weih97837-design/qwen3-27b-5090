@@ -4,19 +4,22 @@ Speed and quality of the default configuration (`docker compose up -d serve` wit
 `gdnfp4`, KV cache `nvfp4`, DSpine speculative decoding, `MAX_SEQS=8`, `MAX_TOKENS=262144`), and how to reproduce
 each number. The JSON files of the speed numbers are in [results/](results/).
 
-The speed through the server was measured again when each request of a batched step got its own verify rows
-(2026-11-14), together with DFlash2 (`SPEC=dflash2`) on the same day; the prefill table's DSpine column was measured
+The one-request decode and the concurrent requests through the server were measured again for v0.7.0 (2026-11-23),
+DSpine and DFlash2 (`SPEC=dflash2`) on the same build; the agent rows are from 2026-11-14, when each request of a
+batched step got its own verify rows, together with DFlash2 on the same day; the prefill table's DSpine column was measured
 again on 2026-11-14 after the GDN prefill changes (P5-14 to P5-17), its DFlash2 column is from 2026-10-11. The in-process table by context length runs without speculative decoding and is from
-2026-10-11; the comparison with other engines and the power limit section keep their own dates.
+2026-10-11; the comparison with other engines and the power limit section keep their own dates. Apart from the
+2026-11-23 rows, these speed numbers predate the two-term lm_head (2026-11-23), which changes a step of a given
+number of rows by under 0.4% ([decisions.md](decisions.md#weights)).
 
 ## Conditions
 
 | | |
 | --- | --- |
 | GPU | RTX 5090 (32 GB), power limit **400 W** (below the card's default 575 W; every number here is at 400 W) |
-| Host | WSL2 (kernel 6.18), Docker with the NVIDIA Container Toolkit; NVIDIA driver 621.14 (2026-11-13), 617.42 (2026-10-11) |
-| Build | the serving image (CUDA 13.3), code `ea0d2f8` (2026-11-14) for DSpine's concurrent and agent rows, `32e5b99` for the rest (the commit between changes only DSpine's batched steps); prefill `0ea9769` (2026-11-14; DFlash2 column `9e74583`, 2026-10-11) |
-| Date | 2026-11-14 through the server; 2026-10-11 in-process, DFlash2's prefill and against other engines |
+| Host | WSL2 (kernel 6.18), Docker with the NVIDIA Container Toolkit; NVIDIA driver 621.01 (2026-11-23), 621.14 (2026-11-13), 617.42 (2026-10-11) |
+| Build | the serving image (CUDA 13.3), code `2f0e0c3` (v0.7.0, 2026-11-23) for the one-request decode and concurrent rows; `ea0d2f8` (2026-11-14) for DSpine's agent rows, `32e5b99` for the rest (the commit between changes only DSpine's batched steps); prefill `0ea9769` (2026-11-14; DFlash2 column `9e74583`, 2026-10-11) |
+| Date | 2026-11-23 (decode and concurrent rows) and 2026-11-14 through the server; 2026-10-11 in-process, DFlash2's prefill and against other engines |
 
 Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The card's default
 575 W limit and the energy per token at both limits are in [Power limit and energy](#power-limit-and-energy).
@@ -59,16 +62,20 @@ divides all output tokens by the time from the start to the last response. Two r
 
 | C | Sum tok/s | Per request (p50) | Wall tok/s | DFlash2, sum tok/s |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 357–358 | 357–358 | 355–356 | 309–310 |
-| 4 | 899–901 | 223–225 | 838–839 | 932 |
-| 8 | 1,313–1,314 | 163–164 | 1,252–1,265 | 1,392–1,394 |
+| 1 | 318 | 318 | 316–317 | 323 |
+| 4 | 872–899 | 216–222 | 839–859 | 920–923 |
+| 8 | 1,339–1,399 | 168–171 | 1,242–1,277 | 1,364–1,368 |
 
 All C requests run as one batch, and each request's tokens are bit-identical to running it alone. With DFlash2 every
 request verifies 8 rows per step; with DSpine each request verifies 4, 8, 12 or 16 rows of its own, chosen from the
 tokens it has been getting accepted at each width and a model of the step's time (`Q27_SPEC_ADAPT_BATCH`,
 [configuration.md](configuration.md)). On this reasoning prompt wider blocks hardly raise the acceptance, so DSpine
-keeps most requests at 8 rows, accepts fewer of them than DFlash2, and with four or eight requests at once DFlash2 is
-3% and 6% faster. The per-request rows pay off when the requests differ or produce predictable text: in-process,
+keeps most requests at 8 rows and accepts fewer of them than DFlash2. Since v0.7.0 each request then verifies only the
+prefix of its draft that is worth its time, judged from the draft's own confidence before any token is drawn
+(`Q27_SPEC_CUT`), which made four and eight requests 2.5% and 2.7% faster here; DFlash2 is still 3–6% faster with four
+requests, and the two are level with eight. With one request this prompt is a single fixed-seed text, so its rate moves
+with any change of the numerics that changes the text (357 tok/s in the v0.5.1 tables, 287 with v0.6.2, 318 now, at
+the same step time). The per-request rows pay off when the requests differ or produce predictable text: in-process,
 greedy (`scripts/batch_test.py bench --temperature 0`), against 8 rows each, four and eight mixed requests (code, JSON,
 prose, Japanese) are 9% and 4% faster and four code requests 21% faster. `SPEC=dflash2` remains a choice for a server
 that mostly runs many requests of long prose or reasoning at once.
@@ -147,16 +154,16 @@ limit, with
 the sampling pinned for all of them (`--extra-body '{"temperature":1.0,"top_p":0.95,"top_k":20,"presence_penalty":0}'`).
 Each engine runs its own weights and KV cache type, and some need different settings for different scenarios
 because one configuration cannot do everything; the settings are listed below the table. The first column is this
-engine with today's default (DSpine, 2026-11-14, the same scripts and settings); the second is the same-day run
-with DFlash2, the default then.
+engine with today's default (DSpine; decode and concurrent rows 2026-11-23, the others 2026-11-14, the same scripts
+and settings); the second is the same-day run with DFlash2, the default before v0.5.0.
 
-| | This engine, DSpine (2026-11-14) | This engine, DFlash2 | [NInfer](https://github.com/Neroued/ninfer) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) |
+| | This engine, DSpine | This engine, DFlash2 | [NInfer](https://github.com/Neroued/ninfer) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Context limit / KV cache, tokens | 262,144 / 601,856 | 262,144 / 605,504 | 16,384 / 43,904 (x8), 94,208 / 96,128 (x4) | 90,000 / 98,134 (fast), 196,608 / 214,219 (agent) | 160,000 / 173,913 |
-| Decode, one request, code / JSON / prose (tok/s) | **411 / 675 / 263** | 386 / 500 / 258 | 285 / 362 / 197 | 246 / 320 / 167 (fast) | 154 / 180 / 128 |
-| Concurrent, sum at C=1 (tok/s) | **357–358** | 312–313 | 234 | 197–205 (fast) | 124 |
-| Concurrent, sum at C=4 | 899–901 | **935–936** | 761–796 | 457–466 (agent) | 498–500 |
-| Concurrent, sum at C=8 | 1,313–1,314 | **1,395–1,397** | 1,260–1,277 | 837–851 (parallel) | 912–930 |
+| Decode, one request, code / JSON / prose (tok/s) | **407 / 742** / 250 | 365 / 485 / **273** | 285 / 362 / 197 | 246 / 320 / 167 (fast) | 154 / 180 / 128 |
+| Concurrent, sum at C=1 (tok/s) | 318 | **323** | 234 | 197–205 (fast) | 124 |
+| Concurrent, sum at C=4 | 872–899 | **920–923** | 761–796 | 457–466 (agent) | 498–500 |
+| Concurrent, sum at C=8 | 1,339–1,399 | 1,364–1,368 | 1,260–1,277 | 837–851 (parallel) | 912–930 |
 | Agent turn, time to first token, 1 / 4 sessions (p50) | 0.23 / **0.23 s** | **0.19** / 0.24 s | 0.39 / 0.75 s (x4) | 0.31 / 0.46 s (agent) | 0.57 / 1.59 s |
 | A second question on a 19.5K / 73K-token document, time to first token | **0.05 / 0.12 s** | 0.06 / 0.14 s | 2.20 / 10.94 s (x4) | 0.22 / 0.49 s (agent) | 0.39 / 1.01 s |
 
@@ -200,8 +207,8 @@ tok/s at 19K / 73K) are from an older build (2026-10-11).
 | [SGLang](https://github.com/sgl-project/sglang) | [v0.5.21](https://github.com/sgl-project/sglang/releases/tag/v0.5.21) with two unmerged patches: embedding in host memory ([#37826](https://github.com/sgl-project/sglang/pull/37826), backported) and MTP weight sharing ([#37155](https://github.com/sgl-project/sglang/pull/37155)) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | fast: DFlash2 (one request at a time); agent / parallel: the checkpoint's MTP head, 5 steps | fast: 90K, 1 request; agent: 196K, 4 requests; parallel: 160K, 8 requests |
 | [vLLM](https://github.com/vllm-project/vllm) | [v0.29.0](https://github.com/vllm-project/vllm/releases/tag/v0.29.0) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | MTP, 3 tokens | 160K, 8 requests, a fixed 6.5 GiB KV cache |
 
-The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`, this engine on 2026-11-14
-`20261114-*-dspine-p338*-*.json`, its prefill `20261114-*-prefill-p517-s*.json` and v0.5.0's on the same day
+The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`, this engine on 2026-11-23
+`20261123-*-{dspine,dflash2}-v070-*.json` and on 2026-11-14 `20261114-*-dspine-p338*-*.json`, its prefill `20261114-*-prefill-p517-s*.json` and v0.5.0's on the same day
 `20261114-*-prefill-v050-s*.json`). Notes:
 
 - NInfer sizes its memory from what `cudaMemGetInfo` reports free minus a 1 GiB margin. Under WSL2 that leaves
@@ -245,21 +252,29 @@ The runs are [results/](results/) `20261027-*-pl575-*.json` and `20261027-*-pl40
 
 Teacher forcing over 13 prompts, 35,328 positions (Japanese and English prose, Python and C++; `bench/golden/`).
 Each recording keeps the top-20 next-token distribution at every position; two recordings are compared by top-1
-agreement and KL divergence ([results/20261011-pr2-golden-v2.json](results/20261011-pr2-golden-v2.json)).
+agreement and KL divergence. The NVFP4 lm_head takes its activations in two terms since 2026-11-23 (W4A4x2; one
+term before, still `Q27_LM_HEAD_A4X2=0`): [results/20261123-pq21-lm-head.json](results/20261123-pq21-lm-head.json).
 
-| Compared | Top-1 agreement | KL |
-| --- | ---: | ---: |
-| Reference model, KV bf16 vs KV fp8 (the noise floor of W4A4 rounding) | 89.1% | 0.0359 |
-| Engine vs reference model (NVIDIA's checkpoint, KV bf16) | 89.3% | 0.0363 |
-| NVIDIA's checkpoint vs the BF16 original (reference model) | 88.7% | 0.0361 |
-| Engine, default (`gdnfp4`, KV nvfp4) vs the BF16 original | 87.4% | 0.0470 |
-| Engine, `gdnfp4`, KV fp8 vs the BF16 original | 87.6% | 0.0445 |
-| Engine, `nvidia`, KV fp8 vs the BF16 original | 88.7% | 0.0362 |
-| Engine, `quasar`, KV fp8 vs the BF16 original | 87.2% | 0.0475 |
+| Compared | Top-1, two terms (default) | KL | Top-1, one term | KL |
+| --- | ---: | ---: | ---: | ---: |
+| Engine vs reference model (NVIDIA's checkpoint, KV bf16) | 90.8% | 0.0278 | 89.2% | 0.0366 |
+| NVIDIA's checkpoint vs the BF16 original (reference model) | 89.8% | 0.0322 | 88.7% | 0.0361 |
+| Engine, default (`gdnfp4`, KV nvfp4) vs the BF16 original | 87.9% | 0.0426 | 87.1% | 0.0467 |
+| Engine, `nvidia`, KV nvfp4 vs the BF16 original | 89.4% | 0.0343 | 88.2% | 0.0383 |
+| Engine, `quasar`, KV nvfp4 vs the BF16 original | 87.7% | 0.0462 | 86.8% | 0.0500 |
 
-The engine is as far from the reference model as the reference model is from itself with another KV cache type, so
-the kernels compute the model correctly; what remains against the BF16 original is the quantization of the weights
-and the KV cache.
+The noise floor of W4A4 rounding, the reference model with a BF16 against an FP8 KV cache, is 89.1% / 0.0359 (one
+term). With the FP8 KV cache, measured on 2026-10-11 with one term
+([results/20261011-pr2-golden-v2.json](results/20261011-pr2-golden-v2.json)): `gdnfp4` 87.6% / 0.0445, `nvidia`
+88.7% / 0.0362 and `quasar` 87.2% / 0.0475 against the BF16 original.
+
+The engine is no further from the reference model than the reference model is from itself with another KV cache
+type, so the kernels compute the model correctly; what remains against the BF16 original is the quantization of the
+weights, the activations and the KV cache.
+
+**code-cpp overlaps `gdnfp4`'s calibration text** (83.7% of code-cpp-4096 in runs of 32 tokens), which flatters
+`gdnfp4` against the other checkpoints. Without code-cpp (30,592 positions) the default is at 87.1% / 0.0445 and
+`nvidia` at 88.8% / 0.0351.
 
 ### Tasks
 
@@ -267,21 +282,24 @@ The default configuration through the server (thinking off, greedy unless noted)
 
 | Task | Result | Script |
 | --- | --- | --- |
-| GSM8K (300 fixed questions) | 95.3% | `quality_gsm8k.py` |
-| BFCL v3 non-live AST (simple, multiple, parallel, parallel_multiple; 1,000 questions) | 88.9% | `quality_tools.py` |
+| GSM8K (300 fixed questions) | 95.0% | `quality_gsm8k.py` |
+| BFCL v3 non-live AST (simple, multiple, parallel, parallel_multiple; 1,000 questions) | 89.0% | `quality_tools.py` |
 | Needle retrieval, 16 facts at 190K tokens | 16 / 16 | `needle_test.py --tokens 190000 --needles 16` |
-| Needle retrieval, 16 facts at 256K tokens, seeds 0–3 | 56 / 64 | `needle_test.py --tokens 256000 --needles 16 --seed N` |
-| Japanese: reading (JSQuAD), translation both ways (FLORES-200), summarization (XL-Sum), LLM-judged | same as KV fp8 within the confidence intervals | `quality_ja.py` |
+| Needle retrieval, 16 facts at 256K tokens, seeds 0–3 | 58 / 64 | `needle_test.py --tokens 256000 --needles 16 --seed N` |
+| Japanese: reading (JSQuAD), translation both ways (FLORES-200), summarization (XL-Sum), LLM-judged | 100 / 96.8 / 92.0 / 100 of 100, none worse than with the one-term lm_head | `quality_ja.py` |
 | Synthetic image questions (70, exact answers) | 67 / 70 (vLLM 70) | `vision_quality.py` |
 
 Notes:
 
+- GSM8K, BFCL, needle retrieval and the Japanese set are from 2026-11-23, with the two-term lm_head; the one-term
+  one on the same build got 94.7%, 89.4%, the same needles and 100 / 96.5 / 91.0 / 98.8
+  ([results/20261123-pq21-lm-head.json](results/20261123-pq21-lm-head.json), [decisions.md](decisions.md#weights)).
 - The NVFP4 KV cache costs parallel tool calls on short prompts: over BFCL's parallel categories (400 questions,
   temperature 0.7, three seeds) it gets 11 fewer right than the FP8 KV cache, nearly all by stopping a parallel
   call list early. After an agent's 32K- or 96K-token history (`quality_tools.py --context`) the difference is gone
   (-4 and +2 questions), which is how agents use the server. `KV_DTYPE=fp8` trades 42% of the KV capacity for it.
-- The image questions were measured with NVIDIA's weights; the three misses are close counting questions that the
-  reference model gets wrong the same way.
+- The image questions were measured with NVIDIA's weights and the one-term lm_head; the three misses are close
+  counting questions that the reference model gets wrong the same way.
 - The evaluation data is downloaded on first use into `bench/quality-data/` (pinned revisions). XL-Sum is
   CC BY-NC-SA 4.0 and is not redistributed here.
 
