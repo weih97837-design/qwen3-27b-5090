@@ -197,6 +197,9 @@ tr.act td { background: var(--wash); }
 .brk { display: none; }
 .nar { display: none; }
 .slot .kv b { white-space: nowrap; }
+#trace-body a { color: var(--s1); font-size: 13px; }
+#trace-body .kv { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+#trace-body .kv div:nth-child(2) b { white-space: nowrap; }
 @media (max-width: 600px) {
   .wid { display: none; }
   .nar { display: inline; }
@@ -357,6 +360,13 @@ tr.act td { background: var(--wash); }
       <h2 style="margin:0">部署與硬體</h2>
     </div>
     <div id="deploy-body"></div>
+  </section>
+
+  <section class="card" id="trace-sec" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">追蹤檔</h2>
+    </div>
+    <div id="trace-body"></div>
   </section>
 
   <section class="card">
@@ -824,6 +834,28 @@ const fmtUptime = (s) => {
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
   return d ? `${d} 天 ${h} 小時` : h ? `${h} 小時 ${m} 分鐘` : `${m} 分鐘 ${Math.floor(s % 60)} 秒`;
 };
+// Request trace files (GET /admin/trace; hidden unless REQUEST_TRACE is set and REQUEST_TRACE_HTTP is not 0)
+let traceInfo = null;
+async function loadTrace() {
+  try { const r = await fetch("/admin/trace", { cache: "no-store" }); const j = r.ok ? await r.json() : null; traceInfo = j && j.enabled ? j : null; }
+  catch (e) { traceInfo = null; }
+  drawTrace();
+}
+function drawTrace() {
+  const t = traceInfo, sec = $("trace-sec"), body = $("trace-body");
+  if (!t || !Array.isArray(t.files)) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const newest = t.files.length ? t.files[t.files.length - 1] : null;
+  const MiB = 1048576, mib = (b) => b == null ? "–" : (b / MiB).toFixed(b >= 10 * MiB ? 0 : 1) + " MiB";
+  body.replaceChildren(
+    el("div", { class: "kv" },
+      kvRow("檔案數", String(t.files.length)),
+      kvRow("總大小", `${mib(t.total_bytes)} / ${mib(t.max_bytes)}`),
+      kvRow("最新檔", newest ? wbrText(newest.name) : "–")),
+    el("div", { class: "row", style: "margin-top:10px;gap:6px 16px;flex-wrap:wrap" },
+      el("a", { href: "/admin/trace", target: "_blank", rel: "noopener" }, "檔案清單（JSON）"),
+      el("a", { href: "/admin/trace/all", download: "trace-all.jsonl" }, "下載全部（/admin/trace/all）")));
+}
 const f2 = (v) => v == null ? "–" : v.toFixed(2);
 const fmtSetting = (v) => v == null ? "–" : typeof v === "number" ? v.toLocaleString() : typeof v === "boolean" ? (v ? "是" : "否") : String(v);
 
@@ -1438,6 +1470,8 @@ buildCharts();
 loadLaunch(true);
 loadUiState();
 setInterval(loadUiState, 10000);
+loadTrace();
+setInterval(loadTrace, 15000);
 try { if (localStorage.getItem("q27-launch-open")) showLaunch(true); } catch (e) { /* (no storage) */ }
 connect();
 </script>

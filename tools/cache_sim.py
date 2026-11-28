@@ -52,8 +52,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "frontend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache_policy as cp  # noqa: E402
+import trace_io  # noqa: E402  (a file path or an http(s):// URL such as http://HOST:8080/admin/trace/all)
 
 BLOCK = 256
 CHUNK_BLOCKS = 16           # 4096-token chunks (chunk_store.h kChunkPages * 64)
@@ -755,7 +757,7 @@ def load(paths):
     """The events of trace files in time order: (ts, 0, req) and (ts, 1, done) (a done without its req is ignored)."""
     reqs, dones = {}, {}
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with trace_io.open_lines(p) as f:
             for line in f:
                 try:
                     r = json.loads(line)
@@ -807,7 +809,10 @@ def main(argv=None):
                     "nosup (no superseded factor), noleaf (no leaf-first)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    events = load(a.files)
+    try:
+        events = load(a.files)
+    except trace_io.TraceSourceError as e:
+        sys.exit(f"cache_sim: {e}")
     params = cp.SmartParams.from_env(os.environ)
     rows = []
     for pol in a.policy.split(","):
