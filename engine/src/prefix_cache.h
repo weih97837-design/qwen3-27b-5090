@@ -176,6 +176,8 @@ struct SpillStats {
   // Restores by where the entry was: in memory / only on the SSD (also counted in `restored`). The reuse rate of a tier is these
   // over the entries it received (spilled / written).
   int64_t restored_ram = 0, restored_disk = 0;
+  // spill_restore_begin's refusals (the frontend's restore-decision counters): busy, no room (spill_room), dropped: a chunk file is missing
+  int64_t restore_refused_busy = 0, restore_refused_room = 0, restore_dropped_missing = 0;
 };
 
 struct CacheStats {

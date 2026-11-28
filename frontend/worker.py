@@ -76,6 +76,20 @@ RESTORE_BW_SMOOTH = 0.3         # weight of a new measurement
 PREFILL_TPS_DEFAULT = 8000.0
 PREFILL_TPS_SMOOTH = 0.2        # weight of a new prefill chunk's speed
 RESTORE_POLL_S = 0.005          # the loop's wait for a message while only restores are pending
+# Restore decisions (q27:restore_decisions_total{tier,outcome}, the stats snapshot's "restore_decisions", the trace's req.restore;
+# docs/tiered-cache.md "還原決策計數"). tier: where the matched entry is ("ram" / "ssd"), "none" when there is no entry.
+#   per check (maybe_restore, once per stay in the queue): matched, then exactly one of the decisions below (matched == their sum)
+#   per started restore (its record): restored, failed or timed_out (started == their sum + those still loading)
+#   at the first prefix_begin: sync_restored (prefix_begin itself promoted a tier entry: no async restore was waited for)
+RESTORE_DECISIONS = ("started", "joined", "not_worth_loading", "no_kv_room", "spill_room_refused", "skipped_busy", "chunk_missing",
+                     "damaged", "begin_refused", "lookup_failed")
+RESTORE_ENDS = ("restored", "failed", "timed_out")
+RESTORE_OUTCOMES = ("matched",) + RESTORE_DECISIONS + RESTORE_ENDS + ("sync_restored",)
+RESTORE_NONE_OUTCOMES = ("no_match", "not_checked", "lookup_failed")  # tier "none": no entry / the request was never checked
+RESTORE_TIERS = ("ram", "ssd")
+# The engine's spill_restore_begin refusal counters (spill_stats) -> the decision they mean (a begin that returned 0; checked in order)
+RESTORE_REFUSALS = (("restore_refused_room", "spill_room_refused"), ("restore_refused_busy", "skipped_busy"),
+                    ("restore_dropped_missing", "chunk_missing"), ("restore_failed", "damaged"))
 
 
 ENGINE_TIME_KINDS = ("prefill", "decode", "restore", "spill", "media", "idle", "other")
@@ -230,6 +244,8 @@ class Seq:
         self.restore_id = None   # the spilled entry whose restore it waited for (engine.spill_release after begin)
         self.restore_pos = 0     # tokens of its prompt that entry covers (their pages are counted in its need, not as room)
         self.trace_src = None    # where its async restore loaded from ("ram" / "ssd"; the request trace)
+        self.restore_outcome = None  # the last restore decision for it (RESTORE_OUTCOMES / RESTORE_NONE_OUTCOMES; the trace's req.restore)
+        self.restore_tier = None     # the tier of the entry that decision was about ("ram" / "ssd"; None: no entry)
         self.no_sync = False     # recompute chosen over loading: prefix_begin must not promote a spilled match itself
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
@@ -322,6 +338,8 @@ class Scheduler:
     restore_completed = 0  # restores a poll saw end (any outcome; _guarded retries a KvFull turn when it grew)
     last_restore_poll = 0.0
     last_poll_error = 0.0  # (monotonic) when a failing restore poll was last logged
+    restore_counts = None  # (tier, outcome) -> n: the restore decisions (note_restore)
+    restore_not_worth = None  # tier -> {"n", "bytes", "load_s", "recompute_s", "last"}: the numbers of the not_worth_loading ones
 
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
@@ -886,20 +904,27 @@ class Scheduler:
         if s.restore_checked:
             return False
         s.restore_checked = True
+        tier = "none"  # (the counters: where the matched entry is, once known)
         try:
             m = self.engine.spill_match(s.eng_ids, self.spec)
             if m is None:
+                self.note_restore("none", "no_match", s)
                 return False
+            tier = "ssd" if m.get("on_disk") else "ram"
+            self.note_restore(tier, "matched")
             rec = self.restores.get(m["id"])
             if rec is not None:  # (another request already waits for this entry; a late one is still loading: not waited for)
                 if rec["late"]:
+                    self.note_restore(tier, "skipped_busy", s)
                     return False
                 rec["seqs"].append(s)
                 s.restoring, s.restore_id, s.restore_pos = rec, rec["id"], m["pos"]
                 s.trace_src = "ssd" if rec["on_disk"] else "ram"
+                self.note_restore(tier, "joined", s)
                 return True
             if not self.worth_loading(m):
                 s.no_sync = True
+                self.note_not_worth(tier, m, s)
                 log(f"{s.rid}: spilled checkpoint of {m['pos']} tokens not loaded (load ~{self.est_load_s(m):.2f} s, "
                     f"recompute ~{self.est_recompute_s(m['pos']):.2f} s)")
                 return False
@@ -907,15 +932,20 @@ class Scheduler:
             # request is admitted as usual and prefix_begin recomputes or promotes as it did without delay hits)
             self.release_finished_cur()  # (its pages count as free below)
             if not self.kv_room(s, cached=m["pos"], extra=-(-m["pos"] // PAGE)):
+                self.note_restore(tier, "no_kv_room", s)
                 log(f"{s.rid}: spilled checkpoint of {m['pos']} tokens not loaded (the KV pool has no room for it)")
                 return False
+            before = self.refusal_counts()
             if not self.engine.spill_restore_begin(m["id"]):
+                self.note_restore(tier, self.refusal_of(before), s)
                 return False
         except Exception as e:  # noqa: BLE001 - delay hits are an optimisation: the request takes the synchronous path
+            self.note_restore(tier, "lookup_failed", s)
             log(f"{s.rid}: spilled checkpoint lookup failed ({e})")
             return False
+        self.note_restore(tier, "started", s)
         rec = {"id": m["id"], "t0": time.time(), "bytes": m["bytes"], "on_disk": m["on_disk"], "pos": m["pos"],
-               "seqs": [s], "late": False}
+               "seqs": [s], "late": False, "tier": tier, "ended": False}
         self.restores[m["id"]] = rec
         s.restoring, s.restore_id, s.restore_pos = rec, m["id"], m["pos"]
         s.trace_src = "ssd" if rec["on_disk"] else "ram"
@@ -924,6 +954,85 @@ class Scheduler:
             f"{'SSD' if m['on_disk'] else 'RAM'}, ~{self.est_load_s(m):.2f} s vs ~{self.est_recompute_s(m['pos']):.2f} s to compute)")
         self.send("event", s.rid, "restore", f"loading a cached prefix of {m['pos']} tokens in the background")
         return True
+
+    # ------------------------------------------------------------ restore-decision counters (no effect on the decisions)
+
+    def note_restore(self, tier, outcome, s=None):
+        """Counts one restore decision (RESTORE_OUTCOMES; tier "none": RESTORE_NONE_OUTCOMES) and, with s, keeps it as the request's
+        (the trace's req.restore / restore_tier). Never raises: the counters must not change what the scheduler does."""
+        try:
+            if self.restore_counts is None:
+                self.restore_counts = collections.Counter()
+            self.restore_counts[(tier, outcome)] += 1
+            self.m[f'q27:restore_decisions_total{{tier="{tier}",outcome="{outcome}"}}'] += 1
+            if s is not None:
+                s.restore_outcome, s.restore_tier = outcome, (tier if tier in RESTORE_TIERS else None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def note_not_worth(self, tier, m, s):
+        """A match judged not worth loading: counted, with its numbers (bytes, estimated load / recompute seconds, the bandwidth the
+        estimate used) summed per tier and kept as the last ones."""
+        self.note_restore(tier, "not_worth_loading", s)
+        try:
+            if self.restore_not_worth is None:
+                self.restore_not_worth = {}
+            load, recompute = self.est_load_s(m), self.est_recompute_s(m["pos"])
+            w = self.restore_not_worth.setdefault(tier, {"n": 0, "bytes": 0, "load_s": 0.0, "recompute_s": 0.0, "last": None})
+            w["n"] += 1
+            w["bytes"] += int(m["bytes"])
+            w["load_s"] += load
+            w["recompute_s"] += recompute
+            w["last"] = {"tokens": m["pos"], "bytes": int(m["bytes"]), "load_s": load, "recompute_s": recompute,
+                         "bandwidth": self.bandwidth(m.get("on_disk")), "prefill_tps": self.prefill_tps or PREFILL_TPS_DEFAULT}
+            self.m[f'q27:restore_not_worth_bytes_total{{tier="{tier}"}}'] += int(m["bytes"])
+            self.m[f'q27:restore_not_worth_load_seconds_total{{tier="{tier}"}}'] += load
+            self.m[f'q27:restore_not_worth_recompute_seconds_total{{tier="{tier}"}}'] += recompute
+        except Exception:  # noqa: BLE001
+            pass
+
+    def refusal_counts(self):
+        """The engine's spill_restore_begin refusal counters (RESTORE_REFUSALS) before a begin, or None (an engine without them)."""
+        try:
+            sp = self.engine.spill_stats()
+            return {k: sp[k] for k, _ in RESTORE_REFUSALS} if all(k in sp for k, _ in RESTORE_REFUSALS) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def refusal_of(self, before):
+        """Why a spill_restore_begin returned 0: the first of its counters that moved since `before` (nothing else moves them between the
+        two reads: the poll is not called in between), else "begin_refused" (out of memory, no file, an engine without the counters)."""
+        after = self.refusal_counts() if before is not None else None
+        if after is not None:
+            for key, outcome in RESTORE_REFUSALS:
+                if after[key] > before[key]:
+                    return outcome
+        return "begin_refused"
+
+    def restore_ended(self, rec, outcome):
+        """A started restore's end (RESTORE_ENDS), counted once per record (a timed-out one that the poll sees end later is not
+        counted again); the requests that still wait for it get it as their outcome."""
+        if rec.get("ended", True):
+            return
+        rec["ended"] = True
+        self.note_restore(rec.get("tier") or ("ssd" if rec.get("on_disk") else "ram"), outcome)
+        for q in rec.get("seqs", ()):
+            if getattr(q, "restoring", None) is rec:
+                q.restore_outcome = outcome
+
+    def restore_decisions(self):
+        """The stats snapshot's "restore_decisions": per tier the count of each outcome, and the not_worth_loading numbers."""
+        counts = {}
+        for (tier, outcome), n in (self.restore_counts or {}).items():
+            counts.setdefault(tier, {})[outcome] = n
+        return {"counts": counts, "not_worth": {t: dict(w) for t, w in (self.restore_not_worth or {}).items()},
+                "outcomes": list(RESTORE_OUTCOMES), "none_outcomes": list(RESTORE_NONE_OUTCOMES)}
+
+    def tiers_with_decisions(self, block):
+        """The tiers block with the restore decisions in it (the status page's tier panel reads them there)."""
+        if isinstance(block, dict) and "error" not in block:
+            block["restore_decisions"] = self.restore_decisions()
+        return block
 
     def release_finished_cur(self):
         """A finished request (its output complete, its end checkpoint saved by finish) still holds the pages of its
@@ -1009,11 +1118,13 @@ class Scheduler:
                 old = self.restore_bw.get(kind)
                 self.restore_bw[kind] = bw if old is None else (1 - RESTORE_BW_SMOOTH) * old + RESTORE_BW_SMOOTH * bw
             log(f"restore of {rec['pos']} tokens ended after {dt:.2f} s" + ("" if ok else " (failed)"))
+            self.restore_ended(rec, "restored" if ok else "failed")
             freed += self.release(rec, "done")
         for rec in self.restores.values():
             if not rec["late"] and now - rec["t0"] > RESTORE_TIMEOUT_S:
                 rec["late"] = True  # (the engine goes on loading it; nobody waits for it any more)
                 self.m["q27:restore_timeouts_total"] += 1
+                self.restore_ended(rec, "timed_out")
                 log(f"restore of {rec['pos']} tokens took over {RESTORE_TIMEOUT_S:.0f} s: its requests start without it")
                 freed += self.release(rec, "timeout")
                 self.engine_release(rec["id"])  # (its checkpoint must not stay held for nobody)
@@ -1341,7 +1452,7 @@ class Scheduler:
                 self.tiers.note_agent(s.agent, agents.owner_id(s.agent))
         tr = time.perf_counter()
         restored0 = self.restored_count()
-        split0 = self.trace_split() if self.trace is not None and s.cached is None else None
+        split0 = self.trace_split() if s.cached is None else None  # (the trace and the sync_restored counter)
         try:
             cached = self.engine.prefix_begin(s.eng_ids, at=s.at, spec=self.spec)
         finally:
@@ -1379,8 +1490,14 @@ class Scheduler:
                 _, old_after = self.text_around(list(old_ids), min(i, 16))
                 log(f"{s.rid}: diverges from its best earlier sequence at token {i} (prompt {len(s.prompt)}, history "
                     f"{len(div[1]) // 4}); before: {before!r}; history after: {old_after!r}; prompt after: {new_after!r}")
+            restored_from = self.trace_restored_from(s, split0)
+            if self.tiers is not None:
+                if not s.restore_checked:  # (no restore check in this stay in the queue: delay hits off, or not looked at)
+                    self.note_restore("none", "not_checked", s)
+                if restored_from is not None and s.trace_src is None:  # (prefix_begin promoted an entry itself)
+                    self.note_restore(restored_from, "sync_restored")
             if self.trace is not None:
-                self.trace.request(s, self.trace_restored_from(s, split0))
+                self.trace.request(s, restored_from)
             self.send("start", s.rid, {"cached": cached})
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
@@ -1394,7 +1511,7 @@ class Scheduler:
                 """The image's pixels, or the video's frames from its pair g on."""
                 nonlocal waited
                 t1, f = time.time(), s.decoding.pop(key, None)
-                loan = -1
+                loan, lost = -1, False
                 try:
                     if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
                         out = f.result()
@@ -1403,12 +1520,16 @@ class Scheduler:
                         f.cancel()
                     sessions, loan = self.lend(s, key, g)
                     return self.decode(s, key, sessions, g)
-                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                except Exception as e:  # noqa: BLE001 - any decoder error is the client's, but a lost CUDA context
+                    if getattr(e, "device_lost", False):  # (videoproc.DeviceLost: the process ends, the server's 503)
+                        lost = True
+                        raise
                     raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
                 finally:
-                    if loan >= 0:
-                        self.engine.kv_unlend(loan)
-                    self.unlend()
+                    if not lost:  # (on a dead context the return would fail and hide the decode's error)
+                        if loan >= 0:
+                            self.engine.kv_unlend(loan)
+                        self.unlend()
                     waited += time.time() - t1
 
             i, frames = 0, {}
@@ -1735,6 +1856,10 @@ class Scheduler:
             for key in ("logical_bytes", "physical_bytes", "chunks", "chunk_hits", "chunk_misses", "dedup_saved_bytes"):
                 if key in sp:  # (RAM dedup: an older engine does not report them)
                     out[f"q27:tier_ram_{key}"] = sp[key]
+            for key in ("ssd_gate_rejected", "ssd_gate_rejected_short", "ssd_gate_rejected_watermark", "ssd_gate_checked",
+                        "restore_refused_busy", "restore_refused_room", "restore_dropped_missing"):
+                if key in sp:  # (the SSD gate / restore refusals: an older engine does not report them)
+                    out[f"q27:tier_{key}"] = sp[key]
             for key in ("ssd_logical_bytes", "ssd_physical_bytes"):
                 if ts.get(key) is not None:  # (SSD dedup: an older engine keeps flat files and has no such figures)
                     out[f"q27:tier_{key}"] = ts[key]
@@ -1783,7 +1908,8 @@ class Scheduler:
                 "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
                 "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"],
                 "slots": slot_rows(lanes, self.engine_seqs, target=self.max_seqs, last_lanes=self.slot_lanes),
-                "tiers": tiers_block(self.engine, getattr(self, "tiers", None)),
+                "tiers": self.tiers_with_decisions(tiers_block(self.engine, getattr(self, "tiers", None))),
+                "restore_decisions": self.restore_decisions(),
                 "agents": agents_block(seqs, self.__dict__.get("agent_totals", {}),
                                        getattr(getattr(self, "tiers", None), "agent_rows", None)),
                 "clients": clients_block(seqs, self.__dict__.get("client_totals", {}), now),

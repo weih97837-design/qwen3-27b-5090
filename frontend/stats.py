@@ -366,6 +366,11 @@ def tiers_block(engine, tiers, environ=None):
                 "ssd_reuse_rate": _rate(sp.get("restored_disk"), sp["written"]),
                 "fair_agents": ts.get("fair_agents"), "ssd_skipped_superseded": ts.get("ssd_skipped_superseded", 0),
                 "expired": ts.get("expired", 0), "not_written": ts.get("not_written", 0),
+                # the SSD gate (engine/src/ssd_gate.h): RAM-cap victims the engine rejected BEFORE writing them (None: an engine without it)
+                "ssd_gate_on": sp.get("ssd_gate_on"), "ssd_gate_rejected": sp.get("ssd_gate_rejected"),
+                "ssd_gate_rejected_short": sp.get("ssd_gate_rejected_short"),
+                "ssd_gate_rejected_watermark": sp.get("ssd_gate_rejected_watermark"), "ssd_gate_checked": sp.get("ssd_gate_checked"),
+                "ssd_gate": ts.get("ssd_gate"),
                 # CACHE_POLICY (legacy / smart) and, under smart, its counters per tier (ram / vram: the engine's; ssd: the policy's)
                 **cache_policy.status_block(sp, ts),
                 "last_error": ts.get("last_error"), "retention_s": getattr(tiers, "ram_retention_s", None),

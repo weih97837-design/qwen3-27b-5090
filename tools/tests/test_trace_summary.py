@@ -93,3 +93,15 @@ def test_anchor_section_skipped_for_older_traces():
     s = ts.summarize([req(0, "a", 1000, 0, 0)])
     assert s["anchors"] is None
     assert "no new_anchors" in ts.render(s)
+
+
+def test_restore_decisions_line():
+    reqs = [req(0, "a", 20000, 0, 0), req(1, "a", 21000, 0, 20000), req(2, "b", 9000, 0, 9000), req(3, "c", 30000, 0, 11000)]
+    reqs[0].update(restore="not_worth_loading", restore_tier="ssd")
+    reqs[1].update(restore="restored", restore_tier="ram")
+    reqs[2].update(restore="not_worth_loading", restore_tier="ssd")
+    reqs[3].update(restore="no_match", restore_tier=None)
+    s = ts.summarize(reqs)
+    assert s["restore_decisions"] == {"ssd not_worth_loading": 2, "none no_match": 1, "ram restored": 1}
+    assert "restore decisions (tier outcome: requests): ssd not_worth_loading: 2  none no_match: 1  ram restored: 1" in ts.render(s)
+    assert "restore_decisions" not in ts.summarize([req(0, "a", 1, 0, 0)])  # (a trace written before the fields)

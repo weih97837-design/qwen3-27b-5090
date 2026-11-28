@@ -437,8 +437,9 @@ GreedyDual 順序（綜合 SGLang 的 StateCost、Marconi 的效用與 vLLM／TR
   RAM→SSD（引擎與 tick）不再因 `superseded_durable` 而丟棄；`flush()` 也照寫。
 - **沒有**依 agent 的步驟、冷 agent 步驟、「用量最多者先」（`SPILL_FAIR_AGENTS`、`SPILL_COLD_FIRST`、`SPILL_COLD_AFTER_S` 在 smart 下不作用）。
 - **SSD 准入**取代 `SPILL_SSD_WARM_ONLY`／`SPILL_PROBATION_GIB`（smart 下不作用）：entry 只有在它在 SSD 的 priority（stamp 取 SSD 水位在它最後使用時的值、位元組取它寫入時新增的
-  `new_disk_bytes`）**高於 SSD 目前的水位 L** 時才寫入（低於 L 就會是下一個 victim）；SSD 還沒淘汰過（L = 0）時一律寫入。tick 在寫入前檢查；引擎在 RAM 滿時自己寫出的 entry，
-  在 tick 第一次看到它在 SSD 時檢查，不合格就刪除。計數器 `ssd_not_admitted`。`SPILL_SSD_MIN_TOKENS` 與規則 A（`SPILL_UNUSED_TTL_S`）照舊。
+  `new_disk_bytes`）**高於 SSD 目前的水位 L** 時才寫入（低於 L 就會是下一個 victim）；SSD 還沒淘汰過（L = 0）時一律寫入。tick 在寫入前檢查；引擎在 RAM 滿時自己寫出的 victim
+  現在也在**寫入前**由引擎用同一條規則檢查（見下方「SSD 寫入前的准入（引擎端）」），不合格就直接丟棄、不寫入（計數器 `ssd_gate_rejected`）。
+  tick 第一次看到 SSD 上的新 entry 時仍會再檢查一次（安全網：較舊的引擎、或兩次 tick 之間水位變了），不合格就刪除，計數器 `ssd_not_admitted`。`SPILL_SSD_MIN_TOKENS` 與規則 A（`SPILL_UNUSED_TTL_S`）照舊。
 - 閒置備份（VRAM 還有原件）仍然先於唯一副本被丟（與 `choose_victim` 相同的類別規則，含「4 倍」例外）；丟備份不移動 RAM 水位（沒有損失）。
 
 **常數**（都可用環境變數調整；`compose.yaml`、`scripts/windows/settings.example.ini`、`docs/configuration.md` 有列出）：
@@ -557,6 +558,77 @@ python tools/cache_sim_gen.py synth.jsonl --workload diverging --churn 0.08     
 傳給每個引擎行程（driver 也會清掉環境裡繼承來的 `CACHE_*`）。預設的 `test.cmd` 因此涵蓋 **smart**；情境 k（保留）檢查的是當下策略的行為，沒有指定 `--cache-policy` 時**跑兩次，smart 與 legacy 各一次**，
 所以兩套檢查都有覆蓋（smart 版 driver 會設 `CACHE_MIN_RESIDENT_S=0`，否則情境裡的 entry 都只有幾秒、全部算新進）；`test.cmd --cache-policy legacy` 則用舊規則跑全部情境。
 Windows：`test.cmd --scenarios k` 或 `test.cmd --cache-policy legacy`。環境裡的 `CACHE_POLICY` 等同於這個選項。
+
+## SSD 寫入前的准入（引擎端）
+
+**問題**：RAM 層滿時，引擎的 `spill_enforce_ram` 會把 victim 直接 `spill_write` 到 SSD，沒有檢查 `SPILL_SSD_MIN_TOKENS`、也沒有 smart 的 SSD 准入。
+frontend 要等到下一次 tick 才判斷，不合格再刪掉。實機（`CACHE_POLICY=smart`、SSD 層開）：寫入 SSD 3,333 筆，只有 1 筆被還原；`ssd_not_admitted` 2,674 筆，
+也就是約 80% 的寫入是「先寫、後判、再刪」，白白消耗 SSD 壽命與 I/O。
+
+**現在**：frontend 的 `TierPolicy` 在 `start()`、每次 `tick()` 結束（`make_room` 之後）與 `flush()` 之後，用新的 C API 把它的 SSD 准入狀態推給引擎：
+
+```c
+int q27_spill_set_ssd_gate(void* m, int on, int64_t min_tokens, double watermark, double floor,
+                           const uint64_t* clocks, const double* values, int n);
+```
+
+（Python：`Engine.spill_set_ssd_gate(on, min_tokens, watermark, floor, clocks, values)`；`on=0` 關閉。）引擎在 `spill_enforce_ram` 寫出唯一副本的 victim **之前**
+用 `engine/src/ssd_gate.h` 的 `SsdGate::verdict` 判斷：
+
+1. token 數 < `min_tokens`（`SPILL_SSD_MIN_TOKENS`，0 = 不限）→ 拒收（`short`）。legacy 與 smart 都適用。
+2. 引擎是 `CACHE_POLICY=smart` 且水位 L > 0：priority = stamp_at(last_use) + smart_value(entry) ≤ L → 拒收（`watermark`）。
+   輸入與 tiercache 的 tick 路徑相同：深度 = token 數；parent 深度、junction 取自所有可見節點的鏈（同 `spill_meta` 的 `parent_pos`／`junction`）；hits；
+   superseded（`spill_meta` 的一般旗標）；位元組 = 現在寫入要新增的 `new_disk_bytes`（`spill_new_disk`）；stamp 用 frontend 推送的 SSD 水位紀錄（`GdTier` 的 floor／clocks／values，
+   與 `GdTier::stamp_at` 相同語意）。L ≤ 0（SSD 還沒淘汰過）不做水位檢查。
+3. 其他 → 照舊寫入。
+
+被拒收的 victim 走既有的丟棄路徑（`spill_erase`，也計入 `dropped`），**不會寫入 SSD**。`frontend/cache_policy.py` 的 `ssd_verdict` 是同一條規則的 Python 版，
+`frontend/tests/test_cache_policy.py` 用 `engine/tests/smart_policy_cli.cc` 的 `admit` 指令比對兩邊；`frontend/tests/test_ssd_gate.py` 驗證推送的值與 `TierPolicy`
+自己的判斷（`_short`、`_smart_admit`）一致。
+
+- **預設等於舊行為**：引擎沒被推送過（較舊的 frontend）時 gate 為關閉，RAM 滿時照舊全部寫出；較舊的引擎沒有這個 API 時 frontend 不推送，照舊事後判斷。
+- **SSD 層關閉**（`SPILL_SSD_GIB=0` 或沒有 `SPILL_DIR`）時不推送（引擎本來就直接丟棄）。
+- **`SPILL_SSD_WARM_ONLY`／`SPILL_PROBATION_GIB`（legacy）仍只在 frontend**：它們需要跨層的 agent hits 與 frontend 才知道的 `auto:` owner，沒有推給引擎；
+  開啟時仍是事後刪除（`not_written`）。
+- frontend 的事後檢查（`_admit_fresh`、probation）保留為安全網，計數方式不變。兩次 tick 之間 SSD 水位若上升，引擎用的是上一次推送的值，可能多寫入幾筆，下一次 tick 再刪。
+- **行為改變**（legacy 與 smart 都是）：RAM 滿時短於 `SPILL_SSD_MIN_TOKENS` 的唯一副本 victim 以前會被引擎寫入 SSD（之後一直留著：tick 的 `_short` 只檢查 RAM entry，
+  smart 的事後檢查只看水位），現在直接丟棄，不會以任何路徑進入 SSD（包括 16K–32K 的共用前綴）。
+
+**計數器**（`spill_stats` 第 41–45 個值；`/stats` tiers 區塊；狀態頁分層快取面板的「SSD 寫入前拒收」）：
+`ssd_gate_on`（1 = 已推送且開啟）、`ssd_gate_rejected`（全部拒收）、`ssd_gate_rejected_short`、`ssd_gate_rejected_watermark`、`ssd_gate_checked`（gate 判斷過的 victim 數 = 准入 + 拒收；准入後 `spill_write` 失敗者仍會被丟棄，`written` 另外也含 tick 的寫出，所以 `written` 不等於 准入數）。
+`/metrics`：`q27:tier_ssd_gate_rejected`、`q27:tier_ssd_gate_rejected_short`、`q27:tier_ssd_gate_rejected_watermark`、`q27:tier_ssd_gate_checked`。
+`TierPolicy.status()` 的 `ssd_gate` 是最後一次推送的值（`min_tokens`、`watermark`、`steps`、`smart`；沒有推送時為 `null`）。
+
+## 還原決策計數
+
+以前只看得到「載回了幾筆」，分不出 SSD entry 沒被載回是「沒找到」、「找到但判斷不值得」還是「引擎拒絕」。現在 `worker.py` 在還原路徑的每個分支計數（只計數，不改變任何決策；
+計數本身出錯也不影響排程）。`tier` 是找到的 entry 所在層（`ram`／`ssd`），沒有 entry 時為 `none`。
+
+| outcome | 何時 |
+|---|---|
+| `matched` | `maybe_restore` 的 `spill_match` 找到 entry（每次排隊只看一次；被搶佔重新排隊後再看一次） |
+| `started` | `spill_restore_begin` 開始背景載回 |
+| `joined` | 另一個請求已在等同一個 entry 的載回，共用它 |
+| `not_worth_loading` | 估計載入時間 ≥ 0.8 × 重算時間（設 `no_sync`）；另外累計位元組、估計載入秒數、估計重算秒數，並保留最近一次的值（含使用的頻寬與 prefill 速度） |
+| `no_kv_room` | `kv_room` 判斷 KV 池放不下載回的頁 |
+| `spill_room_refused` | 引擎 `spill_restore_begin` 拒絕：`spill_room` 不足（引擎計數器 `restore_refused_room`） |
+| `skipped_busy` | entry 正在載回但已逾時沒人等（frontend），或引擎回報 busy／live／未知 entry（`restore_refused_busy`） |
+| `chunk_missing` | manifest 列出的 chunk 檔不在，引擎丟棄 entry（`restore_dropped_missing`） |
+| `damaged` | entry 損毀，引擎丟棄（`restore_failed` 增加但不是 chunk 遺失） |
+| `begin_refused` | 引擎拒絕，原因不在上述（記憶體不足、沒有檔案、較舊的引擎沒有這些計數器） |
+| `lookup_failed` | 查詢過程發生例外（在 `spill_match` 之前為 `tier="none"`） |
+| `restored`／`failed`／`timed_out` | 已開始的載回結束：成功、失敗、超過 30 s（逾時後才完成的不再計一次） |
+| `sync_restored` | 第一次 `prefix_begin` 自己同步載回了分層 entry（沒有等背景載回） |
+| `no_match`（none） | `spill_match` 沒有找到 entry |
+| `not_checked`（none） | 請求開始時這次排隊沒有做過還原檢查（`SPILL_ASYNC_PROMOTE` 關閉） |
+
+關係：每層 `matched` = `started` + `joined` + … + `lookup_failed`（上表第 2–11 列的和）；`started` = `restored` + `failed` + `timed_out` + 仍在載入中。
+引擎端的拒絕原因來自 `spill_stats` 新增的 `restore_refused_busy`、`restore_refused_room`、`restore_dropped_missing`（第 46–48 個值）：frontend 在 `spill_restore_begin` 前後各讀一次，
+看哪一個增加。
+
+**輸出**：`/metrics` 的 `q27:restore_decisions_total{tier,outcome}`、`q27:restore_not_worth_bytes_total{tier}`、`q27:restore_not_worth_load_seconds_total{tier}`、
+`q27:restore_not_worth_recompute_seconds_total{tier}`、`q27:tier_restore_refused_*`；統計快照的 `restore_decisions`（`counts`、`not_worth`；也放在 tiers 區塊內），
+狀態頁分層快取面板可展開的「還原決策」小表；請求軌跡 `req` 的 `restore` 與 `restore_tier`（`docs/request-trace.md`），`tools/trace_summary.py` 會印一行彙總。
 
 ## WSL2 注意事項
 

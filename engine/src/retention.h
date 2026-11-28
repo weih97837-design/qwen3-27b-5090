@@ -448,10 +448,11 @@ inline const std::vector<uint64_t>* cached_bh(const std::vector<int32_t>& ids, V
 // from every visible node (pool + RAM + SSD), leaf from the RAM tier. freed(s): host bytes erasing s gives back (spill_freed);
 // superseded(id): Model::spill_superseded. Returns spill.end() when there is no candidate; *pick (if not null) gets the pick. The
 // eviction of a sole copy is recorded in gd (now_clock: the latest use clock); an idle backup's is not (dropping it loses nothing: it
-// must not raise the watermark).
+// must not raise the watermark). *victim_ci (if not null) gets the victim's ChainInfo (ssd_gate.h: its SSD admission inputs).
 template <class Map, class Ckpts, class Freed, class Sup>
 inline typename Map::iterator smart_ram_victim(Map& spill, const Ckpts& ckpts, const SmartParams& p, GdTier& gd, double now_s,
-                                               uint64_t now_clock, Freed&& freed, Sup&& superseded, SmartPick* pick = nullptr) {
+                                               uint64_t now_clock, Freed&& freed, Sup&& superseded, SmartPick* pick = nullptr,
+                                               ChainInfo* victim_ci = nullptr) {
   std::vector<RetNode> nodes;
   std::vector<uint8_t> tiers;
   std::vector<typename Map::iterator> its;
@@ -496,6 +497,7 @@ inline typename Map::iterator smart_ram_victim(Map& spill, const Ckpts& ckpts, c
   if (cls < 0) return spill.end();
   const SmartPick& k = cls ? k1 : k0;
   if (pick) *pick = k;
+  if (victim_ci) *victim_ci = ci[at[cls][size_t(k.idx)]];
   if (cls == 1) gd.evicted(k, now_clock);
   return its[at[cls][size_t(k.idx)]];
 }

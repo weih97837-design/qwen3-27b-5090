@@ -9,12 +9,16 @@
 //   ram <now_s> <min_resident_s> <n>          (smart_ram_victim with fake entries; t0 / k / factors: the defaults)
 //     n lines: live freed state hits superseded born last_use owner len id_0 ..   (all in RAM, none busy)
 //   -> "ram <index of the victim or -1>"
+//   admit <t0_us> <k_us> <superseded_factor> <junction_factor> <hit_weight> <min_tokens> <L> <floor> <nsteps> <n>   (src/ssd_gate.h)
+//     nsteps lines: clock value (the SSD tier's stamp record); n lines: tokens bytes parent_depth hits junction superseded last_use smart
+//   -> n lines "admit <verdict: 0 admit, 1 short, 2 below the watermark>"
 #include <cstdio>
 #include <iostream>
 #include <map>
 #include <string>
 
 #include "retention.h"
+#include "ssd_gate.h"
 
 using namespace q27;
 
@@ -97,6 +101,25 @@ int main() {
       auto it = smart_ram_victim(spill, ck, p, gd, now, 0, [](const Ent& e) { return e.freed; },
                                  [&](uint64_t id) { return spill.at(id).sup; });
       std::printf("ram %lld\n", it == spill.end() ? -1LL : (long long)it->first);
+    } else if (cmd == "admit") {
+      SmartParams p;
+      long long min_tokens = 0;
+      double L = 0, floor = 0;
+      size_t ns = 0, n = 0;
+      std::cin >> p.t0_us >> p.k_us >> p.superseded_factor >> p.junction_factor >> p.hit_weight >> min_tokens >> L >> floor >> ns >> n;
+      std::vector<uint64_t> clocks(ns);
+      std::vector<double> values(ns);
+      for (size_t i = 0; i < ns; i++) std::cin >> clocks[i] >> values[i];
+      SsdGate g;
+      g.set(true, min_tokens, L, floor, clocks.data(), values.data(), ns);
+      for (size_t i = 0; i < n; i++) {
+        long long tokens = 0;
+        int j, su, smart;
+        SsdGateIn e;
+        std::cin >> tokens >> e.bytes >> e.parent_depth >> e.hits >> j >> su >> e.last_use >> smart;
+        e.junction = j, e.superseded = su;
+        std::printf("admit %d\n", g.verdict(tokens, smart != 0, p, [&] { return e; }));
+      }
     }
     std::fflush(stdout);
   }

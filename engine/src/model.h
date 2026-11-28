@@ -14,6 +14,7 @@
 #include "memory.h"
 #include "prefix_cache.h"
 #include "retention.h"
+#include "ssd_gate.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -148,11 +149,15 @@ class Model {
   // Pins a decoding sequence's verify width (area -1: the running one) to `block` rows (2 .. the draft's block; DFlash2
   // 8) for its single and batched steps: tests (batched lanes of given widths against single runs).
   void spec_set_block(int area, int block);
+  // Tests of cut steps (P3-39): the running sequence's single steps draft `rows` (0: their verify width; more: that
+  // many, the verify takes the first rows of them, eagerly).
+  void spec_set_draft_rows(int rows) { spec_draft_rows_ = rows; }
   bool has_draft() const { return draft_ != nullptr; }
   int spec_block() const { return draft_ ? draft_->block() : 0; }
   int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
   // Rows of lane z's block in the last spec_step_lanes / spec_draft_lanes.
   int last_lane_block(int z) const { return z >= 0 && z < blr_.n ? blr_.rows(z) : 0; }
+  int last_lane_draft(int z) const { return z >= 0 && z < bdlr_.n ? bdlr_.rows(z) : 0; }  // (its draft rows)
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -218,7 +223,10 @@ class Model {
   uint64_t spill_import(const std::string& path);
   // out[28..40] (appended): CACHE_POLICY (0 legacy, 1 smart), then GdTier::stats of the RAM tier and of the VRAM checkpoints (6 each:
   // evictions of a leaf / a non-leaf / a young entry, picks that passed over a young entry, mean victim priority x1000, watermark x1000).
-  static constexpr int kSpillStats = 41;
+  // out[41..48] (appended): the SSD gate (ssd_gate.h): 1 when pushed and on, victims rejected (all), of them too short / below the
+  // watermark, victims judged; then spill_restore_begin's refusals: busy (unknown / live / busy / already restoring), no room
+  // (spill_room), dropped because a chunk file of its manifest is missing (also in failed / restore_failed).
+  static constexpr int kSpillStats = 49;
   void spill_stats(int64_t* out, int n) const;
   // SPILL_PINNED_GIB: pins up to `chunks` more slabs (Options::spill_pinned_slab_mib each, cudaHostAlloc) of the pinned
   // pool; returns how many it added, 0 when the pool is full (or pinning failed once: it is not retried). Pinning
@@ -248,6 +256,9 @@ class Model {
   int spill_release(uint64_t id);
   // false: prefix_begin does not promote a spilled match synchronously (the frontend decided to compute it instead).
   void spill_set_sync_lookup(bool on) { spill_sync_lookup_ = on; }
+  // The SSD gate (ssd_gate.h SsdGate::set): the frontend's SSD admission, applied by spill_enforce_ram before it writes a victim.
+  void spill_set_ssd_gate(bool on, int64_t min_tokens, double watermark, double floor, const uint64_t* clocks, const double* values,
+                          size_t n) { ssd_gate_.set(on, min_tokens, watermark, floor, clocks, values, n); }
   // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
   // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
   // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
@@ -352,6 +363,7 @@ class Model {
   mutable uint64_t sup_key_ = ~uint64_t(0);
   uint64_t owner_next_ = 0, seq_owner_ = 0;  // set_owner; the running sequence's owner
   uint32_t seq_hits_ = 0;                    // reuse count inherited from the checkpoint it resumed from (retention.h inherited_hits)
+  SsdGate ssd_gate_;                         // the frontend's SSD admission (q27_spill_set_ssd_gate; off until pushed)
   GdTier gd_ram_, gd_vram_;                  // CACHE_POLICY=smart: the watermarks / stamps / counters of the RAM tier and the pool
   void spill_checkpoint(const Checkpoint& c);    // a copy of c in host memory (before evict_checkpoint unrefs it)
   bool spill_subsumed(const Checkpoint& c, uint64_t ignore_id) const;  // a deeper checkpoint covers c (ignore_id: skipped)
@@ -636,7 +648,26 @@ class Model {
   bool bwarm_ = false;
   AcceptLanes bacc_;                 // the lanes' sampling (chains) and top-k list lengths
   SeqLanes bsl_;                     // positions, rotary deltas and page tables of the lanes
-  LaneRows blr_;                     // the rows of the lanes' blocks in the current step
+  LaneRows blr_;                     // the rows of the lanes' blocks in the current step (their verify rows)
+  LaneRows bdlr_;                    // their draft rows: blr_, or more in a cut step (P3-39)
+  bool bvary_ = false;               // the lanes' rows may differ (DSpine, the FP8-MMA verify)
+  // Rows read on the device (P3-39, Q27_BATCH_DEV_ROWS): the batched kernels read blr_ / bdlr_ from b_lrd_ [2] (verify,
+  // draft), copied from the pinned b_lrh_ by the step itself (a memcpy node of its graph; stage_rows writes b_lrh_
+  // before each launch), so a graph runs any split of its shape (lanes, total rows, the longest lane's rows).
+  bool dev_rows_ = false;
+  LaneRows *b_lrh_ = nullptr, *b_lrd_ = nullptr;
+  void stage_rows();
+  LaneRows vrows() const;            // blr_ / bdlr_ as the kernels take them (with dev_rows_: their device copies)
+  LaneRows drows() const;
+  uint64_t bcaptures_ = 0;           // batched-step graphs captured (instantiated or updated)
+  // Cut steps (P3-39, Q27_SPEC_CUT): the draft at the lanes' rows (batch_rows), then each lane verifies the prefix
+  // that maximizes the expected tokens per ms (from the draft's table, dspine_conf_tokens; cut_rows).
+  bool batch_cut_ = false;
+  int spec_draft_rows_ = 0;          // (spec_set_draft_rows)
+  bool cut_step_ = false;            // the current step is cut
+  float cut_lam_ = 0.f;              // tokens per ms of the recent cut steps (0: none yet)
+  ConfCalib cut_cal_{};
+  float *b_conf_ = nullptr, *b_conf_dev_ = nullptr;  // [lanes][16] expected tokens at 1..16 rows, mapped pinned
   int batch_rows_ = 0;               // rows of a batched step, at most (batch_row_budget)
   float *bconv_[kMaxLanes] = {}, *bssm_[kMaxLanes] = {};  // their GDN states (replayed in place)
   bf16 *bring_k_[kMaxLanes] = {}, *bring_v_[kMaxLanes] = {};  // their draft context rings
@@ -656,6 +687,9 @@ class Model {
     uint64_t used;
     cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
     LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
+    int tag = 0;       // 0: a whole step (or a masked one's two parts); a cut step's part: 1 the draft, 2 the rest
+    LaneRows clr;      // (tag 2: the draft rows it was captured with)
+    int total = 0, longest = 0;  // its shape (the rows of the part: tag 1 the draft's, otherwise the verify's)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -671,7 +705,9 @@ class Model {
   void batch_body(int n, int part = 0);  // one step of the lanes (captured; part: as spec_body's)
   bool batch_masked() const;
   struct BatchGraph;
-  BatchGraph& batch_graph(int n);
+  BatchGraph& batch_graph(int n, int tag = 0);
+  bool cut_part(int n, int part);    // a cut step's part (as batch_part's); returns whether a graph ran
+  bool cut_rows(int n);              // the verify rows of a cut step (blr_) from b_conf_; false: none cut
   void batch_prepare(const int32_t* lanes, int n);
   void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
   void lane_note(SpecSampling& m, int rows, int tokens) const;
@@ -725,6 +761,7 @@ class Model {
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;
+  bool head_a4x2_ = true;  // Q27_LM_HEAD_A4X2: two-term NVFP4 activations into the NVFP4 lm_head (logits)
   // Decode step as a CUDA graph (Q27_NO_GRAPH=1: eager). Not used while profiling.
   bool graphs_ = true, graph_warm_ = false;
   struct GraphKey {
@@ -747,7 +784,7 @@ class Model {
   static constexpr int kGraphCache = 4;
   // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
   // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
-  static constexpr int kBatchGraphCache = 8;
+  static constexpr int kBatchGraphCache = 48;  // (cut steps: an entry per shape of the draft and of the verify)
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;
