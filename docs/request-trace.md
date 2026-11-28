@@ -9,6 +9,9 @@ REQUEST_TRACE=D:\q27-trace            # 目錄（檔名 trace-…jsonl），或�
 python frontend/server.py --request-trace D:\q27-trace   # 同義
 REQUEST_TRACE_HASH_AGENTS=1           # agent 欄位改為穩定的短雜湊
 REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預設 512）
+REQUEST_TRACE_ANCHORS=0               # 關閉內容錨點（new_anchors，見下；開啟軌跡時預設開）
+REQUEST_TRACE_ANCHOR_EVERY=128        # 約每幾個 token 一個錨點（預設 128）
+REQUEST_TRACE_ANCHOR_K=32             # 每個錨點雜湊的 token 數（預設 32）
 ```
 
 檔名為 `<前綴>-YYYYMMDD-HHMMSS.jsonl`（同一秒內再開新檔會加 `_1`、`_2`）。單檔達 64 MiB 就換新檔；總大小超過上限時刪除最舊的檔。每行寫完立即 flush。寫入發生任何錯誤時，記錄器只記一行 log 並自行停用，不影響服務。
@@ -24,6 +27,7 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 | `engine` | 引擎版本字串（同 `GET /version`） |
 | `build` | Windows 程式包的版本（`app\VERSION`，例如 `v0.6.2.7-cache-tier`）；在原始碼 checkout 裡沒有這個檔案，值為 `null`。用來分辨不同版本的追蹤檔 |
 | `block_tokens` | 256 |
+| `anchor_every`, `anchor_k` | 內容錨點的參數（預設 128、32；`REQUEST_TRACE_ANCHORS=0` 時 `anchor_every` 為 0，`req` 沒有 `new_anchors`） |
 | `ts` | 檔案開始時間（epoch 秒） |
 | `settings` | 與快取有關的設定：所有 `SPILL_*` 與 `CACHE_*`（保留策略 `CACHE_POLICY` 及其常數）、`STATE_HOST_CACHE`、`CHECKPOINT_INTERVAL`、`PREFILL_CHUNK`、`MAX_SEQS`、`KV_POOL_TOKENS`（有設定才有）、`kv_pool_pages`、`kv_pool_tokens`（引擎實際的 KV 池）等 |
 
@@ -45,6 +49,8 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 | `diverged_at` | 與最佳歷史分岔的位置，沒有則 `null` |
 | `restored_from` | 這次命中從分層快取載回時為 `"ram"` 或 `"ssd"`，否則 `null`（無法判斷時為 `null`） |
 | `queued_s` | 排隊秒數 |
+| `new_tokens` | `prompt_tokens - reusable`：前綴快取必須自己算的那一段（沒有錨點時省略） |
+| `new_anchors` | 那一段（index >= `reusable`）內的內容錨點雜湊清單（12 位十六進位），見「內容錨點」 |
 | `blocks` | 提示詞每 256 token 一塊（只含完整區塊）的鏈式雜湊，見下 |
 
 `done`：請求結束。`ts`、`rid`、`reason`（`stop` / `length` / `cancelled` / `error`…）、`output_tokens`、`ttft_s`、`prefill_s`、`computed_tokens`（實際預填的 token）、`preempted`（被搶佔次數）、`total_tokens`（提示詞＋輸出）、`end_blocks`：（提示詞＋輸出）中位於「提示詞最後一個完整區塊之後」的區塊雜湊，也就是結尾檢查點涵蓋的部分。未開始的請求 `end_blocks` 為空。
@@ -55,9 +61,20 @@ REQUEST_TRACE_MAX_MIB=512             # 全部軌跡檔的總大小上限（預�
 
 `h_k` 取 `blake2b(d_{k-1} + 第 k 塊的 int32 token id（小端位元組）)` 摘要的前 8 位元組（16 個十六進位字元）；`d_k` 為完整摘要，`d_{-1}` 為固定常數 `q27-request-trace-v1`。用的 id 就是交給 `prefix_begin` 的引擎 id（含媒體佔位 id），所以前綴相同的提示詞，前面的雜湊一定相同：較長提示詞的前 k 個雜湊等於較短者。125K token 的提示詞（488 塊）約 3 ms。
 
+### 內容錨點（位置無關的量測）
+
+前綴快取只能重用**從第一個 token 起完全相同**的內容。要回答「快取必須重算的內容，有多少其實早就在別的請求出現過，只是位置不同或前面的標頭不同」，`req` 的 `new_anchors` 記錄 `reusable` 之後那段的內容定義錨點（前綴那段已知可重用；依歸納，更早出現過的內容都曾在某個較早請求的「新」段記錄過，所以略過）：
+
+- 錨點規則（只依 token id，與位置、前綴無關）：位置 i 的 token 是錨點，當 `((id * 2654435761) & 0xFFFFFFFF) >> 7) % EVERY == 0`（EVERY 預設 128，即平均每 128 token 一個），且 i 之後（含 i）在提示詞內至少有 K 個 token（K 預設 32）。
+- 雜湊：以該處起 K 個 token 的 int32 位元組做 blake2b，取前 6 位元組（12 位十六進位）。相同內容放在不同偏移、不同標頭之後，只要錨點之後的 K 個 token 相同，雜湊就相同。
+- 成本：125K token 的新段約 15 ms（量測值；只有尾段的請求更少），不逐 token 雜湊，只對約 1/128 的位置雜湊 32 個 token。
+- 大小：平均每個請求約 42 個錨點（約 0.6 KB）；完全冷的 125K 提示詞約 970–1,000 個，每個在 JSON 中約 15 位元組，約 14.5 KB。沿用總大小上限（`REQUEST_TRACE_MAX_MIB`）與換檔，沒有另外的單請求上限。
+
 ## 隱私
 
 只記數量、時間與雜湊，**不記提示詞文字、輸出文字、token id 或任何內容**。雜湊是單向的鏈式雜湊，但相同前綴會得到相同雜湊，所以檔案能看出「哪些請求共用前綴」。agent id 與機器名稱預設照實寫入；若要分享軌跡，設 `REQUEST_TRACE_HASH_AGENTS=1`（機器名稱仍在，分享前自行檢查）。短名稱的雜湊可被字典猜出，不是匿名化。
+
+錨點只是 32 個 token 視窗的雜湊，不含文字也不含 token id。和任何文字雜湊一樣，已經握有候選文字的人可以做字典比對（把候選內容用同樣規則算一遍，確認某個視窗是否出現過）；除此之外無法反推內容。
 
 ## 大小
 
@@ -70,6 +87,12 @@ python tools/trace_summary.py trace-*.jsonl [--json]
 ```
 
 只用 CPU，印出請求數、各 agent 的請求數、提示詞大小分佈、平均 `cached`／`reusable`、大於 16K 的提示詞完全沒有命中的比例、有 `diverged_at` 的比例與位置分佈、各 agent 相鄰請求的間隔（中位數、p90），以及「可重用但沒命中」的 token 總數；有 `reusable_from` 的軌跡另外印出各來源（same／other／none）的請求數與可重用 token 數，以及「可重用 token 中來自其他 agent 的比例」。
+
+### 內容錨點的摘要
+
+`trace_summary.py` 依檔案／時間順序維護「錨點雜湊 → 見過的 agent 集合」。對每個請求，算它的 `new_anchors` 有多少比例已出現在**較早**請求的新段中（任何 agent／同一 agent／其他 agent），並彙總：新 token 總數、估計「可依內容共用」的新 token 數（每個請求的比例 × `new_tokens`，加總；沒有錨點的短尾段不計入分母）、每請求比例的分佈（p10／中位數／p90 與 0%、0–25%、25–75%、75–100%、100% 的直方圖），以及依「`cached` 為 0 或大於 0」與 `reusable_from` 分組的同樣數字。沒有 `new_anchors` 的舊軌跡只印一行說明並略過。
+
+這個數字**代表**：位置無關的重用「最多」能找到多少，是上限。它**不代表**能被前綴快取拿到：換了前綴之後，KV 與遞迴狀態都取決於之前的全部內容，所以逐字相同的內容在不同前綴後面無法精確重用（文獻中有近似方法，本引擎沒有）。誤差來源：每約 128 token 才取樣一個、視窗只有 32 token（視窗內任何一個 token 不同就不算）、純估計。實務上的解法是提示詞排版：共用內容放前面並維持固定順序，會變的內容放最後。
 
 ## 模擬器
 

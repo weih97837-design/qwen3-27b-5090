@@ -305,3 +305,102 @@ def test_reusable_from_same_other_none(tmp_path):
     # a history without agents (a scheduler that does not keep them): unknown, not a guess
     assert rt.reusable_from(5, [1, 2, 3, 4, 5, 6], collections.deque([b"x"]), None, "a") is None
     assert rt.reusable_from(0, [1], collections.deque(), None, "a") == "none"
+
+
+# ---------------------------------------------------------------- anchors (position-independent measurement)
+
+def b(x):
+    return array.array("i", x).tobytes()
+
+
+def rnd(n, seed):
+    import random
+    r = random.Random(seed)
+    return [r.randrange(1000, 150000) for _ in range(n)]
+
+
+def test_anchors_are_content_defined():
+    block = rnd(5000, 1)
+    a0 = set(rt.anchors(b(block), 0))
+    assert len(a0) > 15
+    # same content at another offset / behind another header: the same hashes
+    for head in (rnd(777, 2), rnd(3001, 3)):
+        assert a0 <= set(rt.anchors(b(head + block), 0))
+    # different content: different hashes
+    assert not (a0 & set(rt.anchors(b(rnd(5000, 9)), 0)))
+    assert all(len(h) == 12 for h in a0)
+
+
+def test_anchors_only_beyond_reusable_and_need_k_following_tokens():
+    x = rnd(6000, 4)
+    full = rt.anchors(b(x), 0)
+    tail = rt.anchors(b(x), 3000)
+    assert 0 < len(tail) < len(full) and set(tail) <= set(full)
+    assert full[len(full) - len(tail):] == tail
+    assert rt.anchors(b(x), 6000) == [] and rt.anchors(b(x), 99999) == []
+    # an anchor token needs K tokens inside the prompt: cut the prompt so the last anchor has k-1 tokens after it
+    every, k = 4, 32
+    pos = [i for i, t in enumerate(x) if (((t * 2654435761) & 0xFFFFFFFF) >> 7) % every == 0]
+    last = [p for p in pos if p + k < len(x)][-1]
+    assert len(rt.anchors(b(x[:last + k]), 0, every, k)) == len([p for p in pos if p <= last])
+    assert len(rt.anchors(b(x[:last + k - 1]), 0, every, k)) == len([p for p in pos if p < last])
+    assert rt.anchors(b(x[:k - 1]), 0, 1, k) == []
+
+
+def test_anchor_env_switches_and_header(tmp_path):
+    def hdr(env):
+        d = tmp_path / str(len(os.listdir(tmp_path)))
+        d.mkdir()
+        r = rt.from_env({"REQUEST_TRACE": str(d), **env}, {}, lambda m: None)
+        return r, json.loads(next(d.glob("trace-*.jsonl")).read_text().splitlines()[0])
+    r, h = hdr({})
+    assert (r.anchor_every, r.anchor_k, h["anchor_every"], h["anchor_k"]) == (128, 32, 128, 32)
+    r, h = hdr({"REQUEST_TRACE_ANCHOR_EVERY": "16", "REQUEST_TRACE_ANCHOR_K": "8"})
+    assert (h["anchor_every"], h["anchor_k"]) == (16, 8)
+    r, h = hdr({"REQUEST_TRACE_ANCHORS": "0"})
+    assert r.anchor_every == 0 and h["anchor_every"] == 0
+    r, h = hdr({"REQUEST_TRACE_ANCHOR_EVERY": "junk"})
+    assert h["anchor_every"] == 128
+
+
+def run_req(s, d, rid, prompt, agent_id="a/t"):
+    s.submit(rid, req(prompt, agent_id=agent_id))
+    r = s.by_id[rid]
+    s.waiting.remove(r)
+    s.alive.append(r)
+    s.begin(r)
+    s.finish(r, "stop", save=False)
+    return [e for e in read(files(d)[0]) if e["t"] == "req"][-1]
+
+
+def test_req_event_has_new_anchors_of_the_tail_only(tmp_path):
+    s = sched(tmp_path)
+    p = rnd(4000, 5)
+    e = run_req(s, tmp_path, "r1", p)
+    assert e["new_tokens"] == 4000 and e["new_anchors"] == rt.anchors(b(p), 0) and 10 < len(e["new_anchors"]) < 80
+    p2 = p[:2048] + rnd(1500, 6)
+    e2 = run_req(s, tmp_path, "r2", p2)   # reusable = 2048 (from r1's history): only the tail is anchored
+    assert e2["reusable"] == 2048 and e2["new_tokens"] == len(p2) - 2048
+    assert e2["new_anchors"] == rt.anchors(b(p2), 2048)
+    off = tmp_path / "off"
+    off.mkdir()
+    s2 = sched(off, REQUEST_TRACE_ANCHORS="0")
+    e3 = run_req(s2, off, "r1", p)
+    assert "new_anchors" not in e3 and "new_tokens" not in e3
+
+
+def test_anchor_time_125k_and_size():
+    x = b(rnd(125_000, 7))
+    t = time.perf_counter()
+    a = rt.anchors(x, 0)
+    dt = time.perf_counter() - t
+    print(f"125K tail: {len(a)} anchors in {dt * 1000:.2f} ms, {len(json.dumps(a, separators=(',', ':')))} bytes")
+    assert 700 < len(a) < 1300 and dt < 0.1
+
+
+def test_anchor_trace_has_no_content(tmp_path):
+    s = sched(tmp_path)
+    p = rnd(1000, 8) + [141414, 151515, 161616, 171717, 181818, 191919] + rnd(2000, 9)
+    run_req(s, tmp_path, "r1", p)
+    raw = files(tmp_path)[0].read_text()
+    assert "141414" not in raw and "151515" not in raw
