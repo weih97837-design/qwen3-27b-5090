@@ -200,7 +200,8 @@ class Recorder:
                        "prompt_tokens": len(s.prompt), "media_tokens": (media_of(s.images) or {}).get("tokens", 0),
                        "max_tokens": s.max_new, "cached": s.cached, "reusable": s.reusable,
                        "reusable_from": getattr(s, "reusable_from", None), "diverged_at": s.diverged_at,
-                       "restored_from": restored_from, "queued_s": round(s.begun - s.arrival, 4), "blocks": blocks})
+                       "restored_from": restored_from, "restore": getattr(s, "restore_outcome", None),
+                       "restore_tier": getattr(s, "restore_tier", None), "queued_s": round(s.begun - s.arrival, 4), "blocks": blocks})
         except Exception as e:  # noqa: BLE001
             self.disable(e)
 

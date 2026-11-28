@@ -134,7 +134,8 @@ def test_events_fields_and_no_content(tmp_path):
     hdr, rq, sn, dn = ev
     assert hdr["version"] == 1 and hdr["block_tokens"] == 256 and hdr["engine"] and hdr["settings"]["PREFILL_CHUNK"] == 2048
     assert {"ts", "rid", "agent", "client", "prompt_tokens", "media_tokens", "max_tokens", "cached", "reusable", "diverged_at",
-            "restored_from", "queued_s", "blocks"} <= rq.keys()
+            "restored_from", "restore", "restore_tier", "queued_s", "blocks"} <= rq.keys()
+    assert rq["restore"] is None and rq["restore_tier"] is None  # (no tier policy: no restore decision)
     assert rq["agent"] == "manager/task-9" and rq["client"] == "PC-A" and rq["prompt_tokens"] == len(prompt)
     assert rq["cached"] == 256 and rq["restored_from"] is None and rq["diverged_at"] is None and rq["max_tokens"] == 4
     assert rq["blocks"] == rt.block_chain(prompt)[0] and len(rq["blocks"]) == 2   # (the ids the engine's prefix_begin got)
@@ -404,3 +405,16 @@ def test_anchor_trace_has_no_content(tmp_path):
     run_req(s, tmp_path, "r1", p)
     raw = files(tmp_path)[0].read_text()
     assert "141414" not in raw and "151515" not in raw
+
+
+def test_req_carries_the_restore_decision(tmp_path):
+    """req.restore / restore_tier: the request's last restore decision (worker.RESTORE_OUTCOMES) and the tier of its entry."""
+    s = sched(tmp_path)
+    s.submit("r1", req(P, agent_id="m/t"))
+    r = s.by_id["r1"]
+    s.waiting.remove(r)
+    s.alive.append(r)
+    r.restore_outcome, r.restore_tier = "not_worth_loading", "ssd"
+    s.begin(r)
+    rq = [e for e in read(files(tmp_path)[0]) if e["t"] == "req"][-1]
+    assert rq["restore"] == "not_worth_loading" and rq["restore_tier"] == "ssd"

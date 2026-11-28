@@ -82,6 +82,14 @@ def summarize(reqs, dones=(), snaps=()):
         total = sum(b["reusable_tokens"] for b in by.values())
         out["reusable_from"] = by
         out["reusable_from_other_share"] = by.get("other", {}).get("reusable_tokens", 0) / total if total else None
+    # Restore decisions (req.restore / restore_tier; traces before them have none): "tier outcome" -> requests
+    rd = {}
+    for r in reqs:
+        if r.get("restore") is not None:
+            k = f"{r.get('restore_tier') or 'none'} {r['restore']}"
+            rd[k] = rd.get(k, 0) + 1
+    if rd:
+        out["restore_decisions"] = dict(sorted(rd.items(), key=lambda kv: (-kv[1], kv[0])))
     out["anchors"] = anchor_stats(reqs)
     return out
 
@@ -199,6 +207,8 @@ def render(s):
         L.append("reusable prefix from (requests / reusable tokens): " + "  ".join(
             f"{k} {v['requests']} / {v['reusable_tokens']}" for k, v in sorted(s["reusable_from"].items()))
             + "  -> share of reusable tokens from other agents: " + ("-" if o is None else f"{100 * o:.1f}%"))
+    if s.get("restore_decisions"):
+        L.append("restore decisions (tier outcome: requests): " + "  ".join(f"{k}: {v}" for k, v in s["restore_decisions"].items()))
     L.append(render_anchors(s.get("anchors")))
     return "\n".join(L)
 

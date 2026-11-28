@@ -98,6 +98,8 @@ td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; white-space:
 .seq .preview { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 2px 12px; font-size: 12px; }
 .kv div span { color: var(--muted); }
+.restore-dec summary { cursor: pointer; color: var(--ink2); }
+.restore-dec table { width: auto; min-width: 0; }
 .kv div b { font-weight: 600; font-variant-numeric: tabular-nums; }
 .ctx { position: relative; }
 .ctx .tick { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); opacity: 0.55; border-radius: 1px; }
@@ -890,6 +892,32 @@ function tierCol(title, used, cap, note) {
     el("div", { class: "meter" }, el("div", { style: `width:${(pct * 100).toFixed(1)}%;background:var(${pct > 0.9 ? "--serious" : "--s1"})` })),
     el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, note));
 }
+// Restore decisions (worker.py RESTORE_OUTCOMES; docs/tiered-cache.md "還原決策計數"): why a matched tier entry was or was not loaded back,
+// per tier. A collapsible small table; its open state survives the redraw of every tick.
+const RESTORE_ZH = { matched: "找到可用 entry", started: "開始背景載回", joined: "共用進行中的載回", not_worth_loading: "不值得載回（重算較快）",
+  no_kv_room: "KV 池放不下", spill_room_refused: "引擎拒絕：KV 空間不足", skipped_busy: "略過：正在載回／忙碌", chunk_missing: "chunk 檔遺失（已丟棄）",
+  damaged: "損毀（已丟棄）", begin_refused: "引擎拒絕（其他）", lookup_failed: "查詢失敗", restored: "載回完成", failed: "載回失敗",
+  timed_out: "等待逾時", sync_restored: "同步載回（prefix_begin）", no_match: "沒有可用 entry", not_checked: "未檢查（排隊時沒看）" };
+let restoreOpen = false;
+function restoreTable(rd, ssdOff) {
+  const counts = rd.counts || {}, n = (v) => v == null ? "–" : Number(v).toLocaleString();
+  const tiers = ["ram", ...(ssdOff ? [] : ["ssd"]), "none"];
+  const outcomes = [...(rd.outcomes || []), ...(rd.none_outcomes || [])].filter((o, i, a) => a.indexOf(o) === i);
+  const rows = outcomes.filter((o) => tiers.some((t) => (counts[t] || {})[o]));
+  const tot = (o) => tiers.reduce((a, t) => a + ((counts[t] || {})[o] || 0), 0);
+  const d = el("details", { class: "restore-dec", style: "margin-top:10px;font-size:12px" },
+    el("summary", {}, `還原決策 · 找到 ${n(tot("matched"))} · 開始載回 ${n(tot("started"))} · 不值得 ${n(tot("not_worth_loading"))}`),
+    rows.length ? el("div", { class: "scroll" }, el("table", {},
+      el("tr", {}, el("th", {}, "結果"), ...tiers.map((t) => el("th", { class: "r" }, t === "none" ? "無 entry" : t.toUpperCase()))),
+      ...rows.map((o) => el("tr", {}, el("td", {}, RESTORE_ZH[o] || o), ...tiers.map((t) => el("td", { class: "r" }, n((counts[t] || {})[o] || 0)))))))
+      : el("div", { class: "muted" }, "還沒有還原決策。"),
+    ...Object.entries(rd.not_worth || {}).filter(([t]) => tiers.includes(t)).map(([t, w]) => el("div", { class: "muted", style: "margin-top:4px;overflow-wrap:anywhere" },
+      `${t.toUpperCase()} 不值得載回 ${n(w.n)} 次：合計 ${fmtGiB(w.bytes)}，估計載入 ${fmtS(w.load_s)}、重算 ${fmtS(w.recompute_s)}` +
+      (w.last ? `；最近一次 ${n(w.last.tokens)} tok、${fmtGiB(w.last.bytes)}、載入 ${fmtS(w.last.load_s)} 對重算 ${fmtS(w.last.recompute_s)}（頻寬 ${(w.last.bandwidth / 1e9).toFixed(1)} GB/s）` : ""))));
+  d.open = restoreOpen;
+  d.addEventListener("toggle", () => { restoreOpen = d.open; });
+  return d;
+}
 function drawTiers() {
   const t = snapTiers(), sec = $("tiers-sec"), body = $("tiers-body"), sum = $("tiers-sum");
   if (t === undefined || (t !== null && typeof t !== "object")) { sec.hidden = true; return; }
@@ -939,6 +967,12 @@ function drawTiers() {
         ` · 平均優先權 ${c.victim_priority_mean == null ? "–" : c.victim_priority_mean.toFixed(2)} · 水位 L ${(c.watermark || 0).toFixed(2)}`)),
       ...(t.cache_policy === "smart" && !ssdOff ? [kvRow("SSD 拒收（低於水位）", n(t.ssd_not_admitted || 0))] : [])));
   }
+  // The SSD gate (engine/src/ssd_gate.h): RAM-cap victims the engine rejected BEFORE writing them (an older engine: no line).
+  if (!ssdOff && t.ssd_gate_rejected != null)
+    kids.push(el("div", { class: "kv", style: "margin-top:10px" }, kvRow("SSD 寫入前拒收", t.ssd_gate_on ?
+      `${n(t.ssd_gate_rejected)}（過短 ${n(t.ssd_gate_rejected_short)} · 低於水位 ${n(t.ssd_gate_rejected_watermark)}）／判斷 ${n(t.ssd_gate_checked)}` :
+      `${n(t.ssd_gate_rejected)}（未啟用）`)));
+  if (t.restore_decisions && typeof t.restore_decisions === "object") kids.push(restoreTable(t.restore_decisions, ssdOff));
   kids.push(el("div", { class: "kv", style: "margin-top:10px" },
     ...(ssdOff ? [] : [kvRow("RAM 停留時間 retention", t.retention_s != null ? fmtDur(t.retention_s) : "–")]),
     kvRow("VRAM 備份", t.backup_entries == null ? "–" : `${n(t.backup_entries)} 份`),

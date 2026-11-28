@@ -48,6 +48,8 @@ REQUEST_TRACE_ANCHOR_K=32             # 每個錨點雜湊的 token 數（預設
 | `reusable_from` | 這段可重用前綴來自誰的歷史：`"same"`（共用該最長前綴的歷史 entry 之中有一個屬於同一個 agent，即 agent id 的 `/` 之前那段、快取的 owner）、`"other"`（只有其他 agent 的）、`"none"`（沒有可重用前綴）；無法判斷時為 `null`。歷史（最近 64 段）另外記每段的 agent 名稱，記憶體只多 64 個字串。只是量測：快取依內容查找，與 agent 無關 |
 | `diverged_at` | 與最佳歷史分岔的位置，沒有則 `null` |
 | `restored_from` | 這次命中從分層快取載回時為 `"ram"` 或 `"ssd"`，否則 `null`（無法判斷時為 `null`） |
+| `restore` | 這個請求最後一次的還原決策（`worker.py` 的 `RESTORE_OUTCOMES`；見 `docs/tiered-cache.md`「還原決策計數」）：例如 `"started"`、`"joined"`、`"restored"`、`"failed"`、`"timed_out"`、`"not_worth_loading"`、`"no_kv_room"`、`"spill_room_refused"`、`"skipped_busy"`、`"chunk_missing"`、`"damaged"`、`"begin_refused"`、`"lookup_failed"`、`"no_match"`、`"not_checked"`；沒有分層快取或沒有判斷過時為 `null`。舊軌跡沒有這個欄位 |
+| `restore_tier` | 該決策所針對 entry 的位置：`"ram"`、`"ssd"`；沒有 entry（`no_match`、`not_checked`）或沒有決策時為 `null` |
 | `queued_s` | 排隊秒數 |
 | `new_tokens` | `prompt_tokens - reusable`：前綴快取必須自己算的那一段（沒有錨點時省略） |
 | `new_anchors` | 那一段（index >= `reusable`）內的內容錨點雜湊清單（12 位十六進位），見「內容錨點」 |
@@ -86,7 +88,7 @@ REQUEST_TRACE_ANCHOR_K=32             # 每個錨點雜湊的 token 數（預設
 python tools/trace_summary.py trace-*.jsonl [--json]
 ```
 
-只用 CPU，印出請求數、各 agent 的請求數、提示詞大小分佈、平均 `cached`／`reusable`、大於 16K 的提示詞完全沒有命中的比例、有 `diverged_at` 的比例與位置分佈、各 agent 相鄰請求的間隔（中位數、p90），以及「可重用但沒命中」的 token 總數；有 `reusable_from` 的軌跡另外印出各來源（same／other／none）的請求數與可重用 token 數，以及「可重用 token 中來自其他 agent 的比例」。
+只用 CPU，印出請求數、各 agent 的請求數、提示詞大小分佈、平均 `cached`／`reusable`、大於 16K 的提示詞完全沒有命中的比例、有 `diverged_at` 的比例與位置分佈、各 agent 相鄰請求的間隔（中位數、p90），以及「可重用但沒命中」的 token 總數；有 `reusable_from` 的軌跡另外印出各來源（same／other／none）的請求數與可重用 token 數，以及「可重用 token 中來自其他 agent 的比例」。有 `restore` 的軌跡另外印一行 `restore decisions (tier outcome: requests)`：每種「`restore_tier` `restore`」組合的請求數（沒有 tier 時為 `none`）。
 
 ### 內容錨點的摘要
 

@@ -598,6 +598,37 @@ int q27_spill_set_ssd_gate(void* m, int on, int64_t min_tokens, double watermark
 `/metrics`：`q27:tier_ssd_gate_rejected`、`q27:tier_ssd_gate_rejected_short`、`q27:tier_ssd_gate_rejected_watermark`、`q27:tier_ssd_gate_checked`。
 `TierPolicy.status()` 的 `ssd_gate` 是最後一次推送的值（`min_tokens`、`watermark`、`steps`、`smart`；沒有推送時為 `null`）。
 
+## 還原決策計數
+
+以前只看得到「載回了幾筆」，分不出 SSD entry 沒被載回是「沒找到」、「找到但判斷不值得」還是「引擎拒絕」。現在 `worker.py` 在還原路徑的每個分支計數（只計數，不改變任何決策；
+計數本身出錯也不影響排程）。`tier` 是找到的 entry 所在層（`ram`／`ssd`），沒有 entry 時為 `none`。
+
+| outcome | 何時 |
+|---|---|
+| `matched` | `maybe_restore` 的 `spill_match` 找到 entry（每次排隊只看一次；被搶佔重新排隊後再看一次） |
+| `started` | `spill_restore_begin` 開始背景載回 |
+| `joined` | 另一個請求已在等同一個 entry 的載回，共用它 |
+| `not_worth_loading` | 估計載入時間 ≥ 0.8 × 重算時間（設 `no_sync`）；另外累計位元組、估計載入秒數、估計重算秒數，並保留最近一次的值（含使用的頻寬與 prefill 速度） |
+| `no_kv_room` | `kv_room` 判斷 KV 池放不下載回的頁 |
+| `spill_room_refused` | 引擎 `spill_restore_begin` 拒絕：`spill_room` 不足（引擎計數器 `restore_refused_room`） |
+| `skipped_busy` | entry 正在載回但已逾時沒人等（frontend），或引擎回報 busy／live／未知 entry（`restore_refused_busy`） |
+| `chunk_missing` | manifest 列出的 chunk 檔不在，引擎丟棄 entry（`restore_dropped_missing`） |
+| `damaged` | entry 損毀，引擎丟棄（`restore_failed` 增加但不是 chunk 遺失） |
+| `begin_refused` | 引擎拒絕，原因不在上述（記憶體不足、沒有檔案、較舊的引擎沒有這些計數器） |
+| `lookup_failed` | 查詢過程發生例外（在 `spill_match` 之前為 `tier="none"`） |
+| `restored`／`failed`／`timed_out` | 已開始的載回結束：成功、失敗、超過 30 s（逾時後才完成的不再計一次） |
+| `sync_restored` | 第一次 `prefix_begin` 自己同步載回了分層 entry（沒有等背景載回） |
+| `no_match`（none） | `spill_match` 沒有找到 entry |
+| `not_checked`（none） | 請求開始時這次排隊沒有做過還原檢查（`SPILL_ASYNC_PROMOTE` 關閉） |
+
+關係：每層 `matched` = `started` + `joined` + … + `lookup_failed`（上表第 2–11 列的和）；`started` = `restored` + `failed` + `timed_out` + 仍在載入中。
+引擎端的拒絕原因來自 `spill_stats` 新增的 `restore_refused_busy`、`restore_refused_room`、`restore_dropped_missing`（第 46–48 個值）：frontend 在 `spill_restore_begin` 前後各讀一次，
+看哪一個增加。
+
+**輸出**：`/metrics` 的 `q27:restore_decisions_total{tier,outcome}`、`q27:restore_not_worth_bytes_total{tier}`、`q27:restore_not_worth_load_seconds_total{tier}`、
+`q27:restore_not_worth_recompute_seconds_total{tier}`、`q27:tier_restore_refused_*`；統計快照的 `restore_decisions`（`counts`、`not_worth`；也放在 tiers 區塊內），
+狀態頁分層快取面板可展開的「還原決策」小表；請求軌跡 `req` 的 `restore` 與 `restore_tier`（`docs/request-trace.md`），`tools/trace_summary.py` 會印一行彙總。
+
 ## WSL2 注意事項
 
 - **RAM 層計入 WSL VM 的記憶體。** 預設的 WSL2 記憶體上限不足以容納 32 GiB 的 RAM 層。請在 `%UserProfile%\.wslconfig`
